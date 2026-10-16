@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Iterable, List, Tuple
+from copy import deepcopy
+from .schema import claim_index
 
 
 @dataclass
@@ -38,7 +40,7 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
     facts = run.fact_store.to_dict()
     calcs = run.calc_store.to_dict()
     evidence = _evidence_dict(run.evidence_store)
-    claims = {c.get("claim_id"): c for c in run.claims if c.get("claim_id")}
+    claims = claim_index(run.claims)
     tasks: List[AtomicTask] = []
 
     for claim in run.claims:
@@ -48,32 +50,50 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
         resolved: Dict[str, Any] = {}
         deps: List[Dict[str, Any]] = []
         unresolved: List[str] = []
-        for ref in claim.get("refs", []) or []:
+        references = list(dict.fromkeys(claim.get("refs", []) + claim.get("fact_refs", [])))
+        seen_refs = set()
+
+        def resolve(ref):
+            if ref in seen_refs:
+                return
+            seen_refs.add(ref)
             if ref in facts:
                 resolved[ref] = {"kind": "fact", "value": facts[ref]}
             elif ref in calcs:
                 resolved[ref] = {"kind": "calc", "value": calcs[ref]}
+                for source in calcs[ref].get("input_refs", []):
+                    resolve(source)
             elif ref in evidence:
                 resolved[ref] = {"kind": "evidence", "value": evidence[ref]}
             elif ref.startswith("evidence.") and ref[9:] in evidence:
                 resolved[ref] = {"kind": "evidence", "value": evidence[ref[9:]]}
             elif ref in claims:
-                dep = claims[ref]
-                deps.append({
-                    "claim_id": dep.get("claim_id"),
-                    "text": dep.get("text", ""),
-                    "claim_type": dep.get("claim_type"),
-                    "refs": dep.get("refs", []),
-                    "bindings": dep.get("bindings", []),
-                    "author_role": dep.get("author_role"),
-                })
+                return  # dependency objects are resolved below
             else:
                 unresolved.append(ref)
 
+        seen_deps = set()
+
+        def dependency(cid):
+            if cid in seen_deps:
+                return
+            seen_deps.add(cid)
+            dep = claims[cid]
+            deps.append(deepcopy(dep))
+            for ref in dep.get("refs", []) + dep.get("fact_refs", []):
+                resolve(ref)
+            for parent in dep.get("dependencies", []):
+                dependency(parent)
+
+        for ref in references:
+            resolve(ref)
+        for dep in claim.get("dependencies", []):
+            dependency(dep)
+
         tasks.append(AtomicTask(
             claim_id=cid,
-            claim=claim,
-            resolved_refs=resolved,
+            claim=deepcopy(claim),
+            resolved_refs=deepcopy(resolved),
             dependency_claims=deps,
             unresolved_refs=unresolved,
         ))
@@ -135,6 +155,13 @@ def normalize_atomic_result(claim_id: str, result: Dict[str, Any]) -> Dict[str, 
         raise ValueError(f"findings for {claim_id} must be a list")
     if verdict == "PASS" and findings:
         raise ValueError(f"PASS result for {claim_id} must have empty findings")
+    if verdict != "PASS" and not findings:
+        raise ValueError(f"{verdict} result must explain its findings")
+    for finding in findings:
+        if not isinstance(finding, dict) or not isinstance(finding.get("issue"), str) or not finding["issue"]:
+            raise ValueError("every finding requires issue text")
+        if finding.get("claim_id", claim_id) != claim_id:
+            raise ValueError("finding targets another claim")
     out = dict(result)
     out["claim_id"] = claim_id
     out["verdict"] = verdict
@@ -149,6 +176,10 @@ def summarize_atomic_results(
     """Require an LLM result for every claim; missing reviews never auto-pass."""
 
     expected = list(expected_claim_ids)
+    if len(set(expected)) != len(expected):
+        raise ValueError("duplicate expected claim IDs")
+    if set(results_by_claim) - set(expected):
+        raise ValueError("unexpected atomic review IDs")
     missing = [cid for cid in expected if cid not in results_by_claim]
     if missing:
         return {
