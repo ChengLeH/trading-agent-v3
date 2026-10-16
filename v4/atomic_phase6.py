@@ -22,6 +22,7 @@ class AtomicTask:
     resolved_refs: Dict[str, Any]
     dependency_claims: List[Dict[str, Any]]
     unresolved_refs: List[str]
+    context: Dict[str, Any] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -40,6 +41,7 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
     facts = run.fact_store.to_dict()
     calcs = run.calc_store.to_dict()
     evidence = _evidence_dict(run.evidence_store)
+    events = getattr(run, "events", {})
     claims = claim_index(run.claims)
     tasks: List[AtomicTask] = []
 
@@ -50,7 +52,7 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
         resolved: Dict[str, Any] = {}
         deps: List[Dict[str, Any]] = []
         unresolved: List[str] = []
-        references = list(dict.fromkeys(claim.get("refs", []) + claim.get("fact_refs", [])))
+        references = claim.get("refs", []) + claim.get("fact_refs", [])
         seen_refs = set()
 
         def resolve(ref):
@@ -65,6 +67,11 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
                     resolve(source)
             elif ref in evidence:
                 resolved[ref] = {"kind": "evidence", "value": evidence[ref]}
+            elif ref in events:
+                resolved[ref] = {"kind": "event", "value": events[ref]}
+                resolve(events[ref]["source_ref"])
+                if events[ref].get("aggregate_ref"):
+                    resolve(events[ref]["aggregate_ref"])
             elif ref.startswith("evidence.") and ref[9:] in evidence:
                 resolved[ref] = {"kind": "evidence", "value": evidence[ref[9:]]}
             elif ref in claims:
@@ -96,6 +103,9 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
             resolved_refs=deepcopy(resolved),
             dependency_claims=deps,
             unresolved_refs=unresolved,
+            context={"as_of": getattr(run, "manifest", {}).get("as_of"),
+                     "trade": deepcopy(getattr(run, "trade", {}))
+                     if claim.get("author_role") in {"trader", "risk_manager"} else {}},
         ))
     return tasks
 

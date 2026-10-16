@@ -7,6 +7,7 @@ from claim prose. Only explicit typed bindings are checked deterministically.
 """
 
 from types import SimpleNamespace
+import unittest
 
 from v3.facts import Fact, FactStore, CalcStore
 from v3.evidence import EvidenceStore
@@ -108,6 +109,11 @@ def test_atomic_task_resolves_explicit_refs_only():
     assert len(tasks) == 1
     assert "fact.dram_supply.2029" in tasks[0].resolved_refs
     assert tasks[0].unresolved_refs == []
+
+
+def load_tests(loader, tests, pattern):
+    return unittest.TestSuite(unittest.FunctionTestCase(v) for k, v in sorted(globals().items())
+                              if k.startswith("test_") and callable(v))
 
 
 if __name__ == "__main__":

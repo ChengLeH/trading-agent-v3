@@ -1,5 +1,4 @@
 """Contract regressions; no network or model required."""
-import copy
 import unittest
 from v4.test_atomic_phase6 import make_run
 

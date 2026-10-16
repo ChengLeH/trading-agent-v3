@@ -1,6 +1,6 @@
 """V4 canonical objects and graph invariants. Never interpret prose."""
 from copy import deepcopy
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 import hashlib
 import json
 
@@ -60,6 +60,13 @@ class Claim:
             raise ValueError("assertion.kind required")
         if not raw["assertion"]["kind"]:
             raise ValueError("assertion.kind must be nonempty")
+        assertion = raw["assertion"]
+        if assertion["kind"] == "value" and (assertion.get("ref_id") not in raw["refs"] or "value" not in assertion):
+            raise ValueError("value assertion requires a declared ref_id and value")
+        if assertion["kind"] == "event" and (assertion.get("event_ref") not in raw["refs"] or type(assertion.get("is_aggregate")) is not bool):
+            raise ValueError("event assertion requires declared event_ref and boolean is_aggregate")
+        if assertion["kind"] == "trade_plan" and (raw["author_role"] != "trader" or not isinstance(assertion.get("trade"), dict)):
+            raise ValueError("only trader may author a structured trade_plan assertion")
         if not isinstance(raw["bindings"], list):
             raise ValueError("bindings must be a list")
         for binding in raw["bindings"]:
@@ -123,9 +130,14 @@ def descendants(claims, seeds):
     affected = set(seeds)
     if affected - index.keys():
         raise ValueError("unknown changed claim")
-    while True:
-        expanded = affected | {cid for cid, c in index.items()
-                               if affected.intersection(c.get("dependencies", []))}
-        if expanded == affected:
-            return [cid for cid in index if cid in affected]
-        affected = expanded
+    children = {cid: [] for cid in index}
+    for cid, c in index.items():
+        for dep in c.get("dependencies", []):
+            children[dep].append(cid)
+    pending = list(affected)
+    while pending:
+        for child in children[pending.pop()]:
+            if child not in affected:
+                affected.add(child)
+                pending.append(child)
+    return [cid for cid in index if cid in affected]
