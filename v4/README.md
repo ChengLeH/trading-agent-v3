@@ -72,6 +72,8 @@ finding 只按明確 claim_id／claim_ids 路由；全局 finding 缺 ID 時由 
 
 每次成功修補都必須重新完成全局掃描；任何未處理 finding、缺掃描或舊報告雜湊都不能 finalize。
 超過修訂上限、雲端失敗、來源錯誤或無法定位，均回傳 blocked 且不附交付報告。
+命令列輸入或檢查點讀取失敗也會寫入本次 blocked 結果，覆蓋舊成功結果；檢查點保存失敗回報 blocked:checkpoint。
+若連結果檔都無法寫入，標準輸出會明列 blocked:output 與 result_written=false，不能把磁碟上的舊結果當成本次交付。
 執行輸出 `result.json` 包含報告、sidecar（來源與驗證附檔）、各層驗證紀錄、修訂歷程與雲端呼叫資訊；它是當次結果的唯一交付入口。
 
 ## 持久化與重新載入

@@ -66,6 +66,51 @@ def review_all(r):
 
 
 class Integration(unittest.TestCase):
+    def test_cli_malformed_input_replaces_prior_success_with_blocked_result(self):
+        from .__main__ import main
+        for source in ("--resume", "--manifest"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as temp:
+                out = Path(temp) / "out"
+                out.mkdir()
+                result_path = out / "result.json"
+                result_path.write_text(json.dumps(dict(status="complete", blocked=False, report_markdown="OLD SUCCESS")))
+                invalid = Path(temp) / "invalid.json"
+                invalid.write_text("not JSON")
+                args = [source, str(invalid), "--out", str(out), "--author-model", "author",
+                        "--verifier-model", "first", "--deep-model", "second", "--global-model", "global"]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(args), 2)
+                result = json.loads(result_path.read_text())
+                self.assertTrue(result["blocked"])
+                self.assertEqual(result["status"], "blocked:input")
+                self.assertNotIn("report_markdown", result)
+
+    def test_cli_checkpoint_and_output_write_failures_are_explicit(self):
+        from .__main__ import main
+        r = seeded()
+        review_all(r)
+        r.prepare_phase6_global_sweep()
+        r.collect_phase6_global_sweep([], model_identity="test/global")
+        completed = r.finalize()
+        with tempfile.TemporaryDirectory() as temp:
+            args = ["--resume", "unused.json", "--out", temp, "--author-model", "author",
+                    "--verifier-model", "first", "--deep-model", "second", "--global-model", "global"]
+            with patch("v4.__main__.load_checkpoint", return_value=r), \
+                 patch.object(r, "execute_phase6", return_value=completed), \
+                 patch("v4.__main__.save_checkpoint", side_effect=OSError("checkpoint unavailable")), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(args), 2)
+            saved = json.loads((Path(temp) / "result.json").read_text())
+            self.assertEqual(saved["status"], "blocked:checkpoint")
+            self.assertNotIn("report_markdown", saved)
+            stdout = io.StringIO()
+            with patch("v4.__main__.load_checkpoint", side_effect=ValueError("input invalid")), \
+                 patch("v4.__main__.write_json", side_effect=PermissionError("output denied")), \
+                 contextlib.redirect_stdout(stdout):
+                self.assertEqual(main(args), 2)
+            self.assertFalse(json.loads(stdout.getvalue())["result_written"])
+            self.assertEqual(json.loads(stdout.getvalue())["status"], "blocked:output")
+
     def test_manual_collect_requires_models_and_distinct_deep_identity(self):
         r = seeded()
         prepared = r.prepare_phase6_atomic()
@@ -274,6 +319,33 @@ class Integration(unittest.TestCase):
         r.orch.register_events(r.run_id, [event, member])
         findings, _ = r.orch.validate_stage(r.run_id, "final")
         self.assertTrue(any(f.get("check_id") == "event_total" for f in findings))
+
+    def test_event_catalog_and_binding_survive_checkpoint_roundtrip(self):
+        from .checkpoint import save_checkpoint, load_checkpoint
+        r = seeded()
+        source = Fact("fact.release", 100, "SHARES", "2026", concept="Release", entity="TEST", source_id="fixture")
+        r.run.fact_store.add(source)
+        event = dict(event_id="event.cap", date="2026-11-01", source_ref=source.fact_id,
+                     entity="TEST", concept="Release", period="2026", unit="SHARES",
+                     scope="combined", basis="reported", is_aggregate=True, value=100)
+        r.orch.register_events(r.run_id, [event])
+        c = claim("event.claim")
+        c.update(author_role="event_analyst", refs=[event["event_id"]],
+                 assertion=dict(kind="event", event_ref=event["event_id"], is_aggregate=True),
+                 bindings=[dict(ref_id=event["event_id"], **{key: event[key] for key in
+                                ("entity", "concept", "period", "unit", "scope", "basis")})])
+        r.orch.submit_batch(r.run_id, {"event_analyst": [c]})
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "events.json"
+            save_checkpoint(r, path)
+            restored = load_checkpoint(path)
+            self.assertEqual(restored.run.events, r.run.events)
+            self.assertEqual(restored.run.claims, r.run.claims)
+            atomic, deep = CloudDouble(), CloudDouble("test/deep")
+            sweep = CloudDouble("test/global", lambda _: [])
+            result = restored.execute_phase6(atomic, deep, sweep, sweep)
+            self.assertFalse(result["blocked"], result)
+            self.assertEqual(result["sidecar"]["events"], r.run.events)
 
     def test_typed_calculation_dag_and_mismatch(self):
         from .pipeline import calculation_findings
