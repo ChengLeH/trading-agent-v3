@@ -1,0 +1,34 @@
+AMAZON.COM, INC. — Management's Discussion and Analysis (excerpt, fixture for V3 Prototype A)
+
+Net sales increased 13% to $167.7 billion in the second quarter of 2026, compared
+with $148.9 billion in the second quarter of 2025. The increase was driven
+primarily by growth in AWS and advertising revenue.
+
+AWS segment sales increased 17% year-over-year to $30.9 billion. AWS operating
+income was $10.2 billion, with operating margin expanding to 33% as efficiency
+gains from custom silicon offset higher depreciation.
+
+Management expects AWS revenue growth to reaccelerate in the second half of 2026
+as enterprise migrations resume and AI workloads ramp. Capital expenditures for
+2026 are expected to be approximately $105 billion, weighted toward AI
+infrastructure including Trainium capacity and data center buildouts.
+
+North America segment operating margin improved to 6.4% from 5.1% a year ago,
+reflecting lower cost to serve and strong advertising growth. International
+segment returned to operating profitability.
+
+The company recognized a pre-tax gain of $53.4 billion from the revaluation of
+its investment in Anthropic. On an after-tax basis the gain contributed
+approximately $41.8 billion to net income. Management noted this gain is
+non-recurring and excluded it from discussion of operating trends.
+
+Risk factors updated this quarter include increased disclosure around AI
+infrastructure concentration and export controls affecting accelerator supply.
+
+Advertising revenue grew 22% year-over-year, outpacing overall retail growth.
+Management attributed the strength to sponsored product improvements and
+expanding off-Amazon demand.
+
+Free cash flow for the trailing twelve months was $18.4 billion, down from
+$23.1 billion, reflecting the step-up in AI capex. Management expects capex
+intensity to moderate in 2027 as data center capacity comes online.
