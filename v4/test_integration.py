@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import contextlib
+import io
 from v3.pipeline import RunState
 from v3.facts import Fact
 from .runner import PipelineRunnerV4, ROLES
@@ -44,7 +46,17 @@ def seeded():
     r.orch.runs[r.run_id] = RunState(run_id=r.run_id, ticker="TEST",
                                     manifest={"subject": {"ticker": "TEST"}, "as_of": "2026-10-16"})
     r.run.events = {}
-    r.orch.submit_batch(r.run_id, {"bull": [claim("a"), claim("b", ["a"]), claim("c", ["b"]), claim("independent")]})
+    r.orch.register_trade(r.run_id, {"direction": "WAIT"})
+    grouped = {"bull": [claim("a"), claim("b", ["a"]), claim("c", ["b"]), claim("independent")]}
+    for role in ROLES:
+        if role == "bull":
+            continue
+        c = claim("role." + role)
+        c["author_role"] = role
+        if role == "trader":
+            c["assertion"] = dict(kind="trade_plan", trade={"direction": "WAIT"})
+        grouped[role] = [c]
+    r.orch.submit_batch(r.run_id, grouped)
     return r
 
 
@@ -54,6 +66,109 @@ def review_all(r):
 
 
 class Integration(unittest.TestCase):
+    def test_manual_collect_requires_models_and_distinct_deep_identity(self):
+        r = seeded()
+        prepared = r.prepare_phase6_atomic()
+        results = {cid: verdict(cid, "FAIL" if cid == "a" else "PASS") for cid, _ in prepared["atomic_prompts"]}
+        for identity in (None, "", False, " "):
+            with self.subTest(stage="atomic", identity=identity), self.assertRaises(ValueError):
+                r.collect_phase6_atomic(results, model_identity=identity)
+            self.assertEqual(r.receipts, {})
+        r.collect_phase6_atomic(results, model_identity="test/first")
+        r.prepare_phase6_deep_review()
+        for identity in (None, "", False, " ", "test/first"):
+            with self.subTest(stage="deep", identity=identity), self.assertRaises(ValueError):
+                r.collect_phase6_deep_review({"a": verdict("a")}, model_identity=identity)
+            self.assertEqual(r.deep_receipts, {})
+        r.collect_phase6_deep_review({"a": verdict("a")}, model_identity="test/second")
+        r.prepare_phase6_global_sweep()
+        for identity in (None, "", False, " "):
+            with self.subTest(stage="global", identity=identity), self.assertRaises(ValueError):
+                r.collect_phase6_global_sweep([], model_identity=identity)
+            self.assertIsNone(r.global_receipt)
+        r.collect_phase6_global_sweep([], model_identity="test/global")
+        self.assertFalse(r.finalize()["blocked"])
+
+    def test_partial_role_checkpoint_never_skips_missing_roles_on_resume(self):
+        from .checkpoint import save_checkpoint, load_checkpoint
+        for completed in ((), ROLES[:4], ROLES[:6], ROLES[:7], ROLES[:8]):
+            with self.subTest(completed=completed), tempfile.TemporaryDirectory() as temp:
+                r = seeded()
+                r.run.claims = [c for c in r.run.claims if c["author_role"] in completed]
+                if "trader" not in completed:
+                    r.run.trade = {}
+                r.run.stage = "blocked:roles"
+                r.orch._sync_views(r.run)
+                path = Path(temp) / "partial.json"
+                save_checkpoint(r, path)
+                restored = load_checkpoint(path)
+                first, deep = CloudDouble(), CloudDouble("test/deep")
+                sweep = CloudDouble("test/global", lambda _: [])
+                result = restored.execute_phase6(first, deep, sweep, sweep)
+                self.assertTrue(result["blocked"])
+                self.assertIn("incomplete role", result["reason"])
+                self.assertNotIn("report_markdown", result)
+                self.assertEqual(first.calls, [])
+                with self.assertRaises(ValueError):
+                    restored.finalize()
+
+    def test_trade_plan_cannot_be_removed_and_failed_patch_is_transactional(self):
+        from .checkpoint import save_checkpoint, load_checkpoint
+        r = seeded()
+        review_all(r)
+        before = r.orch.snapshot(r.run_id)
+        receipts = copy.deepcopy(r.receipts)
+        r.prepare_phase6_revision_v4([dict(claim_id="role.trader", issue="invalid retype")])
+        with self.assertRaises(ValueError):
+            r.collect_phase6_revision([dict(claim_id="role.trader", assertion=dict(kind="interpretation"))])
+        self.assertEqual(r.orch.snapshot(r.run_id), before)
+        self.assertEqual(r.receipts, receipts)
+        self.assertEqual(r.history, [])
+        # A tampered checkpoint must hit the same invariant as initial inputs,
+        # patch candidates and final validation.
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "bad.json"
+            save_checkpoint(r, path)
+            data = json.loads(path.read_text())
+            for c in data["state"]["claims"]:
+                if c["claim_id"] == "role.trader":
+                    c["assertion"] = dict(kind="interpretation")
+            path.write_text(json.dumps(data))
+            with self.assertRaises(ValueError):
+                load_checkpoint(path)
+
+    def test_cli_success_and_blocked_run_replace_single_delivery_artifact(self):
+        from .__main__ import main
+        def author_response(prompt):
+            packet = json.loads(prompt.split("<context-data>\n")[1].split("\n</context-data>")[0])
+            c = claim(packet["role"] + ".1")
+            c["author_role"] = packet["role"]
+            output = {"claims": [c]}
+            if packet["role"] == "trader":
+                output["trade"] = {"direction": "WAIT"}
+                c["assertion"] = dict(kind="trade_plan", trade=output["trade"])
+            return output
+        clients = {"author": CloudDouble("test/author", author_response), "atomic": CloudDouble(),
+                   "deep": CloudDouble("test/deep"), "global": CloudDouble("test/global", lambda _: [])}
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "news.json"
+            path.write_text(json.dumps({"items": [dict(title="test", url="https://example.test/source", published="2026-10-15")]}))
+            manifest_path = Path(temp) / "manifest.json"
+            manifest_path.write_text(json.dumps(dict(subject={"ticker": "TEST"}, as_of="2026-10-16",
+                                                     sources=[dict(id="news", type="news_json", path=str(path))])))
+            out = Path(temp) / "out"
+            args = ["--manifest", str(manifest_path), "--out", str(out), "--author-model", "author",
+                    "--verifier-model", "atomic", "--deep-model", "deep", "--global-model", "global"]
+            with patch("v4.__main__.GeminiCloudClient", side_effect=lambda model: clients[model]), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(args), 0)
+                self.assertIn("report_markdown", json.loads((out / "result.json").read_text()))
+                self.assertTrue((out / "checkpoint.json").exists())
+                clients["global"].responder = lambda _: "not JSON"
+                self.assertEqual(main(args), 2)
+                blocked = json.loads((out / "result.json").read_text())
+                self.assertTrue(blocked["blocked"])
+                self.assertNotIn("report_markdown", blocked)
+
     @patch("v3.pipeline.build_packet", side_effect=AssertionError("legacy packet"))
     @patch("v3.validation.ValidationService.validate_stage", side_effect=AssertionError("legacy validation"))
     @patch("v3.runner.build_subagent_prompt", side_effect=AssertionError("legacy schema"))
@@ -107,7 +222,7 @@ class Integration(unittest.TestCase):
         sweep = CloudDouble("test/global", lambda _: [])
         result = r.execute_phase6(atomic, deep, author, sweep)
         self.assertFalse(result["blocked"], result)
-        self.assertEqual(len(atomic.calls), 7)
+        self.assertEqual(len(atomic.calls), 15)
         self.assertEqual(len(deep.calls), 1)
         self.assertEqual(len(sweep.calls), 1)
         self.assertEqual(result["sidecar"]["revision_history"][0]["affected_claim_ids"], ["a", "b", "c"])
@@ -147,11 +262,11 @@ class Integration(unittest.TestCase):
                      scope="combined", basis="reported", is_aggregate=True, value=100)
         r.orch.register_events(r.run_id, [event])
         c = claim("event.claim")
-        c.update(author_role="bear", text="完全無關的文字仍由結構檢查", refs=[event["event_id"]],
+        c.update(author_role="event_analyst", text="完全無關的文字仍由結構檢查", refs=[event["event_id"]],
                  assertion=dict(kind="event", event_ref=event["event_id"], is_aggregate=False),
                  bindings=[{k: event[k] for k in ("entity", "concept", "period", "unit", "scope", "basis")}])
         c["bindings"][0]["ref_id"] = event["event_id"]
-        r.orch.submit_batch(r.run_id, {"bear": [c]})
+        r.orch.submit_batch(r.run_id, {"event_analyst": [c]})
         findings, blocked = r.orch.validate_stage(r.run_id, "final")
         self.assertTrue(blocked)
         self.assertTrue(any(f.get("check_id") == "event_binding" for f in findings))
@@ -174,21 +289,22 @@ class Integration(unittest.TestCase):
     def test_trade_claim_patch_regenerates_numeric_resources_and_risk_context(self):
         r = seeded()
         original = dict(direction="BUY", entry=100, stop=90, target=120, position_pct=10)
-        c = claim("trader.plan")
-        c.update(author_role="trader", dependencies=["a"], assertion=dict(kind="trade_plan", trade=original))
         r.orch.register_trade(r.run_id, original)
-        r.orch.submit_batch(r.run_id, {"trader": [c]})
-        risk = claim("risk.decision", ["trader.plan"])
-        risk["author_role"] = "risk_manager"
-        r.orch.submit_batch(r.run_id, {"risk_manager": [risk]})
+        plan_id, risk_id = "role.trader", "role.risk_manager"
+        for c in r.run.claims:
+            if c["claim_id"] == plan_id:
+                c.update(dependencies=["a"], assertion=dict(kind="trade_plan", trade=original))
+            if c["claim_id"] == risk_id:
+                c["dependencies"] = [plan_id]
+        r.orch._sync_views(r.run)
         review_all(r)
-        r.prepare_phase6_revision_v4([dict(claim_id="trader.plan", issue="change plan")])
+        r.prepare_phase6_revision_v4([dict(claim_id=plan_id, issue="change plan")])
         updated = {**original, "stop": 95}
-        pending = r.collect_phase6_revision([dict(claim_id="trader.plan", assertion=dict(kind="trade_plan", trade=updated))])
+        pending = r.collect_phase6_revision([dict(claim_id=plan_id, assertion=dict(kind="trade_plan", trade=updated))])
         self.assertEqual(r.run.trade, updated)
         self.assertEqual(r.run.fact_store.get("fact.Trade.Stop").value, 95)
         self.assertEqual(r.run.calc_store.get("calc.trade.risk_reward")["value"], 4)
-        self.assertEqual(set(pending["revalidate_claim_ids"]), {"trader.plan", "risk.decision"})
+        self.assertEqual(set(pending["revalidate_claim_ids"]), {plan_id, risk_id})
         self.assertEqual(r.orch.get_packet(r.run_id, "risk_manager")["trade"], updated)
         self.assertFalse(any(f["status"] == "FAIL" for f in r.orch.validate_stage(r.run_id, "final")[0]))
 
@@ -202,7 +318,7 @@ class Integration(unittest.TestCase):
             sweep = CloudDouble("test/global", lambda _: [])
             result = r.execute_phase6(first, deep, sweep, sweep)
             self.assertFalse(result["blocked"])
-            self.assertEqual(len(first.calls), 4)
+            self.assertEqual(len(first.calls), 12)
             self.assertEqual(deep.calls, [])
             self.assertEqual(len(sweep.calls), 1)
 
@@ -210,21 +326,21 @@ class Integration(unittest.TestCase):
         r = seeded()
         review_all(r)
         r.prepare_phase6_global_sweep()
-        r.collect_phase6_global_sweep([])
+        r.collect_phase6_global_sweep([], model_identity="test/global")
         r.prepare_phase6_revision_v4([dict(claim_id="a", issue="fix")])
         result = r.collect_phase6_revision([dict(claim_id="a", text="修正版")])
         self.assertEqual(result["revalidate_claim_ids"], ["a", "b", "c"])
         self.assertEqual({cid for cid, _ in result["atomic_prompts"]}, {"a", "b", "c"})
-        self.assertEqual(set(r.receipts), {"independent"})
+        self.assertEqual(set(r.receipts), {c["claim_id"] for c in r.run.claims} - {"a", "b", "c"})
         self.assertEqual(r.run.analyses["bull"]["claims"][0]["text"], "修正版")
         self.assertEqual(r.orch.get_packet(r.run_id, "trader")["claims"][0]["text"], "修正版")
         with self.assertRaises(ValueError):
             r.finalize()
-        r.collect_phase6_atomic({cid: verdict(cid) for cid, _ in result["atomic_prompts"]})
+        r.collect_phase6_atomic({cid: verdict(cid) for cid, _ in result["atomic_prompts"]}, model_identity="test/first")
         with self.assertRaises(ValueError):
             r.finalize()
         r.prepare_phase6_global_sweep()
-        r.collect_phase6_global_sweep([])
+        r.collect_phase6_global_sweep([], model_identity="test/global")
         self.assertIn("修正版", r.finalize()["report_markdown"])
 
     def test_patch_rolls_back_on_duplicate_unknown_author_or_cycle(self):
@@ -243,12 +359,12 @@ class Integration(unittest.TestCase):
     def test_missing_wrong_and_stale_atomic_responses_cannot_deliver(self):
         r = seeded()
         r.prepare_phase6_atomic()
-        self.assertTrue(r.collect_phase6_atomic({"a": verdict("a")})["blocked"])
+        self.assertTrue(r.collect_phase6_atomic({"a": verdict("a")}, model_identity="test/first")["blocked"])
         with self.assertRaises(ValueError):
-            r.collect_phase6_atomic({cid: verdict("wrong") for cid in ("a", "b", "c", "independent")})
+            r.collect_phase6_atomic({c["claim_id"]: verdict("wrong") for c in r.run.claims}, model_identity="test/first")
         r.run.claims[0]["text"] = "changed while in flight"
         with self.assertRaises(ValueError):
-            r.collect_phase6_atomic({cid: verdict(cid) for cid in ("a", "b", "c", "independent")})
+            r.collect_phase6_atomic({c["claim_id"]: verdict(c["claim_id"]) for c in r.run.claims}, model_identity="test/first")
         with self.assertRaises(ValueError):
             r.finalize()
 
@@ -257,8 +373,8 @@ class Integration(unittest.TestCase):
         with self.assertRaises(ValueError):
             r.prepare_phase6_deep_review(["a"])
         r.prepare_phase6_atomic()
-        r.collect_phase6_atomic({cid: verdict(cid, "SUSPICIOUS" if cid == "a" else "PASS")
-                                  for cid in ("a", "b", "c", "independent")}, model_identity="test/first")
+        r.collect_phase6_atomic({c["claim_id"]: verdict(c["claim_id"], "SUSPICIOUS" if c["claim_id"] == "a" else "PASS")
+                                  for c in r.run.claims}, model_identity="test/first")
         with self.assertRaises(ValueError):
             r.prepare_phase6_deep_review(["independent"])
         r.prepare_phase6_deep_review()
@@ -266,7 +382,7 @@ class Integration(unittest.TestCase):
             r.collect_phase6_deep_review({"a": verdict("a")}, model_identity="test/first")
         r.collect_phase6_deep_review({"a": verdict("a")}, model_identity="test/second")
         r.prepare_phase6_global_sweep()
-        r.collect_phase6_global_sweep([])
+        r.collect_phase6_global_sweep([], model_identity="test/global")
         self.assertFalse(r.finalize()["blocked"])
 
     def test_linker_complete_unique_known_nonempty_or_explicit_unresolved(self):
@@ -290,12 +406,12 @@ class Integration(unittest.TestCase):
         with self.assertRaises(ValueError):
             r.finalize()
         r.prepare_phase6_global_sweep()
-        r.collect_phase6_global_sweep([dict(issue="stale", claim_ids=["a"])])
+        r.collect_phase6_global_sweep([dict(issue="stale", claim_ids=["a"])], model_identity="test/global")
         with self.assertRaises(ValueError):
             r.finalize()
         r.prepare_phase6_global_sweep()
-        r.collect_phase6_global_sweep([])
-        r.run.trade = {"direction": "WAIT"}
+        r.collect_phase6_global_sweep([], model_identity="test/global")
+        r.run.manifest["as_of"] = "2026-10-17"
         with self.assertRaises(ValueError):
             r.finalize()
 
@@ -315,10 +431,10 @@ class Integration(unittest.TestCase):
                  basis="gaap", scope="consolidated", source_id="fixture")
         r.run.fact_store.add(f)
         source = claim("source")
-        source.update(author_role="bear", refs=[f.fact_id], fact_refs=[f.fact_id],
+        source.update(author_role="source_analyst", refs=[f.fact_id], fact_refs=[f.fact_id],
                       bindings=[dict(ref_id=f.fact_id, **{k: getattr(f, k) for k in
                                     ("entity", "concept", "period", "unit", "scope", "basis")})])
-        r.orch.submit_batch(r.run_id, {"bear": [source]})
+        r.orch.submit_batch(r.run_id, {"source_analyst": [source]})
         review_all(r)
         f.value = 11
         pending = r.prepare_phase6_atomic()["atomic_prompts"]
@@ -326,7 +442,7 @@ class Integration(unittest.TestCase):
         # Removal must block final delivery, even if an LLM says PASS.
         r.run.fact_store._facts.pop(f.fact_id)
         r.prepare_phase6_atomic()
-        r.collect_phase6_atomic({"source": verdict("source")})
+        r.collect_phase6_atomic({"source": verdict("source")}, model_identity="test/first")
         with self.assertRaises(ValueError):
             r.prepare_phase6_global_sweep()
 

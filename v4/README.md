@@ -44,6 +44,7 @@ python -m v4 --manifest /path/to/manifest.json \
 程式庫亦可注入具 `execution="cloud"`、`identity`、`complete(prompt)` 的既有雲端連線介面。
 這是呼叫端的信任界線；V4 不會把任意呼叫介面的自述當成供應商認證。
 `prepare_*`／`collect_*` API（程式介面）可供既有 assistant coordinator（助理協調流程）逐步驅動；每次 collect 必須提交完整 JSON。
+逐步入口與自動入口都要求非空的模型識別；第一層與深度審查必須不同，缺漏身分時不會發布驗證紀錄。
 舊名稱 `prepare_phase6`、`prepare_phase6_verify`、`collect_phase6`、`prepare_phase6_revision` 已重新指向 V4 契約，其回傳形狀不再與 V3 相同。
 
 ## Claim 與資料契約
@@ -84,7 +85,8 @@ python -m v4 --resume /path/to/v4-output/checkpoint.json \
 
 checkpoint（檢查點）以暫存檔與原子替換保存正式物件及稽核資訊，不包含憑證。
 重新載入會驗證 schema 與 DAG，重建分析視圖；序列化的舊審查紀錄只作稽核，不能當成新執行的通行證。
-因此重啟後全部 Claim 與全局掃描都會再驗一次，會有額外雲端費用。原角色生成尚未完成的檢查點，不應當成完整研究報告。
+因此重啟後全部 Claim 與全局掃描都會再驗一次，會有額外雲端費用。原角色生成尚未完成的檢查點會被封鎖，須重新由 manifest 執行角色流程；不會直接進 Phase 6 或交付半份報告。
+初始提交、修補、重新載入與最終驗證都共同要求 trader 的唯一 trade_plan，且它必須與衍生交易狀態一致。要撤單請修成 WAIT 方案，不能刪除或改型後留下舊 BUY／SHORT。
 V3 的 Markdown 或舊 Claim 缺欄位時，不能自動用文字猜成 V4；必須重新執行 V4 角色流程，或由明確結構化資料完成遷移。
 
 ## 驗證與限制

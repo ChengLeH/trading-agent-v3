@@ -49,6 +49,12 @@ def decode_response(result):
     return json.loads(result) if isinstance(result, str) else result
 
 
+def require_model_identity(identity):
+    if not isinstance(identity, str) or not identity.strip():
+        raise ValueError("explicit nonempty cloud model identity required")
+    return identity
+
+
 class PipelineRunnerV4:
     def __init__(self, *, max_revisions=3, max_workers=4):
         if not isinstance(max_revisions, int) or not 0 <= max_revisions <= 20:
@@ -172,6 +178,7 @@ class PipelineRunnerV4:
                     claim_count=len(pending), total_claim_count=len(tasks), binding_findings=findings)
 
     def collect_phase6_atomic(self, results_by_claim, *, model_identity=None):
+        require_model_identity(model_identity)
         if self.pending_atomic is None:
             raise ValueError("prepare atomic review before collecting")
         tasks = self._tasks()
@@ -198,6 +205,8 @@ class PipelineRunnerV4:
         tasks = self._tasks()
         if not tasks or set(tasks) != set(self.receipts):
             raise ValueError("all current claims require semantic verification")
+        for receipt in self.receipts.values():
+            require_model_identity(receipt.get("model"))
         return tasks
 
     def prepare_phase6_deep_review(self, claim_ids=None):
@@ -218,6 +227,7 @@ class PipelineRunnerV4:
         return dict(deep_prompts=prompts, deep_review_claim_ids=wanted)
 
     def collect_phase6_deep_review(self, results_by_claim, *, model_identity=None):
+        require_model_identity(model_identity)
         if not self.pending_deep:
             raise ValueError("prepare deep review first")
         tasks = self._require_atomic()
@@ -227,10 +237,12 @@ class PipelineRunnerV4:
         if not summary["complete"]:
             self.status = "blocked:missing_deep"
             return {**summary, "blocked": True}
-        for cid, result in summary["results"].items():
-            first_model = self.receipts[cid]["model"]
-            if model_identity and first_model == model_identity:
+        # Check the entire batch before publishing any second-layer receipt.
+        for cid in summary["results"]:
+            first_model = require_model_identity(self.receipts[cid].get("model"))
+            if first_model == model_identity:
                 raise ValueError("deep reviewer must be a distinct cloud model")
+        for cid, result in summary["results"].items():
             self.deep_receipts[cid] = dict(input_hash=self.pending_deep[cid], result=deepcopy(result), model=model_identity)
         self.pending_deep = None
         findings = self._review_findings()
@@ -244,6 +256,8 @@ class PipelineRunnerV4:
                 continue
             if cid not in self.deep_receipts:
                 raise ValueError("every non-PASS claim requires independent deep review")
+            if require_model_identity(self.deep_receipts[cid].get("model")) == require_model_identity(r.get("model")):
+                raise ValueError("deep review model must differ from atomic verifier")
             result = self.deep_receipts[cid]["result"]
             if result["verdict"] != "PASS":
                 findings.extend({**f, "claim_id": cid} for f in result["findings"])
@@ -331,6 +345,7 @@ class PipelineRunnerV4:
         return dict(revalidate_claim_ids=affected, **self.prepare_phase6_atomic())
 
     def _ready_for_global(self):
+        self._require_complete_roles()
         self._require_atomic()
         if self._review_findings():
             raise ValueError("outstanding semantic findings")
@@ -338,6 +353,14 @@ class PipelineRunnerV4:
         if blocked:
             raise ValueError("deterministic findings block global sweep")
         return findings
+
+    def _require_complete_roles(self):
+        # Derive completion from canonical claims, not a saved stage label or
+        # analysis view that a partial checkpoint might carry.
+        completed = {c["author_role"] for c in self.run.claims}
+        missing = set(ROLES) - completed
+        if missing:
+            raise ValueError(f"incomplete role generation; missing {sorted(missing)}; restart role generation from manifest")
 
     def prepare_phase6_global_sweep(self):
         self._ready_for_global()
@@ -352,6 +375,7 @@ class PipelineRunnerV4:
             dict(state=self._state(), report_markdown=rendered["report_markdown"], history=self.history)))
 
     def collect_phase6_global_sweep(self, findings, *, model_identity=None):
+        require_model_identity(model_identity)
         self._ready_for_global()
         if not self.pending_global or self.pending_global["input_hash"] != self._hash():
             raise ValueError("stale or unprepared global sweep")
@@ -375,6 +399,7 @@ class PipelineRunnerV4:
         findings = self._ready_for_global()
         if not self.global_receipt or self.global_receipt["input_hash"] != self._hash() or self.global_receipt["findings"]:
             raise ValueError("current report requires a clean global LLM consistency sweep")
+        require_model_identity(self.global_receipt.get("model"))
         rendered = render_report(self.orch.snapshot(self.run_id))
         if rendered["sidecar"]["report_hash"] != self.global_receipt["report_hash"]:
             raise ValueError("rendered report changed after global sweep")
@@ -403,9 +428,11 @@ class PipelineRunnerV4:
         for client in clients:
             if getattr(client, "execution", None) != "cloud" or not getattr(client, "identity", None):
                 raise ValueError("V4 requires explicit cloud client identities")
+            require_model_identity(client.identity)
         if verifier.identity == deep_reviewer.identity:
             raise ValueError("atomic verifier and deep reviewer must be distinct models")
         try:
+            self._require_complete_roles()
             while True:
                 prepared = self.prepare_phase6_atomic()
                 results = self._parallel(verifier, prepared["atomic_prompts"])

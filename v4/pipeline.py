@@ -26,6 +26,15 @@ def source_catalog(run):
     return sources
 
 
+def validate_trade_claim(claims, trade):
+    plans = [c for c in claims if c["assertion"]["kind"] == "trade_plan"]
+    has_trader = any(c["author_role"] == "trader" for c in claims)
+    if len(plans) != (1 if has_trader else 0):
+        raise ValueError("trader requires exactly one canonical trade_plan Claim")
+    if plans and plans[0]["assertion"]["trade"] != trade:
+        raise ValueError("canonical trade_plan Claim differs from derived trade state")
+
+
 def calculation_findings(run):
     """Recompute typed operations using V3's pure finance kernel."""
     facts, calcs = run.fact_store.to_dict(), run.calc_store.to_dict()
@@ -155,6 +164,7 @@ class OrchestratorV4(Orchestrator):
                 incoming.append(c)
         candidate = run.claims + incoming
         index = claim_index(candidate)  # transactional validation, including cross-role dependencies
+        validate_trade_claim(candidate, run.trade)
         sources = source_catalog(run)
         fact_ids = set(run.fact_store.to_dict())
         if set(sources).intersection(index):
@@ -194,6 +204,7 @@ class OrchestratorV4(Orchestrator):
     def validate_stage(self, run_id, stage):
         run = self.runs[run_id]
         claim_index(run.claims)
+        validate_trade_claim(run.claims, run.trade)
         out = []
         for fn, args in ((check_source_integrity, (run.records,)),
                          (check_source_identity, (run.manifest, [r for r in run.records if not isinstance(r, SourceError)]))):
@@ -329,8 +340,8 @@ class OrchestratorV4(Orchestrator):
         # Reuse exactly the same source/schema contracts as initial ingestion.
         shadow = deepcopy(run)
         trade_claims = [c for c in candidate if c["assertion"]["kind"] == "trade_plan"]
-        if len(trade_claims) > 1:
-            raise ValueError("only one canonical trade_plan Claim is allowed")
+        if len(trade_claims) != (1 if any(c["author_role"] == "trader" for c in candidate) else 0):
+            raise ValueError("patch must preserve the canonical trade_plan Claim")
         shadow.claims, shadow.analyses = [], {}
         self.runs["__patch_candidate__"] = shadow
         try:

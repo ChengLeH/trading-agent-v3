@@ -1,5 +1,7 @@
 """Contract regressions; no network or model required."""
 import unittest
+import ast
+from pathlib import Path
 from v4.test_atomic_phase6 import make_run
 
 
@@ -10,6 +12,17 @@ def claim(cid="c1", deps=None):
 
 
 class Contracts(unittest.TestCase):
+    def test_v4_production_has_no_regex_or_legacy_prose_entrypoint_imports(self):
+        for path in Path(__file__).parent.glob("*.py"):
+            if path.name.startswith("test_"):
+                continue
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    self.assertFalse(any(a.name in {"re", "regex", "v3.runner", "v3.reporting"} for a in node.names), path)
+                if isinstance(node, ast.ImportFrom):
+                    self.assertNotIn(node.module, {"re", "regex", "v3.runner", "v3.reporting"}, path)
+
     def test_duplicate_and_missing_ids_rejected_before_task_dispatch(self):
         from v4.atomic_phase6 import build_atomic_tasks
         for claims in ([claim(), claim()], [dict(text="missing")]):
