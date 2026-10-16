@@ -1,0 +1,5 @@
+.venv/
+.codegraph/
+.depgraph.json
+__pycache__/
+*.pyc
