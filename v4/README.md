@@ -36,7 +36,7 @@ python -m v4 --manifest /path/to/manifest.json \
 ```
 
 模型 ID 必須由執行者明確指定，verifier 與 deep 必須不同。憑證只讀取環境變數 `GEMINI_API_KEY`，不搜尋本機憑證檔、不建立金鑰、不啟動本地模型。
-內建 adapter（連線介面）只直接連線 Google 固定 HTTPS API，不接受自訂本地網址、不走 agy、不跟隨重新導向，也不使用環境代理伺服器。
+內建 adapter（連線介面）使用 Google 固定 HTTPS API，不接受自訂本地網址、不走 agy、不跟隨重新導向；沿用系統代理設定，包含環境變數指定的 egress proxy（對外連線代理），保留 TLS（傳輸加密）憑證驗證。
 協定依據：[Google generateContent 官方文件](https://ai.google.dev/api/generate-content)。
 每次實際回應記錄 requested_model、served_model（伺服器有提供時）、response_id 與 usage；請求的模型名稱不等於已證實的後端身分。
 同一 API 供應商的不同模型提供模型層級獨立性，不能據此聲稱不同模型家族已驗證。

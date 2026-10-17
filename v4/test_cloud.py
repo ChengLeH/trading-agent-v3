@@ -5,12 +5,25 @@ import os
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
+from urllib.request import ProxyHandler
 from .cloud import GeminiCloudClient, NoRedirect
 
 
 class Transport(unittest.TestCase):
     def response(self, payload):
         return io.BytesIO(json.dumps(payload).encode())
+
+    def test_environment_proxy_is_used_without_allowing_redirects(self):
+        for env, expected in (({"https_proxy": "http://egress.invalid:3128"},
+                               {"https": "http://egress.invalid:3128"}), ({}, {})):
+            with self.subTest(env=env), patch.dict(os.environ, {"GEMINI_API_KEY": "test-key", **env}, clear=True), \
+                    patch("v4.cloud.build_opener") as opener:
+                opener.return_value.open.return_value = self.response(dict(candidates=[
+                    dict(finishReason="STOP", content=dict(parts=[dict(text='{"ok":true}')]))]))
+                self.assertEqual(GeminiCloudClient("test").complete("test"), {"ok": True})
+                handlers = opener.call_args.args
+                self.assertEqual(next(h.proxies for h in handlers if isinstance(h, ProxyHandler)), expected)
+                self.assertTrue(any(isinstance(h, NoRedirect) for h in handlers))
 
     def test_explicit_cloud_endpoint_model_and_audit(self):
         client = GeminiCloudClient("test-model")

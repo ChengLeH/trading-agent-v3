@@ -38,9 +38,9 @@ class GeminiCloudClient:
                        generationConfig=dict(responseMimeType="application/json", temperature=0.1))
         req = Request(url, data=json.dumps(payload).encode(), method="POST",
                       headers={"Content-Type": "application/json", "x-goog-api-key": key})
-        # Explicit direct HTTPS: environment proxy settings cannot silently
-        # route requests into a local model endpoint. No key in URLs or logs.
-        opener = build_opener(ProxyHandler({}), NoRedirect())
+        # Honor system/egress proxies while keeping the fixed Google HTTPS
+        # endpoint, TLS verification and redirect rejection. No key in URLs/logs.
+        opener = build_opener(ProxyHandler(), NoRedirect())
         try:
             with opener.open(req, timeout=self.timeout) as response:
                 data = json.load(response)
