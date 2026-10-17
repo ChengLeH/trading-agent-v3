@@ -700,5 +700,90 @@ class AdjustableRuntimeLimits(unittest.TestCase):
             self.assertEqual(client.call_args.kwargs["max_continuations"], 12)
             self.assertEqual(client.call_args.kwargs["session_budget_seconds"], 14400)
 
+
+class BindingReferenceContracts(unittest.TestCase):
+    def fixture(self):
+        from .schema import DIMENSIONS
+        runner = seeded()
+        fact = Fact("fact.binding", 10, "USD", "FY2025", entity="TEST", concept="Revenue",
+                    basis="gaap", scope="consolidated", source_id="fixture")
+        runner.run.fact_store.add(fact)
+        c = claim("binding_user.conclusion", ["a"])
+        c.update(author_role="binding_user", refs=[fact.fact_id, "a"], fact_refs=[fact.fact_id],
+                 bindings=[dict(ref_id=fact.fact_id, **{key: getattr(fact, key) for key in DIMENSIONS}),
+                           dict(ref_id="a", **{key: "unknown" for key in DIMENSIONS})])
+        return runner, c
+
+    def test_source_and_claim_bindings_are_preserved_and_both_semantically_checked(self):
+        runner, c = self.fixture()
+        runner.orch.submit_batch(runner.run_id, {"binding_user": [c]})
+        stored = next(row for row in runner.run.claims if row["claim_id"] == c["claim_id"])
+        self.assertEqual(stored["bindings"], c["bindings"])
+        findings, _ = runner.orch.validate_stage(runner.run_id, "final")
+        self.assertFalse(any(f.get("status") == "FAIL" and f.get("ref_id") == "a" for f in findings))
+        prepared = runner.prepare_phase6_atomic()
+        cid = c["claim_id"]
+        self.assertIn(cid, [key for key, _ in prepared["atomic_prompts"]])
+        schema = prepared["response_schemas"][cid]
+        self.assertEqual(set(schema["properties"]["reference_checks"]["items"]["properties"]["ref_id"]["enum"]),
+                         {"a", "fact.binding"})
+        results = {row["claim_id"]: verdict(row["claim_id"], ref_ids=reference_ids(row)) for row in runner.run.claims}
+        results[cid]["reference_checks"] = [row for row in results[cid]["reference_checks"] if row["ref_id"] != "a"]
+        summary = runner.collect_phase6_atomic(results, model_identity="test/verifier")
+        self.assertTrue(summary["blocked"])
+        self.assertIn(cid, summary["invalid_claim_ids"])
+
+    def test_role_prompt_output_with_claim_binding_reaches_next_native_phase(self):
+        runner, c = self.fixture()
+        c.update(claim_id="research_manager.conclusion", author_role="research_manager")
+        runner.run.claims = [row for row in runner.run.claims if row["author_role"] not in
+                             {"research_manager", "trader", "risk_manager"}]
+        runner.run.analyses = {role: value for role, value in runner.run.analyses.items() if role not in
+                               {"research_manager", "trader", "risk_manager"}}
+        runner.orch._sync_views(runner.run)
+        author = CloudDouble("test/author", lambda _: dict(claims=[c]))
+        role, prompt = runner._role_prompts(("research_manager",))[0]
+        response = runner._complete(author, role, prompt, reuse_role_output=True)
+        next_role, _ = runner.collect_rm(response["claims"])
+        self.assertEqual(next_role, "trader")
+        self.assertEqual(next(row for row in runner.run.claims if row["claim_id"] == c["claim_id"])["bindings"], c["bindings"])
+
+    def test_optional_claim_binding_does_not_weaken_source_or_dependency_constraints(self):
+        for mutation in ("missing_source", "duplicate_source", "duplicate_claim", "unknown", "missing_dependency"):
+            with self.subTest(mutation=mutation):
+                runner, c = self.fixture()
+                if mutation == "missing_source": c["bindings"] = c["bindings"][1:]
+                elif mutation == "duplicate_source": c["bindings"].append(copy.deepcopy(c["bindings"][0]))
+                elif mutation == "duplicate_claim": c["bindings"].append(copy.deepcopy(c["bindings"][1]))
+                elif mutation == "unknown":
+                    c["refs"][-1] = "missing"; c["bindings"][-1]["ref_id"] = "missing"
+                else: c["dependencies"] = []
+                before = copy.deepcopy(runner.run.claims)
+                with self.assertRaises(ValueError): runner.orch.submit_batch(runner.run_id, {"binding_user": [c]})
+                self.assertEqual(runner.run.claims, before)
+
+    def test_real_source_binding_mismatch_still_fails_and_claim_binding_is_optional(self):
+        for include_claim in (True, False):
+            with self.subTest(include_claim=include_claim):
+                runner, c = self.fixture()
+                if not include_claim: c["bindings"].pop()
+                c["bindings"][0]["unit"] = "shares"
+                runner.orch.submit_batch(runner.run_id, {"binding_user": [c]})
+                findings, blocked = runner.orch.validate_stage(runner.run_id, "final")
+                self.assertTrue(blocked)
+                self.assertTrue(any(f.get("status") == "FAIL" and f.get("ref_id") == "fact.binding"
+                                    and f.get("dimension") == "unit" for f in findings))
+
+    def test_claim_bindings_survive_checkpoint_reload_and_surgical_patching(self):
+        from .checkpoint import save_checkpoint, load_checkpoint
+        runner, c = self.fixture()
+        runner.orch.submit_batch(runner.run_id, {"binding_user": [c]})
+        with tempfile.TemporaryDirectory() as temp:
+            checkpoint = Path(temp) / "checkpoint.json"; save_checkpoint(runner, checkpoint)
+            restored = load_checkpoint(checkpoint)
+        self.assertEqual(next(row for row in restored.run.claims if row["claim_id"] == c["claim_id"])["bindings"], c["bindings"])
+        restored.orch.patch(restored.run_id, [dict(claim_id=c["claim_id"], text="Updated conclusion")], [c["claim_id"]])
+        self.assertEqual(next(row for row in restored.run.claims if row["claim_id"] == c["claim_id"])["bindings"], c["bindings"])
+
 if __name__ == "__main__":
     unittest.main()

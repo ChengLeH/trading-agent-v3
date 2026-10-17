@@ -83,6 +83,7 @@ P6 的單條與分批路徑都會隨完成順序寫入合格收據與 `checkpoin
 - ID 必須唯一；相依關係不得循環、缺失；Claim 引用若指向另一 Claim，也必須列在 dependencies。
 - assertion 至少有 `kind`。`kind=value` 必須明列 `ref_id/value`；`kind=event` 必須明列 `event_ref/is_aggregate`。
 - 每個來源引用恰一個 binding，必填 `ref_id/entity/concept/period/scope/unit/basis`。未知維度填 `unknown`，不得猜測；未知來源維度交由 LLM 判斷證據是否足夠。
+- `refs` 可含來源與上游 Claim ID；Claim ref 仍須列於 `dependencies`。Claim binding 可省略；已提供的 Claim binding 會原樣保留供 LLM 驗證歸因，不當作 Fact 做來源維度比對。所有 binding 都須有完整欄位且 ref_id 不重複；來源 binding 的完整性與維度比對照常執行。ID 類型依實際目錄判斷，不靠名稱猜測。
 - FACT 維度與明確數值直接比較；保留 share_basis、effective_date、source_id、source_hash 等來源資訊。Evidence 或 Calc 沒有的維度不由 Python 從文字補猜。
 - trader 恰一條 `assertion.kind=trade_plan` Claim，內含完整 `trade` 物件，與 trader 回覆的 trade 相同。修訂它會重建該方案產生的 Fact／Calc，並使相關驗證失效。
 - 事件由 `OrchestratorV4.register_events()` 接受結構化 catalog（目錄）。每筆事件必填 event_id/date/source_ref 與完整維度、value、is_aggregate；子事件以 aggregate_ref 明列所屬合計，不從文字或相近數值猜關係。

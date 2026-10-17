@@ -59,13 +59,15 @@ def validate_claim_bindings(
     require_bindings: bool = False,
     sources=None,
 ) -> List[BindingFinding]:
-    """Validate explicit claim bindings against FACT metadata.
+    """Compare source bindings with canonical typed metadata, never prose.
 
-    No claim text is inspected. A missing binding is WARN during migration and
-    FAIL when require_bindings=True. Non-FACT refs are ignored here and remain
-    the responsibility of calc/evidence/claim validators.
+    Known Claim bindings describe an upstream premise, not a source record.
+    Their attribution is checked by mandatory LLM reference review; structural
+    declaration and DAG checks remain required.
     """
 
+    claims = list(claims)
+    claim_ids = {c.get("claim_id") for c in claims if isinstance(c.get("claim_id"), str)}
     facts = _fact_dict(fact_store)
     canonical = sources if sources is not None else facts
     out: List[BindingFinding] = []
@@ -111,10 +113,16 @@ def validate_claim_bindings(
                     out.append(BindingFinding(cid, ref_id, "FAIL", "ref_id",
                                               "declared reference", ref_id,
                                               "binding ref is not declared"))
+            if ref_id in claim_ids and ref_id not in canonical:
+                if require_bindings and ref_id not in claim.get("dependencies", []):
+                    out.append(BindingFinding(cid, ref_id, "FAIL", "ref_id",
+                                              "declared Claim dependency", ref_id,
+                                              "Claim binding must name a declared dependency"))
+                continue  # its meaning is verified by the LLM, not source dimensions
             fact = canonical.get(ref_id)
             if fact is None:
-                # This checker is deliberately FACT-only. Other ref types are
-                # validated elsewhere and should not be guessed from prefixes.
+                # Unknown IDs are not inferred from spelling or prose. Claim
+                # references were resolved by actual membership above.
                 if require_bindings:
                     out.append(BindingFinding(cid, ref_id, "FAIL", "ref_id",
                                               "existing source", ref_id,

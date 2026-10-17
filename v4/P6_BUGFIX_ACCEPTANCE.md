@@ -119,3 +119,35 @@ archive = abandon_session(session_directory, reason="操作者明確授權的原
 回滾可撤回本次提交並重啟；先備份完整輸出資料。舊版會再次對 unresolved 拋一般例外，不能視為問題已解決。
 
 本輪最終驗收：V4 175 項通過，V3 基準 24 項通過，git diff --check 通過。獨立審查後補強混合缺邊／不確定 finding 在圖修補失敗或額度用完時的診斷合併；只依明確 finding_id 去除同一問題的副本，不以 prose（自然語言文字）合併問題。
+
+
+## 角色輸出混合來源／Claim binding 的契約修正
+
+### Problem（問題）
+
+原生角色提示允許 `refs` 同時列出來源與上游 Claim，schema（資料格式）也允許 binding.ref_id 指向 refs 中的任一項，但 `submit_batch` 卻要求全部 binding ID 集合等於來源 ID 集合。模型提供了額外的上游 Claim binding 時，即使來源綁定完整、依賴也正確，仍在角色提交時被拒絕。
+
+### Root Cause（根因與影響）
+
+`95b6068` 的 `runner.py::ROLE_CONTRACT`／`schema.py::Claim.from_dict` 允許混合 refs 與 binding → `pipeline.py:181` 以所有 binding ID 對照只有來源的 expected 集合，額外 Claim binding 造成不相等 → ValueError，中止原生角色交接。僅修改提示詞不足以處理已產生的合法額外資訊；僅改 submit_batch 又會在 `bindings.py::validate_claim_bindings` 被當成「找不到來源」拒絕。
+
+### Fix（修正與變更差異）
+
+- `pipeline.py`：來源 refs 仍必須恰有一筆來源 binding；允許已存在、已宣告為 dependency 的可選 Claim binding，保留原資料。所有 binding 都不可重複；真正缺少來源 binding 時附上 claim_id、缺漏及重複 ID。
+- `bindings.py`：以完整 Claim 目錄辨識上游 Claim；Claim 的歸因交給必做的逐引用 LLM 驗證，不把它當成 Fact 來源做維度比對。真正來源的完整性／數值維度驗證保留。
+- `runner.py::ROLE_CONTRACT` 與 README：明示來源與 Claim binding 的差異、Claim binding 可省略及依賴要求。
+- `test_integration.py`：重現原例外，新增混合 binding 提交、原生研究主管交接、漏驗拒絕、缺來源／重複／未知 ID／漏依賴拒絕、錯誤來源 unit 仍失敗，以及檢查點與局部修補保留資料的測試。
+
+不以 ID 前綴或 prose（自然語言文字）猜類型，不刪模型輸出、不補造來源、不把 Claim 當作 Fact、不跳過語義驗證。來源與 Claim 撞 ID 仍拒絕；只有 Claim 引用而沒有實際來源的 grounded claim（有來源事實論述）仍不可假裝有來源。
+
+### Recommended Tests／Prevention（驗收與預防）
+
+新增測試先在原碼重現 `every source ref requires exactly one typed binding`，再驗證修復。`reference_checks` 的必驗 ID 仍含來源與 Claim；測試故意漏掉 Claim 檢查，確認不能通過原子驗收。來源 unit 不符依然 FAIL，說明放寬的是可選的 Claim metadata（中繼資料），不是來源正確性。
+
+### Confidence／更新與回滾
+
+共用契約矛盾已重現，修復信心高；未取得使用者本次完整角色 JSON，未重跑 VM，也未呼叫真實模型，不宣稱該次整份報告已跑完。修改限 V4；更新後重啟驅動程序，保留完整角色回覆、sessions、responses 與檢查點。已有完整角色 JSON 可重新交給對應 collector 驗收；提示詞版本更新會改變新角色請求身分，不擅自將不同提示的快取當相同請求。
+
+回滾可撤回本次提交並重啟。先備份輸出目錄；舊版不能讀回含 Claim binding 的新檢查點，不能把回滾後的拒絕當作資料已損壞。
+
+本輪最終驗收：V4 180 項、V3 基準 24 項通過，git diff --check 通過。獨立審查確認來源／Claim 依實際目錄區分，來源與 Claim ID 撞名仍拒絕；Claim binding 不會免除 DAG 檢查或逐引用 LLM 驗證。

@@ -177,8 +177,15 @@ class OrchestratorV4(Orchestrator):
                 raise ValueError("fact_refs must refer to canonical facts")
             expected = set(c["refs"]).intersection(sources)
             bound = [b["ref_id"] for b in c["bindings"]]
-            if set(bound) != expected or len(bound) != len(set(bound)):
-                raise ValueError("every source ref requires exactly one typed binding")
+            bound_sources = set(bound).intersection(sources)
+            if bound_sources != expected or len(bound) != len(set(bound)):
+                missing = sorted(expected - bound_sources)
+                duplicates = sorted({ref for ref in bound if bound.count(ref) > 1})
+                raise ValueError(f"every source ref requires exactly one typed binding; claim_id={c['claim_id']}; "
+                                 f"missing_source_bindings={missing}; duplicate_bindings={duplicates}")
+            # Claim refs already resolve through claim_index and must be DAG
+            # dependencies. Optional bindings preserve the model's attribution;
+            # they are not canonical source records or a reason to skip NLI.
             if c["claim_type"] in {"source_fact", "derived_fact", "semantic_fact"} and not expected:
                 raise ValueError("grounded claim needs a source reference")
         run.claims = deepcopy(candidate)
