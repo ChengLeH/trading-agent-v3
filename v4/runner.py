@@ -110,7 +110,22 @@ class PipelineRunnerV4:
     def _blocked(self, exc, status):
         details = exc.details() if isinstance(exc, AntigravityError) else {}
         self.status = exc.blocked_status(status) if isinstance(exc, AntigravityError) else status
-        return dict(blocked=True, reason=f"{type(exc).__name__}: {exc}", status=self.status, **details)
+        pending_findings = self._diagnostic_findings(self.pending_patch["findings"] if self.pending_patch else [])
+        diagnostics = dict(findings=pending_findings) if pending_findings else {}
+        return dict(blocked=True, reason=f"{type(exc).__name__}: {exc}", status=self.status, **details, **diagnostics)
+
+    def _diagnostic_findings(self, findings):
+        # Preserve independent occurrences. Only explicit finding identities
+        # may deduplicate a pending copy against its durable deferred copy.
+        combined, seen = [], set()
+        for finding in list(findings) + self.deferred_global_findings:
+            identity = finding.get("finding_id")
+            if identity is not None and identity in seen:
+                continue
+            if identity is not None:
+                seen.add(identity)
+            combined.append(deepcopy(finding))
+        return combined
 
     @property
     def run(self):
@@ -464,7 +479,7 @@ class PipelineRunnerV4:
             raise ValueError("finding references unknown claim IDs")
         if self.revision_round >= self.max_revisions:
             self.status = "blocked:revision_limit"
-            return dict(blocked=True, reason="revision limit reached", findings=findings)
+            return dict(blocked=True, status=self.status, reason="revision limit reached", findings=self._diagnostic_findings(findings))
         self.pending_patch = dict(input_hash=self._hash(), ids=wanted, findings=deepcopy(findings))
         tasks = self._tasks()
         prompt = json_prompt(
@@ -585,7 +600,11 @@ class PipelineRunnerV4:
             if not isinstance(finding, dict):
                 raise ValueError("global finding must be an object")
             finding["finding_id"] = "global." + digest(dict(input_hash=self.pending_global["input_hash"], finding_index=idx))
-        findings = content_findings + audit["dependency_findings"]
+        unresolved_findings = audit["unresolved_dependency_findings"]
+        for finding in unresolved_findings:
+            finding["finding_id"] = "global.dependency." + digest(dict(
+                input_hash=self.pending_global["input_hash"], claim_id=finding["claim_id"]))
+        findings = content_findings + audit["dependency_findings"] + unresolved_findings
         index = claim_index(self.run.claims)
         for f in findings:
             if not isinstance(f, dict) or not isinstance(f.get("issue"), str) or not f["issue"]:
@@ -595,6 +614,8 @@ class PipelineRunnerV4:
                 raise ValueError("unknown global finding claim ID")
             if not ids and f.get("unresolved") is not True:
                 raise ValueError("global finding needs explicit IDs or unresolved=true")
+        # Uncertainty must survive restart and unrelated graph-only repairs.
+        self.deferred_global_findings.extend(deepcopy(unresolved_findings))
         if audit["dependency_patches"]:
             # Repairing graph metadata cannot silently resolve unrelated prose
             # findings from the same response. Keep them across revalidation.
@@ -604,7 +625,8 @@ class PipelineRunnerV4:
         self.pending_global = None
         self.status = "revision" if findings else "verified"
         self._persist()
-        return dict(blocked=bool(findings), needs_revision=bool(findings), findings=deepcopy(findings), **audit)
+        return dict(blocked=bool(findings), status=self.status, needs_revision=bool(findings),
+                    findings=deepcopy(findings), **audit)
 
     def finalize(self):
         findings = self._ready_for_global()

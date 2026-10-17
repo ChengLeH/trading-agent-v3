@@ -88,3 +88,34 @@ archive = abandon_session(session_directory, reason="操作者明確授權的原
 更新須重啟驅動程序。降低旗標不會回溯刪除已授權的持久上限；需要更嚴格政策時應另行明確設計停止／預算管理，不清除既有使用紀錄。回滾前備份整個輸出目錄；舊版只接受最多兩次的 session 格式，已超過兩次的新狀態不能交給舊版直接續跑。
 
 本輪驗收：V4 170 項通過，V3 基準 24 項通過；獨立審查後修正續接啟動失敗的狀態覆蓋。新增測試涵蓋已耗盡上限增額、同 CID 自動續接、已用時間不歸零、舊檢查點、CLI 設定、四次以上格式補正及啟動失敗後再恢復。本輪未載入本地模型、未呼叫真實雲端模型，也未重跑 VM 全量；慢速與失敗條件以可重現的模擬子程序驗證。
+
+
+## Dependency unresolved（語義依賴不確定）的診斷與恢復
+
+### Problem（問題）
+
+全局模型對某個 Claim 回覆 `unresolved=true` 時，舊版會直接拋一般 ValueError，原生入口只顯示 blocked:execution 與 Claim ID，沒有把模型理由帶進可修補結果。模型是否誤判須看其 reason、證據與 Claim，不能光看布林旗標決定。
+
+### Root Cause（根因）
+
+`3fe34e2` 的 `semantic_contracts.py:112` 在讀到 reason 後立即拋出例外 → `runner.py::collect_phase6_global_sweep` 無法建立全局稽核收據／修補問題 → `execute_phase6` 的例外處理只回傳一般錯誤，沒有理由及依賴。這是上游診斷與恢復流程缺口，不表示模型的不確定判斷本身一定錯誤。
+
+目前原生入口使用 RunJournal：完整回覆會先保存在 `responses/` 及 `responses/archive/`；持久 session 的 `session.json` 與 `events.jsonl` 也保存完整終結結果。不能僅因看到串流 deltas 就判定資料必定遺失。未取得使用者該次 run 的檔案，無法確認其實際保存情況，亦無法判定該次 Claim 是資料問題或模型誤判。
+
+### Fix（修正）
+
+將合格但不確定的語義判斷轉為 `dependency_unresolved` 結構化 finding，保留 Claim ID、reason、完整原 review、現有依賴與 required_dependencies。它不會自動新增不確定的依賴邊，也不會放行；進入現有局部修補，再重驗該 Claim 及後代，最後再做全局掃描。
+
+不確定 finding 保存到 deferred_global_findings，檢查點重載或先修其他 Claim 的缺邊都不會丟失；修補歷史保留原理由。修補模型失敗或修訂額度用完時，結果仍列出 finding 及理由。沒有加 `--force`，沒有靠文字比對猜依賴，也沒有省略原子驗證或全局掃描。
+
+### Recommended Tests／Prevention（驗收與預防）
+
+`test_semantic_acceptance.py` 覆蓋：不確定理由／依賴保存、重載後仍可修補、混合缺邊修補不丟其他不確定 finding、完整自動局部修補＋後代重驗＋再掃描、額度用完／修補模型失敗時理由可見；既有 stale／循環／未知 ID 及漏審拒絕測試仍保留。未解決前不能 finalize（交付）。
+
+### Confidence／更新與回滾
+
+原因與共用修復信心高；未取得真實 run 回覆，該次判斷的正確性未確認。本次不呼叫模型，也不改 VM。更新後重新啟動驅動程序，保留檢查點、sessions 及 responses。先前有完整原始全局回覆時，可透過原 RunJournal 重播並重新驗收，無須為此清空已完成的原子結果。若外部 driver 未使用 RunJournal，須保留並傳回原始完整回覆；不能從部分 deltas 猜造。
+
+回滾可撤回本次提交並重啟；先備份完整輸出資料。舊版會再次對 unresolved 拋一般例外，不能視為問題已解決。
+
+本輪最終驗收：V4 175 項通過，V3 基準 24 項通過，git diff --check 通過。獨立審查後補強混合缺邊／不確定 finding 在圖修補失敗或額度用完時的診斷合併；只依明確 finding_id 去除同一問題的副本，不以 prose（自然語言文字）合併問題。

@@ -338,8 +338,10 @@ class SemanticAcceptance(unittest.TestCase):
         r = seeded()
         review_all(r)
         r.prepare_phase6_global_sweep()
+        result = r.collect_phase6_global_sweep(global_review(r, unresolved=["a"]), model_identity="test/global")
+        self.assertTrue(result["blocked"])
         with self.assertRaises(ValueError):
-            r.collect_phase6_global_sweep(global_review(r, unresolved=["a"]), model_identity="test/global")
+            r.finalize()
         r.run.claims[0]["text"] = "changed while global review in flight"
         with self.assertRaises(ValueError):
             r.collect_phase6_global_sweep(global_review(r), model_identity="test/global")
@@ -451,6 +453,86 @@ class SemanticAcceptance(unittest.TestCase):
                 r.collect_phase6_global_sweep(result, model_identity="test/global")
             self.assertEqual(r.run.claims, before)
             self.assertIsNone(r.global_receipt)
+
+    def test_unresolved_dependency_retains_reason_and_enters_surgical_revision(self):
+        from .checkpoint import save_checkpoint, load_checkpoint
+        r = seeded(); review_all(r); r.prepare_phase6_global_sweep()
+        response = global_review(r, unresolved=("b",))
+        row = next(row for row in response["dependency_reviews"] if row["claim_id"] == "b")
+        row["reason"] = "Cannot establish whether the conclusion relies on the prior premise"
+        result = r.collect_phase6_global_sweep(response, model_identity="test/global")
+        self.assertTrue(result["needs_revision"])
+        self.assertEqual(result["status"], "revision")
+        finding = next(f for f in result["findings"] if f["category"] == "dependency_unresolved")
+        self.assertEqual(finding["evidence"], row["reason"])
+        self.assertEqual(finding["dependency_review"], row)
+        self.assertEqual(finding["declared_dependencies"], ["a"])
+        self.assertEqual(result["dependency_patches"], [])
+        response["dependency_reviews"].clear()
+        self.assertEqual(len(r.global_receipt["dependency_reviews"]), len(r.run.claims))
+        with self.assertRaises(ValueError): r.finalize()
+        with tempfile.TemporaryDirectory() as temp:
+            checkpoint = Path(temp) / "checkpoint.json"; save_checkpoint(r, checkpoint)
+            resumed = load_checkpoint(checkpoint)
+            self.assertEqual(resumed.deferred_global_findings, r.deferred_global_findings)
+            review_all(resumed)
+            revision = resumed.prepare_phase6_revision_v4(resumed._review_findings())
+            self.assertEqual(revision["allowed_claim_ids"], ["b"])
+            self.assertIn(row["reason"], revision["revision_prompts"][0][1])
+
+    def test_unresolved_dependency_survives_another_claim_graph_repair(self):
+        r = seeded(); review_all(r); r.prepare_phase6_global_sweep()
+        response = global_review(r, required={"independent": ["a"]}, unresolved=("b",))
+        result = r.collect_phase6_global_sweep(response, model_identity="test/global")
+        r.prepare_phase6_revision_v4(result["dependency_findings"])
+        r.collect_phase6_revision(result["dependency_patches"])
+        self.assertEqual([f["claim_id"] for f in r.deferred_global_findings], ["b"])
+        self.assertEqual(r.deferred_global_findings[0]["dependency_review"]["reason"], "scripted dependency reasoning")
+        with self.assertRaises(ValueError): r.finalize()
+
+    def test_execution_repairs_uncertain_claim_then_revalidates_and_sweeps_again(self):
+        r = seeded(); sweeps = []
+        def sweep(_):
+            sweeps.append(True)
+            return global_review(r, unresolved=["b"] if len(sweeps) == 1 else [])
+        patcher = CloudDouble("test/author", lambda _: [dict(claim_id="b", text="Clarified supported conclusion")])
+        result = r.execute_phase6(CloudDouble(), CloudDouble("test/deep"), patcher,
+                                 CloudDouble("test/global", sweep))
+        self.assertFalse(result["blocked"], result)
+        self.assertEqual((len(sweeps), len(patcher.calls)), (2, 1))
+        self.assertEqual(r.deferred_global_findings, [])
+        self.assertEqual(r.history[0]["findings"][0]["evidence"], "scripted dependency reasoning")
+        self.assertEqual(set(r.history[0]["affected_claim_ids"]), {"b", "c"})
+
+    def test_uncertainty_reason_is_visible_when_patcher_fails_or_budget_exhausts(self):
+        for limit in (0, 1):
+            with self.subTest(limit=limit):
+                r = seeded(); r.max_revisions = limit
+                def fail(_): raise RuntimeError("author unavailable")
+                result = r.execute_phase6(CloudDouble(), CloudDouble("test/deep"),
+                                         CloudDouble("test/author", fail),
+                                         CloudDouble("test/global", lambda _: global_review(r, unresolved=["b"])))
+                self.assertTrue(result["blocked"])
+                self.assertEqual(result["status"], "blocked:revision_limit" if limit == 0 else "blocked:execution")
+                self.assertEqual(result["findings"][0]["claim_id"], "b")
+                self.assertEqual(result["findings"][0]["dependency_review"]["reason"], "scripted dependency reasoning")
+                self.assertNotIn("report_markdown", result)
+
+    def test_mixed_dependency_block_keeps_all_reasons_on_graph_failure_or_limit(self):
+        from unittest.mock import patch
+        for limit in (0, 1):
+            with self.subTest(limit=limit):
+                r = seeded(); r.max_revisions = limit
+                reviewer = CloudDouble("test/global", lambda _: global_review(
+                    r, required={"independent": ["a"]}, unresolved=["b"]))
+                with patch.object(r.orch, "patch", side_effect=RuntimeError("graph repair failed")):
+                    result = r.execute_phase6(CloudDouble(), CloudDouble("test/deep"),
+                                             CloudDouble("test/author"), reviewer)
+                self.assertTrue(result["blocked"])
+                self.assertEqual({f["claim_id"] for f in result["findings"]}, {"independent", "b"})
+                uncertain = next(f for f in result["findings"] if f["claim_id"] == "b")
+                self.assertEqual(uncertain["dependency_review"]["reason"], "scripted dependency reasoning")
+                self.assertNotIn("report_markdown", result)
 
     def test_missing_dependency_is_exact_metadata_patch_and_invalidates_descendants(self):
         r = seeded()

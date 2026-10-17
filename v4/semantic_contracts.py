@@ -94,7 +94,7 @@ def normalize_dependency_review(claims, result):
         raise ValueError("dependency_reviews array required")
     index = claim_index(claims)
     candidate = dict(index)
-    seen, findings, patches = set(), [], []
+    seen, findings, patches, unresolved_findings = set(), [], [], []
     for row in rows:
         if not isinstance(row, dict):
             raise ValueError("dependency review must be an object")
@@ -109,7 +109,14 @@ def normalize_dependency_review(claims, result):
             raise ValueError("dependency review unresolved must be boolean")
         require_text(row.get("reason"), "dependency review reason")
         if row["unresolved"]:
-            raise ValueError(f"unresolved semantic dependencies for {cid}; report blocked")
+            unresolved_findings.append(dict(
+                claim_id=cid, category="dependency_unresolved",
+                issue="LLM could not establish the claim's semantic dependencies",
+                evidence=row["reason"], dependency_review=deepcopy(row),
+                declared_dependencies=deepcopy(index[cid].get("dependencies", [])),
+                required_dependencies=deepcopy(deps),
+                suggested_fix="clarify or correct this Claim and its premises; revalidate it and descendants, then repeat the global audit"))
+            continue  # uncertainty is a repair finding, not a malformed response
         old = index[cid].get("dependencies", [])
         missing = [dep for dep in deps if dep not in old]
         if missing:
@@ -123,7 +130,8 @@ def normalize_dependency_review(claims, result):
         raise ValueError("every Claim requires semantic dependency completeness review")
     if patches:
         claim_index(list(candidate.values()))  # reject cyclic combined repairs transactionally
-    return dict(dependency_reviews=deepcopy(rows), dependency_findings=findings, dependency_patches=patches)
+    return dict(dependency_reviews=deepcopy(rows), dependency_findings=findings, dependency_patches=patches,
+                unresolved_dependency_findings=unresolved_findings)
 
 
 def validate_revision_history(claims, history):
