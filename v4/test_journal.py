@@ -27,6 +27,48 @@ def author_response(prompt):
 
 
 class Journal(unittest.TestCase):
+    def test_policy_failure_is_durable_and_resume_never_replays_failed_response(self):
+        from .agy_session import AntigravityError
+        r = seeded()
+        with tempfile.TemporaryDirectory() as temp:
+            r.journal = RunJournal(temp)
+            client = CloudDouble("test/shared", lambda _: (_ for _ in ()).throw(AntigravityError("tool_policy_unverified")))
+            with self.assertRaises(AntigravityError):
+                r._complete(client, "role", "secret prompt", reuse_role_output=True)
+            archives = [json.loads(path.read_text()) for path in (Path(temp) / "responses/archive").glob("*.json")]
+            self.assertEqual(len(archives), 1)
+            self.assertEqual(archives[0]["status"], "failed")
+            self.assertEqual(archives[0]["error_code"], "tool_policy_unverified")
+            self.assertFalse(archives[0]["retryable"])
+            self.assertNotIn("response", archives[0])
+            self.assertNotIn("secret", json.dumps(archives))
+            client.responder = lambda _: dict(ok=True)
+            with self.assertRaises(AntigravityError):
+                r._complete(client, "role", "secret prompt", reuse_role_output=True)
+            self.assertEqual(len(client.calls), 1)
+            r.journal.retry_roles.add("role")
+            self.assertEqual(r._complete(client, "role", "secret prompt", reuse_role_output=True), dict(ok=True))
+            self.assertEqual(len(client.calls), 2)
+            self.assertEqual(len(list((Path(temp) / "responses/archive").glob("*.json"))), 2)
+
+    def test_invalid_json_failure_requires_explicit_role_retry_after_reload(self):
+        from .agy_session import AntigravityError
+        from .cloud import AntigravityCloudClient
+        r = seeded()
+        with tempfile.TemporaryDirectory() as temp, patch("v4.cloud.shutil.which", return_value="/test/agy"), \
+             patch("v4.cloud.run_session", side_effect=["not JSON", '{"ok":true}']) as run:
+            r.journal = RunJournal(temp)
+            client = AntigravityCloudClient("model")
+            with self.assertRaisesRegex(AntigravityError, "invalid_json"):
+                r._complete(client, "bull", "prompt", reuse_role_output=True)
+            r.journal = RunJournal(temp)
+            with self.assertRaisesRegex(AntigravityError, "invalid_json"):
+                r._complete(client, "bull", "prompt", reuse_role_output=True)
+            self.assertEqual(run.call_count, 1)
+            r.journal.retry_roles.add("bull")
+            self.assertEqual(r._complete(client, "bull", "prompt", reuse_role_output=True), dict(ok=True))
+            self.assertEqual(run.call_count, 2)
+
     def test_structured_schema_changes_journal_identity_and_is_forwarded(self):
         class StructuredDouble(CloudDouble):
             def complete(self, _):

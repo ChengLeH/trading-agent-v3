@@ -5,6 +5,7 @@ from pathlib import Path
 from .checkpoint import save_checkpoint, write_json
 from .schema import digest
 from .cloud import request_completion
+from .agy_session import AntigravityError
 
 
 class RunJournal:
@@ -46,12 +47,24 @@ class RunJournal:
                     write_json(self.directory / "responses" / "archive" / (attempt + ".json"), saved)
                     write_json(self.directory / relative, saved)
                     return saved["response"]
+                if saved.get("status") == "failed":
+                    failure = AntigravityError(saved.get("error_code"), retryable=saved.get("retryable"),
+                                               exit_code=saved.get("exit_code"), attempts=saved.get("attempts"))
+                    if not failure.retryable:
+                        raise failure
+                    break  # transient failure; never replay an older answer
                 raise ValueError("invalid saved response status")
         # Fail before starting paid work if the output directory cannot be
         # written. An in-flight record never counts as a completed response.
         attempt = uuid4().hex
         write_json(self.directory / relative, {**metadata, "attempt_id": attempt, "status": "in_flight"})
-        result = request_completion(client, prompt, response_schema)
+        try:
+            result = request_completion(client, prompt, response_schema)
+        except AntigravityError as exc:
+            failed = {**metadata, "attempt_id": attempt, "status": "failed", **exc.details()}
+            write_json(self.directory / "responses" / "archive" / (attempt + ".json"), failed)
+            write_json(self.directory / relative, failed)
+            raise
         received = {**metadata, "attempt_id": attempt, "status": "received", "response": result}
         # Keep previous attempts for audit, including explicitly retried roles.
         write_json(self.directory / "responses" / "archive" / (attempt + ".json"), received)

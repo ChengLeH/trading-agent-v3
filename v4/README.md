@@ -38,16 +38,29 @@ python -m v4 --manifest /path/to/manifest.json \
 全部角色與審查統一透過既有 Antigravity `agy` 命令列連線，沿用其登入狀態及環境代理，不需要 `GEMINI_API_KEY`。
 模型 ID 由執行者從 `agy models` 清單明確選定，verifier（第一層驗證）與 deep（深度覆核）可使用相同或不同的模型 ID；兩者都是透過 Antigravity 接入。若要同一模型，將 `--verifier-model` 與 `--deep-model` 設為相同值即可。兩層仍分別提出請求、使用不同提示並保存各自的驗證紀錄；同模型兩輪覆核不代表跨模型交叉驗證，也可能重複同一模型的誤判。
 程式由 PATH 尋找 `agy`，或使用執行者設定的 `AGY_EXECUTABLE`。不安裝外掛、不建立／讀取金鑰檔、不啟動本地模型；失敗立即封鎖，不切換 direct API（直接 API）或其他後端。
-短 prompt 沿用 `agy --model ... -p ...`；超過 64 KiB UTF-8 位元組時，改以 stdin（標準輸入）傳送完整 `user` 事件，使用 `--input-format stream-json --output-format stream-json`，不把長文塞進命令列參數。協定依據：[Antigravity 官方 stdin 文件](https://www.antigravity.google/docs/cli/headless/#stream-prompts-from-stdin)。
-長文單次逾時為設定值與 1800 秒的較大者。兩條路徑都保留計畫模式、終端沙箱與停用指令展開，不加入略過權限旗標，也不呼叫 V3 的 API fallback（失敗轉接）。串流須恰有一個成功的完整 `result` 事件，不能把中途片段當成結果。
-空回覆（含純空白）與產生回覆時的例外，總共最多嘗試 3 次（首次＋2 次重試），重試間隔 15 秒；最終失敗封鎖，不切換模型或供應商。非空回覆仍須通過嚴格 JSON 解析，不因 JSON 格式錯誤自動重試或猜修。
+所有 prompt（提示）均以 stdin（標準輸入）傳送完整 `user` 事件，使用 `--input-format stream-json --output-format stream-json`。先收到並檢查啟動資訊，再送出任何提示位元組，不再使用 `-p`。協定依據：[Antigravity 官方 stdin 文件](https://www.antigravity.google/docs/cli/headless/#stream-prompts-from-stdin)。
+程式每次在隔離工作目錄放入內附的 `evidence_agent.md`，明確選用 `v4-evidence-only`；設定空工具清單、`excludeDefaultComponents: true` 與 `inheritCustomizations: false`，不繼承其他工作區的規則、技能或外掛。只有 `init` 回報相同代理、正確隔離目錄及 `tools=[]` 才送出證據；未支援、漏回或仍有工具時回傳 `tool_policy_unverified`／其他明確錯誤，不能退回預設代理。依據：[官方代理規格](https://www.antigravity.google/docs/subagents/)、[排除預設工具與自訂設定的更新紀錄](https://www.antigravity.google/docs/changelog?tab=cli)。
+角色產生、原子驗證、深度覆核、修補、語義連結及全局掃描使用同一工具邊界，只依輸入物件作業。這些限制由執行設定及啟動檢查控制，不是靠模型遵守提示。若執行中仍出現工具或子代理事件，立即中止並拒收結果；串流須恰有一個成功完整的 `result`，不能把中途片段當成答案。
+暫存工作目錄只放代理設定，不保存研究輸入、檢查點或回覆；正式狀態與稽核仍存於 `--out`。不修改全域 `settings.json`，不開放命令、不加入略過權限旗標。保留終端沙箱與停用指令展開，移除在此組合下無效的 `--mode plan`，不呼叫 V3 的 API fallback（失敗轉接）。
+超過 64 KiB UTF-8 的長文單次逾時為設定值與 1800 秒的較大者；短文維持設定值。空回覆（含純空白）及可重試傳輸失敗最多 3 次（首次＋2 次），間隔 15 秒。已識別的權限拒絕、工具清單不合格及工具誤用不重試；`AntigravityError` 提供安全的 `code/retryable/exit_code/attempts`，不公開原始 stderr 或 exception（例外）文字。非空答案仍須嚴格 JSON，不猜修。
 回覆必須是完整 JSON，不能從 prose（一般文字）猜取或修補 JSON。每次成功回應記錄 transport 與 requested_model；文字輸出不提供可靠的實際服務模型身分及用量，因此 served_model 留空，不推測帳單或後端。
 
 程式庫亦可注入具 `execution="cloud"`、`identity`、`complete(prompt)` 的既有雲端連線介面。
-若連線介面另提供 `complete_structured(prompt, response_schema)`，原子與深度審查會明確傳入每條 Claim 的 JSON Schema（結構化回覆規格）；內建 Antigravity 兩條傳輸路徑都會送出 `--json-schema`。舊介面仍收到含完整規格的 prompt，回覆一樣須通過嚴格驗收。
+若連線介面另提供 `complete_structured(prompt, response_schema)`，原子與深度審查會明確傳入每條 Claim 的 JSON Schema（結構化回覆規格）；內建 Antigravity 會送出 `--json-schema`。舊介面仍收到含完整規格的 prompt，回覆一樣須通過嚴格驗收。
+
+可先執行不含模型推論的啟動自檢：
+
+```sh
+python -m v4 --check-transport \
+  --author-model "$AUTHOR_MODEL" --verifier-model "$VERIFIER_MODEL" \
+  --deep-model "$DEEP_MODEL" --global-model "$GLOBAL_MODEL" \
+  --out /path/to/v4-capability-check
+```
+
+自檢只讀啟動事件，永不送出使用者訊息；成功為 `transport_ready`，不是報告完成。失敗為 `blocked:cloud_policy` 並附安全錯誤分類；不能略過再跑。實際每次請求仍重新檢查。程式庫可用 `client.check_capabilities()`；VM 自訂 driver（驅動程式）必須遵守例外的 `retryable=false`，不要自行包成另一層盲目重試。
 這是呼叫端的信任界線；V4 不會把任意呼叫介面的自述當成供應商認證。
 `prepare_*`／`collect_*` API（程式介面）可供既有 assistant coordinator（助理協調流程）逐步驅動；每次 collect 必須提交完整 JSON。
-逐步入口與自動入口都要求非空的模型識別；第一層與深度審查必須不同，缺漏身分時不會發布驗證紀錄。
+逐步入口與自動入口都要求非空的模型識別；第一層與深度審查可用同一模型，但各自的驗證紀錄仍必須完整，缺漏身分時不會發布驗證紀錄。
 舊名稱 `prepare_phase6`、`prepare_phase6_verify`、`collect_phase6`、`prepare_phase6_revision` 已重新指向 V4 契約，其回傳形狀不再與 V3 相同。
 
 ## Claim 與資料契約
@@ -108,6 +121,8 @@ checkpoint（檢查點）以暫存檔與原子替換保存正式物件及稽核�
 命令列啟動時先將 `result.json` 標成 `running`／`blocked=true`，避免程序被直接中止時留下舊成功報告。
 資料匯入完成、每批角色提交、原子／深度驗證收集、語義連結、局部修補與全局掃描完成時，立即更新 `--out/checkpoint.json`，不等整份流程返回才寫。
 每筆模型呼叫開始前與成功返回後，分別將 `in_flight`／`received` 狀態寫入 `--out/responses/`；成功回覆另保留於 `responses/archive/`。並行工作的一筆失敗不會抹去其他已保存回覆。
+已分類的 Antigravity 失敗也立即保存 `failed` 與安全的錯誤碼／重試屬性／退出碼；沒有假造回覆，重新執行不會把失敗紀錄或更早的舊答案當成本次成功。
+未提交角色的不可重試失敗（含非法 JSON）會在一般續跑時保持封鎖；修正原因後，須明確用 `--retry-role` 指定該角色才重新請求。暫時性傳輸失敗可於新執行續試。這與每次執行都重新審查全部 Claim 的規則分開。
 暫存檔只在同一輸出目錄內用於原子替換，檔案與目錄皆同步至磁碟。`--out` 必須由操作者指向持久磁碟或掛載目錄；指定 `/tmp`、非持久 VM 磁碟，或刪除該磁碟後，程式無法保證資料仍在。輸出目錄含研究資料，須按原本權限保存，不能提交到 Git。
 重新載入會驗證 schema 與 DAG，重建分析視圖；序列化的舊審查紀錄只作稽核，不能當成新執行的通行證。
 `--resume` 會先補齊尚未完成的角色階段，已提交的角色不重新生成；未提交批次的成功回覆只有在 run／角色／模型／完整 prompt 雜湊相同時才可重用，也可從原檢查點旁的 responses 續接到新的輸出目錄。階段次序錯亂或缺半批正式角色仍封鎖，不能跳過缺少的角色交付。

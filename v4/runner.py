@@ -14,6 +14,7 @@ from .schema import claim_index, digest, id_list
 from .semantic_contracts import (REFERENCE_INSTRUCTIONS, review_ref_ids, normalize_dependency_review,
                                  validate_revision_history, SEMANTIC_REVIEW_CONTRACT, semantic_review_schema)
 from .cloud import request_completion
+from .agy_session import AntigravityError
 
 PHASE_2_ROLES = ("market_analyst", "fundamentals_analyst", "news_analyst", "social_analyst")
 PHASE_3_ROLES = ("bull", "bear")
@@ -91,6 +92,11 @@ class PipelineRunnerV4:
                                      response_schema=response_schema)
                if self.journal is not None else request_completion(client, prompt, response_schema))
         return decode_response(raw)
+
+    def _blocked(self, exc, status):
+        details = exc.details() if isinstance(exc, AntigravityError) else {}
+        self.status = "blocked:cloud_policy" if details and not details["retryable"] else status
+        return dict(blocked=True, reason=f"{type(exc).__name__}: {exc}", status=self.status, **details)
 
     @property
     def run(self):
@@ -585,8 +591,7 @@ class PipelineRunnerV4:
                 patches = self._complete(patcher, *revision["revision_prompts"][0])
                 self.collect_phase6_revision(patches)
         except Exception as exc:
-            self.status = "blocked:execution"
-            return dict(blocked=True, reason=f"{type(exc).__name__}: {exc}", status=self.status)
+            return self._blocked(exc, "blocked:execution")
 
     def execute(self, ticker, manifest, author, verifier, deep_reviewer, global_reviewer):
         if getattr(author, "execution", None) != "cloud" or not getattr(author, "identity", None):
@@ -597,8 +602,7 @@ class PipelineRunnerV4:
                 return prompts
             return self.resume(author, verifier, deep_reviewer, global_reviewer)
         except Exception as exc:
-            self.status = "blocked:roles"
-            return dict(blocked=True, reason=f"{type(exc).__name__}: {exc}", status=self.status)
+            return self._blocked(exc, "blocked:roles")
 
     def resume(self, author, verifier, deep_reviewer, global_reviewer):
         """Finish role stages from canonical objects, then run fresh reviews."""
@@ -628,6 +632,5 @@ class PipelineRunnerV4:
                     self.collect_risk(outputs["risk_manager"]["claims"])
                 completed.update(roles)
         except Exception as exc:
-            self.status = "blocked:roles"
-            return dict(blocked=True, reason=f"{type(exc).__name__}: {exc}", status=self.status)
+            return self._blocked(exc, "blocked:roles")
         return self.execute_phase6(verifier, deep_reviewer, author, global_reviewer)

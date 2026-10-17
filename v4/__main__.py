@@ -6,6 +6,7 @@ from .runner import PipelineRunnerV4, ROLES
 from .cloud import AntigravityCloudClient
 from .checkpoint import save_checkpoint, load_checkpoint, write_json
 from .journal import RunJournal
+from .agy_session import AntigravityError
 
 
 def main(argv=None):
@@ -13,6 +14,8 @@ def main(argv=None):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--manifest")
     source.add_argument("--resume")
+    source.add_argument("--check-transport", action="store_true",
+                        help="Check tool-free CLI capabilities only; never send a user prompt")
     for role in ("author", "verifier", "deep", "global"):
         parser.add_argument(f"--{role}-model", required=True)
     parser.add_argument("--out", required=True)
@@ -31,7 +34,10 @@ def main(argv=None):
     runner, clients = None, {}
     try:
         clients = {role: AntigravityCloudClient(getattr(args, f"{role}_model")) for role in ("author", "verifier", "deep", "global")}
-        if args.resume:
+        if args.check_transport:
+            capabilities = {role: client.check_capabilities() for role, client in clients.items()}
+            result = dict(blocked=False, status="transport_ready", capabilities=capabilities)
+        elif args.resume:
             runner = load_checkpoint(args.resume)
             runner.journal = RunJournal(out, resume_from=args.resume, retry_roles=args.retry_role)
             result = runner.resume(clients["author"], clients["verifier"], clients["deep"], clients["global"])
@@ -41,7 +47,11 @@ def main(argv=None):
             runner.journal = RunJournal(out, retry_roles=args.retry_role)
             result = runner.execute(manifest["subject"]["ticker"], manifest, clients["author"], clients["verifier"], clients["deep"], clients["global"])
     except Exception as exc:
-        result = dict(blocked=True, status="blocked:input", reason=f"{type(exc).__name__}: {exc}")
+        details = exc.details() if isinstance(exc, AntigravityError) else {}
+        result = dict(blocked=True, status="blocked:cloud_policy" if details and not details["retryable"] else "blocked:input",
+                      reason=f"{type(exc).__name__}: {exc}", **details)
+    if args.check_transport:
+        result.update(capability_check=True, user_prompt_sent=False)
     if runner is not None and runner.run_id:
         try:
             save_checkpoint(runner, out / "checkpoint.json")

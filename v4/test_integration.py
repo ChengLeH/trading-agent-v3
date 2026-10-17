@@ -90,6 +90,51 @@ def review_all(r):
 
 
 class Integration(unittest.TestCase):
+    def test_policy_failure_blocks_report_and_preserves_machine_readable_reason(self):
+        from .agy_session import AntigravityError
+        def denied(_):
+            raise AntigravityError("permission_denied")
+        r = seeded()
+        verifier = CloudDouble("test/shared", denied)
+        deep = CloudDouble("test/shared")
+        sweep = CloudDouble("test/global", lambda _: [])
+        result = r.execute_phase6(verifier, deep, CloudDouble("test/author"), sweep)
+        self.assertEqual(result["status"], "blocked:cloud_policy")
+        self.assertEqual(result["error_code"], "permission_denied")
+        self.assertFalse(result["retryable"])
+        self.assertNotIn("report_markdown", result)
+        self.assertEqual(deep.calls, [])
+        self.assertEqual(sweep.calls, [])
+
+    def test_cli_transport_check_never_runs_pipeline_or_delivers_report(self):
+        from .__main__ import main
+        from .agy_session import AntigravityError
+        for blocked in (False, True):
+            with self.subTest(blocked=blocked), tempfile.TemporaryDirectory() as temp:
+                client = CloudDouble("test/shared")
+                client.check_capabilities = lambda: dict(tools_verified=True, tools=[], user_prompt_sent=False)
+                if blocked:
+                    def failed_check():
+                        raise AntigravityError("tool_policy_unverified")
+                    client.check_capabilities = failed_check
+                args = ["--check-transport", "--out", temp, "--author-model", "shared",
+                        "--verifier-model", "shared", "--deep-model", "shared", "--global-model", "shared"]
+                with patch("v4.__main__.AntigravityCloudClient", return_value=client), \
+                     patch("v4.__main__.PipelineRunnerV4", side_effect=AssertionError("pipeline must not start")), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(args), 2 if blocked else 0)
+                result = json.loads((Path(temp) / "result.json").read_text())
+                self.assertEqual(result["blocked"], blocked)
+                self.assertNotIn("report_markdown", result)
+                self.assertEqual(client.calls, [])
+                self.assertTrue(result["capability_check"])
+                self.assertFalse(result["user_prompt_sent"])
+                if blocked:
+                    self.assertEqual(result["error_code"], "tool_policy_unverified")
+                    self.assertFalse(result["retryable"])
+                else:
+                    self.assertEqual(result["status"], "transport_ready")
+
     def test_cli_malformed_input_replaces_prior_success_with_blocked_result(self):
         from .__main__ import main
         for source in ("--resume", "--manifest"):

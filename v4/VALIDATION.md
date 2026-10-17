@@ -6,7 +6,7 @@
 
 | 檢查 | 結果 |
 |---|---|
-| `python3 -m unittest discover -s v4 -t .` | 81 項通過 |
+| `python3 -m unittest discover -s v4 -t .` | 94 項通過 |
 | `python3 -m v3.test_invariants` | 13 項通過 |
 | `python3 -m v3.test_p6_dedup` | 11 項通過 |
 | `python3 -m compileall -q v4` | 通過 |
@@ -76,6 +76,19 @@ V4 測試使用標準函式庫，沒有安裝依賴、載入本地模型或發�
 獨立審查未發現阻塞問題；依建議補驗回覆封存：同一主張的兩輪回覆各自保存、模型 ID 相同、提示雜湊不同，並保留第一輪疑慮與第二輪通過的各自判決。
 
 ## 尚未驗證與限制
+
+### Debug Summary：無人值守工具拒絕與零工具啟動檢查
+
+- **Problem**：使用者在 VM 對同一份 fundamentals prompt 重現退出碼 0、stdout 為空，stderr 說明 `command` 權限無法詢問而遭拒絕。舊程式把它當一般空回覆，重試後仍只留下空回覆／RuntimeError。
+- **Root Cause**：`cloud.py` 原本只檢查退出碼與 stdout，隱藏 stderr 的已知權限拒絕；同時 `--disable-slash-commands` 不會停用工具，`--mode plan` 在該組合下無效。設定檔的 `tools: []` 也不足以獨立證明工具已清空。傳輸層現由 `agy_session.py` 在任何輸入前驗證 `init` 的代理／工作目錄／空工具清單，才寫入 stdin；診斷分類只讀 CLI 協定訊息，不判斷研究 prose 的語義。
+- **Recommended Tests**：真實替身子程序驗證啟動前沒有 stdin 資料、非空／缺失工具清單或錯誤代理／目錄不寫入任何位元組、完整長文與 schema 傳輸、工具／子代理事件拒收、部分串流及退出／逾時分類、權限拒絕一次即停、失敗稽核保存與重新載入，以及無推論自檢不啟動流程／不交付報告。
+- **Fix**：新增隔離證據代理、stdin 啟動握手與安全的結構化錯誤，空回覆及可重試傳輸仍最多 3 次。內建流程與命令列明列 `blocked:cloud_policy`／錯誤碼／`retryable`；已分類的失敗也保存至 journal（執行紀錄）。新增 `--check-transport`，不發出 user 訊息、不執行模型推論。V3 與全域權限設定未動。
+- **Prevention**：每次請求都重新確認能力，不使用略過權限或替代模型／API。工具檢查失敗時不能轉回預設代理。自訂 VM driver 須遵守 `retryable=false`；本次未取得或修改 VM driver，不能宣稱其外層重試已同步修正。
+- **Confidence**：程式流程與封鎖行為由替身及回歸驗證。開發環境的真實 CLI 無提示啟動，含 `excludeDefaultComponents: true`／`inheritCustomizations: false` 時仍回報非空工具清單；正式自檢因此預期封鎖，不能宣稱該 CLI 已能完成零工具推論。VM 的 CLI 與真實 87 項驗收尚未執行，需先通過自檢；若同樣非空，需釐清 CLI 設定生效／版本支援，不能取消檢查。
+
+正式 `python -m v4 --check-transport` 已在開發環境執行，實際結果為 `blocked:cloud_policy`／`tool_policy_unverified`／`retryable=false`／`user_prompt_sent=false`，四個角色的模型呼叫紀錄皆空。這是安全拒絕的實機驗證，不是模型推論成功。獨立審查另指出需核對啟動回報的模型 ID、拒絕未知步驟型別，以及把非法 JSON 失敗保存並要求明確角色重試；均已修正並加入回歸，最終 V4 94 項通過。實測平台為 macOS 開發環境；VM 的 Linux/Python 3.12 仍未實跑。
+
+官方依據：[無人值守權限與串流啟動資訊](https://www.antigravity.google/docs/cli/headless/)、[自訂代理工具設定](https://www.antigravity.google/docs/subagents/)、[排除預設元件與繼承自訂設定](https://www.antigravity.google/docs/changelog?tab=cli)。
 
 - 依使用者決定，本次先交付程式與測試，真實雲端模型驗收另行安排。語義品質、實際延遲、費用、模型可用性與真實市場資料結果均未驗證。
 - V3 依賴外部 `/tmp/amzn_v3.json` 的資料驗收未執行；本環境沒有該測試資料。上述兩組 V3 回歸已實際執行。
