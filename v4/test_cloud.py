@@ -23,9 +23,9 @@ import json, os, sys, time
 from pathlib import Path
 def emit(value):
     print(json.dumps(value), flush=True)
-def init(tools=None, agent=None, cwd=None, model=None):
+def init(tools=None, agent=None, cwd=None, model=None, conversation="11111111-1111-4111-8111-111111111111"):
     agent = sys.argv[sys.argv.index("--agent") + 1] if agent is None else agent
-    emit(dict(event="init", init=dict(agent=agent, tools=[] if tools is None else tools,
+    emit(dict(event="init", conversation_id=conversation, init=dict(agent=agent, tools=[] if tools is None else tools,
                                      cwd=str(Path.cwd()) if cwd is None else cwd,
                                      model=sys.argv[sys.argv.index("--model") + 1] if model is None else model)))
 def result(response="{}", status="SUCCESS"):
@@ -37,6 +37,11 @@ def result(response="{}", status="SUCCESS"):
 
 class Transport(unittest.TestCase):
     def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        environment = patch.dict(os.environ, {"V4_SESSION_DIR": directory.name})
+        environment.start()
+        self.addCleanup(environment.stop)
         sleeper = patch("v4.cloud.sleep")
         self.sleep = sleeper.start()
         self.addCleanup(sleeper.stop)
@@ -195,6 +200,13 @@ class Transport(unittest.TestCase):
 
 
 class ToolFreeSession(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        environment = patch.dict(os.environ, {"V4_SESSION_DIR": directory.name})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_capability_check_closes_stdin_without_sending_a_user_turn(self):
         with cli_stub('init()\nassert sys.stdin.read() == ""\n') as executable, \
              patch("v4.agy_session.os.write", wraps=os.write) as write:

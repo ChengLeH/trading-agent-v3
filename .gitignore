@@ -3,3 +3,6 @@
 .depgraph.json
 __pycache__/
 *.pyc
+
+# Durable cloud conversations contain research inputs and responses.
+.v4-sessions/

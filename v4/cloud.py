@@ -1,4 +1,6 @@
 """Existing Antigravity (agy) cloud connection only; no direct API fallback."""
+import hashlib
+from pathlib import Path
 import json
 import math
 import os
@@ -20,7 +22,10 @@ def structured_prompt(prompt, serialized_schema):
     return prompt if prompt.endswith(footer) else prompt + footer
 
 
-def request_completion(client, prompt, response_schema=None):
+def request_completion(client, prompt, response_schema=None, *, session_dir=None, resume=False):
+    durable = getattr(client, "complete_in_session", None)
+    if session_dir is not None and callable(durable):
+        return durable(prompt, response_schema, session_dir=session_dir, resume=resume)
     structured = getattr(client, "complete_structured", None)
     if response_schema is not None and callable(structured):
         return structured(prompt, response_schema)
@@ -31,7 +36,7 @@ def request_completion(client, prompt, response_schema=None):
 class AntigravityCloudClient:
     execution = "cloud"
 
-    def __init__(self, model, *, executable=None, timeout=1200):
+    def __init__(self, model, *, executable=None, timeout=1200, session_root=None):
         if (not isinstance(model, str) or not model or model.startswith("-")
                 or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:/" for c in model)):
             raise ValueError("explicit Antigravity model ID required")
@@ -44,8 +49,27 @@ class AntigravityCloudClient:
         self.model = model
         self.identity = f"antigravity/{model}"
         self.timeout = timeout
+        self.session_root = Path(session_root or os.environ.get("V4_SESSION_DIR", Path.cwd() / ".v4-sessions"))
+        self._request_context = threading.local()
         self.calls = []
         self._lock = threading.Lock()
+
+    def complete_in_session(self, prompt, response_schema=None, *, session_dir, resume=False):
+        old = getattr(self._request_context, "value", None)
+        self._request_context.value = (Path(session_dir), resume)
+        try:
+            return self.complete(prompt, response_schema=response_schema)
+        finally:
+            self._request_context.value = old
+
+    def resume_request(self, prompt, response_schema=None):
+        schema = None if response_schema is None else json.dumps(response_schema, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        wire = structured_prompt(prompt, schema)
+        return self.complete_in_session(prompt, response_schema, session_dir=self._session_directory(wire), resume=True)
+
+    def _session_directory(self, wire_prompt):
+        key = hashlib.sha256((self.identity + "\0" + wire_prompt).encode()).hexdigest()
+        return self.session_root / key
 
     def complete_structured(self, prompt, response_schema):
         return self.complete(prompt, response_schema=response_schema)
@@ -65,11 +89,11 @@ class AntigravityCloudClient:
                 last_error = AntigravityError("empty_response", retryable=True)
             except AntigravityError as exc:
                 if not exc.retryable:
-                    raise AntigravityError(exc.code, exit_code=exc.exit_code, attempts=attempt + 1) from None
+                    raise AntigravityError(exc.code, exit_code=exc.exit_code, attempts=attempt + 1, conversation_id=exc.conversation_id) from None
                 last_error = exc
             except Exception:
                 # Unexpected exception text may contain request/account data.
-                last_error = AntigravityError("unexpected_error", retryable=True)
+                raise AntigravityError("unexpected_error") from None
             text = None
             if attempt < 2:
                 sleep(15)
@@ -92,4 +116,7 @@ class AntigravityCloudClient:
         # in stdin and let the per-Claim validators reject/repair omissions.
         wire_prompt = structured_prompt(prompt, response_schema)
         timeout = max(self.timeout, 1800) if len(wire_prompt.encode("utf-8")) > _STDIN_THRESHOLD else self.timeout
-        return run_session(self.executable, self.model, wire_prompt, timeout, None)
+        context = getattr(self._request_context, "value", None)
+        directory, resume = context or (self._session_directory(wire_prompt), False)
+        return run_session(self.executable, self.model, wire_prompt, timeout, None,
+                           session_dir=directory, resume=resume)
