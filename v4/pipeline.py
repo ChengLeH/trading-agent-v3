@@ -30,7 +30,9 @@ def validate_trade_claim(claims, trade):
     plans = [c for c in claims if c["assertion"]["kind"] == "trade_plan"]
     has_trader = any(c["author_role"] == "trader" for c in claims)
     if len(plans) != (1 if has_trader else 0):
-        raise ValueError("trader requires exactly one canonical trade_plan Claim")
+        trader_ids = [c["claim_id"] for c in claims if c["author_role"] == "trader"]
+        plan_ids = [c["claim_id"] for c in plans]
+        raise ValueError(f"trader requires exactly one canonical trade_plan Claim; trader_claim_ids={trader_ids}; trade_plan_claim_ids={plan_ids}")
     if plans and plans[0]["assertion"]["trade"] != trade:
         raise ValueError("canonical trade_plan Claim differs from derived trade state")
 

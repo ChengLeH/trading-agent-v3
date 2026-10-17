@@ -82,25 +82,28 @@ def normalize_reference_checks(expected_refs, result):
         if relation == "CONTRADICTS" and result["verdict"] != "FAIL":
             raise ValueError("contradicted attribution requires FAIL")
     if seen != set(expected_refs):
-        raise ValueError("every direct source and dependency requires semantic reference checking")
+        raise ValueError(f"every direct source and dependency requires semantic reference checking; missing_ref_ids={sorted(set(expected_refs) - seen)}")
     return deepcopy(rows)
 
 
-def normalize_dependency_review(claims, result):
+def normalize_dependency_review(claims, result, *, allow_partial=False, expected_claim_ids=None):
     if not isinstance(result, dict) or not isinstance(result.get("findings"), list):
         raise ValueError("global review object requires findings and dependency_reviews")
     rows = result.get("dependency_reviews")
     if not isinstance(rows, list):
         raise ValueError("dependency_reviews array required")
     index = claim_index(claims)
+    expected = set(index) if expected_claim_ids is None else set(id_list(list(expected_claim_ids), "expected dependency review IDs"))
+    if expected - index.keys():
+        raise ValueError("unknown expected dependency review IDs")
     candidate = dict(index)
     seen, findings, patches, unresolved_findings = set(), [], [], []
     for row in rows:
         if not isinstance(row, dict):
             raise ValueError("dependency review must be an object")
         cid = row.get("claim_id")
-        if not isinstance(cid, str) or cid not in index or cid in seen:
-            raise ValueError("unknown or duplicate dependency review claim_id")
+        if not isinstance(cid, str) or cid not in expected or cid in seen:
+            raise ValueError(f"unknown, duplicate or unrequested dependency review claim_id: {cid}")
         seen.add(cid)
         deps = id_list(row.get("required_dependencies"), "required_dependencies")
         if cid in deps or set(deps) - index.keys():
@@ -126,12 +129,15 @@ def normalize_dependency_review(claims, result):
             findings.append(dict(claim_id=cid, category="dependency_gap", required_dependencies=deps,
                                  issue="LLM dependency audit identified undeclared premises", evidence=row["reason"],
                                  suggested_fix="add the exact semantic dependency IDs, then revalidate descendants"))
-    if seen != set(index):
-        raise ValueError("every Claim requires semantic dependency completeness review")
+    missing = [cid for cid in index if cid in expected and cid not in seen]
+    if missing and not allow_partial:
+        raise ValueError(f"every Claim requires semantic dependency completeness review; missing_claim_ids={missing}")
     if patches:
         claim_index(list(candidate.values()))  # reject cyclic combined repairs transactionally
     return dict(dependency_reviews=deepcopy(rows), dependency_findings=findings, dependency_patches=patches,
-                unresolved_dependency_findings=unresolved_findings)
+                unresolved_dependency_findings=unresolved_findings,
+                missing_dependency_claim_ids=missing,
+                reviewed_dependency_claim_ids=[cid for cid in index if cid in seen])
 
 
 def validate_revision_history(claims, history):

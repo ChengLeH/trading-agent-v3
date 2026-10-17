@@ -449,8 +449,14 @@ class SemanticAcceptance(unittest.TestCase):
             else:
                 result["dependency_reviews"][0]["required_dependencies"] = ["c"]
             before = copy.deepcopy(r.run.claims)
-            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
-                r.collect_phase6_global_sweep(result, model_identity="test/global")
+            if mutation == "omit":
+                pending = r.collect_phase6_global_sweep(result, model_identity="test/global")
+                self.assertTrue(pending["needs_dependency_completion"])
+                self.assertEqual(pending["missing_dependency_claim_ids"], [r.run.claims[-1]["claim_id"]])
+                with self.assertRaises(ValueError): r.finalize()
+            else:
+                with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                    r.collect_phase6_global_sweep(result, model_identity="test/global")
             self.assertEqual(r.run.claims, before)
             self.assertIsNone(r.global_receipt)
 

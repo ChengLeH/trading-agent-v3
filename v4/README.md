@@ -161,6 +161,12 @@ V3 的 Markdown 或舊 Claim 缺欄位時，不能自動用文字猜成 V4；必
 
 Mac 真實測試已在接收任務後刻意中斷，再用原對話 ID 續接；未重傳原始測試標記，回覆仍正確保留標記及算術答案。這證明上下文續接可用，沒有宣稱 87 條真實分析的總時間或帳單已下降。87 層合成依賴鏈的回歸測試驗證線上資料量小於舊全祖先版本的十分之一，同時遠端祖先修改仍使最後一節點失效。
 
+## 全局依賴漏審的補審
+
+全局掃描回覆若只涵蓋部分 Claim，原生流程保留已完成列與全局 findings，列出 `missing_dependency_claim_ids`，再以 `dependency_completion` 只要求補審缺漏項。補審仍用完整 DAG 判斷前提；不將漏項視為沒有依賴，也不重做已完成的全文掃描。
+
+次數使用 `--max-contract-attempts`（包含初次掃描回覆）；耗盡時回 `blocked:global_dependency_coverage`，提高上限可續跑。`global_review_progress` 隨檢查點保存作診斷；重啟從完整 request archives（請求回覆檔）重播並重新驗收，不直接相信檢查點中的審查收據。請保留整個 responses／sessions 目錄。完整覆蓋、修補及必要重驗完成前，報告不能算通過。
+
 ## 驗證與限制
 
 ```sh

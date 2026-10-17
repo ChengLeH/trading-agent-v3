@@ -151,3 +151,42 @@ archive = abandon_session(session_directory, reason="操作者明確授權的原
 回滾可撤回本次提交並重啟。先備份輸出目錄；舊版不能讀回含 Claim binding 的新檢查點，不能把回滾後的拒絕當作資料已損壞。
 
 本輪最終驗收：V4 180 項、V3 基準 24 項通過，git diff --check 通過。獨立審查確認來源／Claim 依實際目錄區分，來源與 Claim ID 撞名仍拒絕；Claim binding 不會免除 DAG 檢查或逐引用 LLM 驗證。
+
+
+## Global dependency review（全局依賴審查）漏項的局部補審
+
+### Problem／Root Cause（問題與根因）
+
+原先 `normalize_dependency_review` 用 coverage（覆蓋範圍）全等檢查發現漏項後直接拋一般 ValueError。模型已完成的跨章 findings 與 dependency rows 沒有進入可續接狀態，原生驅動程序也沒有只補漏項的分支。全體 Claim 都要審是正確性要求；沒有局部補審及精確缺漏診斷，才是此次共用流程缺口。
+
+### Fix（變更與實際路徑）
+
+1. 完整全局掃描仍必做。收到合法但不完整的 dependency_reviews 時，保留已完成 rows、原始 findings、模型及正式狀態／歷史雜湊；不把沒出現的 Claim 補成空依賴。
+2. Collector（結果驗收器）回傳 reviewed_dependency_claim_ids、missing_dependency_claim_ids、coverage_round、needs_retry 及 blocked:global_dependency_coverage。原生 execute 自動再呼叫補審，target_claim_ids 只列漏項；仍給完整 DAG 作為判斷前提的脈絡，不重做全文一致性掃描。
+3. 補審回覆合併後再共同檢查 ID、覆蓋與跨回覆的依賴循環；不得覆寫已接受列，不能換模型或沿用過期狀態。原 findings 與補審新 findings 都保留。全部覆蓋後才建立 global receipt（全局驗收紀錄），再進入既有局部修補或交付。
+4. 次數上限使用 `--max-contract-attempts`，包含原掃描回覆。耗盡時列出缺漏 ID 與進度；提高上限可接續，不清空先前成果。
+5. global_review_progress 隨檢查點保存，供診斷；重新載入不將它當作已接受的模型收據。原 RunJournal 重播原掃描及補審的完整回覆，再通過 collectors 重建驗收。必須保留完整 responses／sessions；已保存的相同請求不需新增模型呼叫。
+6. 開始新掃描會撤銷先前的 clean receipt（無問題紀錄）；pending（未完成）掃描不能靠舊紀錄交付。補審模型變更在呼叫前拒絕，避免花費後才發現不符。
+
+### 六項清單核對
+
+| 項目 | 現版處理 |
+|---|---|
+| unresolved=true | 已轉成保留 reason 的結構化修補問題，不再僅拋一般例外；未解決不會假裝通過 |
+| 漏 dependency review | 本輪新增局部補審與完整缺漏診斷，不默認無依賴 |
+| 漏 reference_checks | 原子／深度層已有局部補正及可調上限；本輪錯誤訊息另列 missing_ref_ids，不能省掉真實的逐引用驗證 |
+| 混合來源／Claim binding | e83f9f2 已區分必需來源 binding 與可選 Claim binding，未放寬真正來源正確性 |
+| 空 patch | efda7e4 的協調層已明確回 blocked:revision_no_changes 並保存待修問題；無 findings 時根本不呼叫 patch。底層 patch([]) 的拒絕不是原生流程崩潰，不能把未解問題當「無需修正」放行 |
+| 非唯一 trade_plan | 必須保留單一正式交易方案，避免沒有決策或互斥決策被當成可交易報告；本輪診斷增加 trader_claim_ids／trade_plan_claim_ids，不自造交易或自選其中一個 |
+
+### Recommended Tests／Prevention（驗收）
+
+`test_global_completion.py` 覆蓋：57 條中先審 13 條、只補剩餘 44 條；原 findings 與新 findings 不遺失；未知／重複／未要求 ID、不同模型、stale state（過期狀態）、跨回覆循環拒絕；次數耗盡、提高上限；原生自動補審；檢查點重啟重播無新增付費呼叫；損毀進度不當收據；舊 clean receipt 無法略過新漏審。
+
+### Confidence／更新與回滾
+
+測試以標準函式庫與模型替身執行；沒有重跑使用者的 VM 或真實 57 條分析，不能宣稱該次報告已完成。更新後重新啟動 V4 驅動程序，保留全部輸出與回覆；外部驅動程序可依 needs_dependency_completion／needs_retry 重新呼叫 prepare_phase6_global_sweep，原生 execute 已自動處理。
+
+回滾可撤回本次提交並重啟，先備份整個輸出目錄。舊版本不支援局部補審，會再對相同漏項拋例外。新檢查點的進度本身不是通過證明，不能手改 missing IDs 或以 force 交付。
+
+本輪最終驗收：V4 193 項、V3 基準 24 項通過；git diff --check 通過。57 條／13+44 的案例是合成模型替身測試，不是真實模型準確性或 VM 全量驗收。獨立審查未發現剩餘阻塞；完整測試由主代理執行。

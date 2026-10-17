@@ -19,6 +19,7 @@ def save_checkpoint(runner, path):
                           records=[dict(kind=type(r).__name__, value=asdict(r)) for r in runner.run.records],
                           revision_round=runner.revision_round, history=runner.history,
                           pending_patch=runner.pending_patch,
+                          global_review_progress=runner.global_review_progress,
                           deferred_global_findings=runner.deferred_global_findings,
                           max_revisions=runner.max_revisions, max_workers=runner.max_workers,
                           max_contract_attempts=runner.max_contract_attempts,
@@ -77,6 +78,27 @@ def load_checkpoint(path, *, continue_verification=True):
         raise ValueError("duplicate deferred finding_id")
     from .semantic_contracts import validate_revision_history
     validate_revision_history(run.claims, r.history)
+    progress = data.get("global_review_progress")
+    if progress is not None and continue_verification:
+        from .semantic_contracts import normalize_dependency_review
+        from .schema import digest
+        if (not isinstance(progress, dict) or progress.get("format") != "v4-global-progress/1"
+                or progress.get("verification_epoch") != r._verification_epoch
+                or progress.get("input_hash") != r._hash() or progress.get("history_hash") != digest(r.history)
+                or type(progress.get("coverage_round")) is not int or progress["coverage_round"] < 1):
+            raise ValueError("invalid global review progress")
+        review = progress.get("review")
+        if not isinstance(review, dict) or not isinstance(review.get("model"), str) or not review["model"].strip():
+            raise ValueError("invalid global progress model")
+        audit = normalize_dependency_review(run.claims, review.get("response"), allow_partial=True)
+        r._validate_global_findings(review["response"]["findings"])
+        if (progress.get("missing_dependency_claim_ids") != audit["missing_dependency_claim_ids"]
+                or progress.get("reviewed_dependency_claim_ids") != audit["reviewed_dependency_claim_ids"]
+                or not audit["missing_dependency_claim_ids"]):
+            raise ValueError("invalid global progress coverage")
+        # Diagnostic only. Reconstruct accepted rows by replaying exact request
+        # archives through collectors, never trust serialized review receipts.
+        r.global_review_progress = progress
     pending = data.get("pending_patch")
     if pending is not None:
         from .schema import id_list, claim_index

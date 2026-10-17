@@ -90,6 +90,7 @@ class PipelineRunnerV4:
         self.pending_atomic = None
         self.pending_deep = None
         self.pending_global = None
+        self.global_review_progress = None
         self.pending_patch = None
         self.revision_round = 0
         self.status = "created"
@@ -115,6 +116,8 @@ class PipelineRunnerV4:
         self.status = exc.blocked_status(status) if isinstance(exc, AntigravityError) else status
         pending_findings = self._diagnostic_findings(self.pending_patch["findings"] if self.pending_patch else [])
         diagnostics = dict(findings=pending_findings) if pending_findings else {}
+        if self.global_review_progress:
+            diagnostics["global_review_progress"] = deepcopy(self.global_review_progress)
         return dict(blocked=True, reason=f"{type(exc).__name__}: {exc}", status=self.status, **details, **diagnostics)
 
     def _diagnostic_findings(self, findings):
@@ -565,7 +568,30 @@ class PipelineRunnerV4:
         self._ready_for_global()
         validate_revision_history(self.run.claims, self.history)
         rendered = render_report(self.orch.snapshot(self.run_id))
-        self.pending_global = dict(input_hash=self._hash(), report_hash=rendered["sidecar"]["report_hash"])
+        if self.pending_global and "review" in self.pending_global:
+            if (self.pending_global["input_hash"] != self._hash()
+                    or self.pending_global["history_hash"] != digest(self.history)):
+                raise ValueError("stale partial global review; accepted rows cannot be reused")
+            status = self._global_coverage_status()
+            if not status["needs_retry"]:
+                return status
+            self.status = "global_dependency_completion"
+            return ("global_dependency_completion", json_prompt(
+                '先前全局掃描已完成，但 dependency_reviews 漏列部分 Claim。只補審 target_claim_ids，'
+                '保留既有 findings，不重做全文掃描、不重回已審列、不把漏審視為無依賴。'
+                '以完整 Claim DAG 與來源理解真正因果依賴，不以字詞猜連線。'
+                '回傳 JSON object：findings（本次新發現的問題，無則 []）及 dependency_reviews。'
+                '對 target_claim_ids 每個恰回 {claim_id,required_dependencies:[精確ID],unresolved:boolean,reason:語義理由}。'
+                'required_dependencies 可指向 state.claims 的任何合法前提，不能指自己或後續結論。',
+                dict(review_scope="dependency_completion", target_claim_ids=status["missing_dependency_claim_ids"],
+                     coverage_round=self.pending_global["coverage_round"] + 1,
+                     verification_epoch=self._verification_epoch, state=self._global_review_state(),
+                     original_findings=self.pending_global["review"]["response"]["findings"],
+                     canonical_state_hash=self._hash(), history_hash=digest(self.history),
+                     history=[{"claim_changes": row.get("claim_changes", [])} for row in self.history])))
+        self.global_receipt = None  # a fresh sweep cannot inherit an earlier clean receipt
+        self.pending_global = dict(input_hash=self._hash(), report_hash=rendered["sidecar"]["report_hash"],
+                                   history_hash=digest(self.history), coverage_round=0)
         self.status = "global"
         return ("global_consistency_reviewer", json_prompt(
             '執行最終全局 LLM 一致性掃描：跨章矛盾、stale state、修正未傳遞、互斥交易規則。'
@@ -592,12 +618,53 @@ class PipelineRunnerV4:
                              for key, value in state.get("evidence", {}).items()}
         return state
 
+    def _global_coverage_status(self):
+        response = self.pending_global["review"]["response"]
+        audit = normalize_dependency_review(self.run.claims, response, allow_partial=True)
+        retry = self.pending_global["coverage_round"] < self.max_contract_attempts
+        self.status = "blocked:global_dependency_coverage"
+        return dict(blocked=True, status=self.status, needs_dependency_completion=True, needs_retry=retry,
+                    reason="global dependency review omitted claims; explicit LLM completion required",
+                    missing_dependency_claim_ids=audit["missing_dependency_claim_ids"],
+                    reviewed_dependency_claim_ids=audit["reviewed_dependency_claim_ids"],
+                    findings=deepcopy(response["findings"] + audit["dependency_findings"] + audit["unresolved_dependency_findings"]),
+                    coverage_round=self.pending_global["coverage_round"], max_contract_attempts=self.max_contract_attempts)
+
+    def _validate_global_findings(self, findings):
+        index = claim_index(self.run.claims)
+        for finding in findings:
+            if not isinstance(finding, dict) or not isinstance(finding.get("issue"), str) or not finding["issue"]:
+                raise ValueError("global finding requires issue")
+            ids = self._finding_claim_ids(finding)
+            if set(ids) - index.keys():
+                raise ValueError("unknown global finding claim ID")
+            if not ids and finding.get("unresolved") is not True:
+                raise ValueError("global finding needs explicit IDs or unresolved=true")
+
     def collect_phase6_global_sweep(self, findings, *, model_identity=None):
         require_model_identity(model_identity)
         self._ready_for_global()
-        if not self.pending_global or self.pending_global["input_hash"] != self._hash():
+        if (not self.pending_global or self.pending_global["input_hash"] != self._hash()
+                or self.pending_global["history_hash"] != digest(self.history)):
             raise ValueError("stale or unprepared global sweep")
-        audit = normalize_dependency_review(self.run.claims, findings)
+        prior = self.pending_global.get("review")
+        if prior:
+            if prior["model"] != model_identity:
+                raise ValueError("dependency completion model differs from saved global reviewer")
+            missing = self._global_coverage_status()["missing_dependency_claim_ids"]
+            normalize_dependency_review(self.run.claims, findings, allow_partial=True, expected_claim_ids=missing)
+            findings = dict(findings=deepcopy(prior["response"]["findings"] + findings["findings"]),
+                            dependency_reviews=deepcopy(prior["response"]["dependency_reviews"] + findings["dependency_reviews"]))
+        audit = normalize_dependency_review(self.run.claims, findings, allow_partial=True)
+        self._validate_global_findings(findings["findings"])
+        coverage_round = self.pending_global["coverage_round"] + 1
+        if audit["missing_dependency_claim_ids"]:
+            self.pending_global.update(review=dict(model=model_identity, response=deepcopy(findings)), coverage_round=coverage_round)
+            result = self._global_coverage_status()
+            self.global_review_progress = dict(format="v4-global-progress/1", verification_epoch=self._verification_epoch,
+                                              **{**deepcopy(self.pending_global), **deepcopy(result)})
+            self._persist()
+            return result
         content_findings = deepcopy(findings["findings"])
         for idx, finding in enumerate(content_findings):
             if not isinstance(finding, dict):
@@ -608,30 +675,27 @@ class PipelineRunnerV4:
             finding["finding_id"] = "global.dependency." + digest(dict(
                 input_hash=self.pending_global["input_hash"], claim_id=finding["claim_id"]))
         findings = content_findings + audit["dependency_findings"] + unresolved_findings
-        index = claim_index(self.run.claims)
-        for f in findings:
-            if not isinstance(f, dict) or not isinstance(f.get("issue"), str) or not f["issue"]:
-                raise ValueError("global finding requires issue")
-            ids = self._finding_claim_ids(f)
-            if set(ids) - index.keys():
-                raise ValueError("unknown global finding claim ID")
-            if not ids and f.get("unresolved") is not True:
-                raise ValueError("global finding needs explicit IDs or unresolved=true")
+        self._validate_global_findings(findings)
         # Uncertainty must survive restart and unrelated graph-only repairs.
         self.deferred_global_findings.extend(deepcopy(unresolved_findings))
         if audit["dependency_patches"]:
             # Repairing graph metadata cannot silently resolve unrelated prose
             # findings from the same response. Keep them across revalidation.
             self.deferred_global_findings.extend(deepcopy(content_findings))
-        self.global_receipt = dict(**self.pending_global, findings=deepcopy(findings), model=model_identity,
+        self.global_receipt = dict(input_hash=self.pending_global["input_hash"], report_hash=self.pending_global["report_hash"],
+                                   history_hash=self.pending_global["history_hash"], coverage_rounds=coverage_round,
+                                   findings=deepcopy(findings), model=model_identity,
                                    dependency_reviews=deepcopy(audit["dependency_reviews"]))
         self.pending_global = None
+        self.global_review_progress = None
         self.status = "revision" if findings else "verified"
         self._persist()
         return dict(blocked=bool(findings), status=self.status, needs_revision=bool(findings),
                     findings=deepcopy(findings), **audit)
 
     def finalize(self):
+        if self.pending_global is not None:
+            raise ValueError("global sweep still pending; dependency coverage must be completed")
         findings = self._ready_for_global()
         if not self.global_receipt or self.global_receipt["input_hash"] != self._hash() or self.global_receipt["findings"]:
             raise ValueError("current report requires a clean global LLM consistency sweep")
@@ -748,9 +812,20 @@ class PipelineRunnerV4:
                         self.status = "blocked:deterministic"
                         return dict(blocked=True, reason="source or calculation repair required", findings=failures)
                 if not findings:
-                    role, prompt = self.prepare_phase6_global_sweep()
-                    global_findings = self._complete(global_reviewer, role, prompt)
-                    result = self.collect_phase6_global_sweep(global_findings, model_identity=global_reviewer.identity)
+                    while True:
+                        prepared_global = self.prepare_phase6_global_sweep()
+                        if isinstance(prepared_global, dict):
+                            return prepared_global
+                        role, prompt = prepared_global
+                        if (self.pending_global.get("review")
+                                and self.pending_global["review"]["model"] != global_reviewer.identity):
+                            raise ValueError("dependency completion model differs from saved global reviewer")
+                        global_findings = self._complete(global_reviewer, role, prompt)
+                        result = self.collect_phase6_global_sweep(global_findings, model_identity=global_reviewer.identity)
+                        if not result.get("needs_dependency_completion"):
+                            break
+                        if not result["needs_retry"]:
+                            return result
                     if result["dependency_patches"]:
                         revision = self.prepare_phase6_revision_v4(result["dependency_findings"])
                         if revision.get("blocked"):
