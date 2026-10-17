@@ -31,6 +31,7 @@ def save_checkpoint(runner, path):
     write_json(path, dict(format="v4-checkpoint/1", state=runner.orch.snapshot(runner.run_id),
                           records=[dict(kind=type(r).__name__, value=asdict(r)) for r in runner.run.records],
                           revision_round=runner.revision_round, history=runner.history,
+                          deferred_global_findings=runner.deferred_global_findings,
                           max_revisions=runner.max_revisions, max_workers=runner.max_workers,
                           audit=dict(atomic=runner.receipts, deep=runner.deep_receipts, global_review=runner.global_receipt)))
 
@@ -63,6 +64,16 @@ def load_checkpoint(path):
     r.orch.submit_batch(r.run_id, grouped)
     r.revision_round = data["revision_round"]
     r.history = data["history"]
+    r.deferred_global_findings = data.get("deferred_global_findings", [])
+    if (not isinstance(r.deferred_global_findings, list)
+            or any(not isinstance(f, dict) or not isinstance(f.get("issue"), str)
+                   or not f["issue"].strip() or not isinstance(f.get("finding_id"), str)
+                   or not f["finding_id"].strip() for f in r.deferred_global_findings)):
+        raise ValueError("invalid deferred global findings")
+    if len({f["finding_id"] for f in r.deferred_global_findings}) != len(r.deferred_global_findings):
+        raise ValueError("duplicate deferred finding_id")
+    from .semantic_contracts import validate_revision_history
+    validate_revision_history(run.claims, r.history)
     # Serialized receipts are audit records, not proof of a new execution.
     # Never trust a stale/mutated checkpoint to bypass atomic/global review.
     r.status = run.stage = "resumed:requires_verification"

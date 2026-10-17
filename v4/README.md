@@ -61,6 +61,11 @@ python -m v4 --manifest /path/to/manifest.json \
 ## 修訂、全局掃描與 blocked（封鎖）狀態
 
 第一層每項回覆必須有正確 claim_id、verdict 與 findings。PASS 的 findings 必須空；SUSPICIOUS／FAIL 必須解釋問題。
+兩層審查都另需 `reference_checks`，對 `refs ∪ fact_refs ∪ dependencies` 中每個 ID 恰回一筆，沒有引用時明確回 `[]`。
+每筆包含 `ref_id/relation/attributed_assertion/source_evidence/reason`，relation 為 SUPPORTS（支持）、CONTRADICTS（矛盾）或 INSUFFICIENT（證據不足）。
+模型必須以原文實際歸因的命題，對照 assertion、binding 與真實來源內容；不能抄正確來源欄位、卻不檢查原文是否把租金負債說成營收。
+引用反證時，檢查原文對反證內容的歸因是否正確，不要求每個來源獨立支持整個投資結論。
+漏回、重複、未知引用、缺說明都會被拒絕；矛盾必須 FAIL，證據不足不能 PASS。第二模型推翻第一層時，也必須重新交完整逐引用紀錄。
 漏回、錯 ID、重複 ID、非法 verdict、過期回覆，都不能通過。深度審查可以推翻第一層的誤報。
 確定性驗證失敗不會使該 Claim 跳過第一層 LLM；它會在所有有效 Claim 驗過之後阻止最終交付。
 來源或計算本身錯誤時回報 blocked，不允許修稿模型藉改 Python 或來源物件來消除錯誤。
@@ -71,6 +76,12 @@ finding 只按明確 claim_id／claim_ids 路由；全局 finding 缺 ID 時由 
 同步更新分析視圖、清除舊證據包，並重驗修改前／後相依圖的後代聯集。
 
 每次成功修補都必須重新完成全局掃描；任何未處理 finding、缺掃描或舊報告雜湊都不能 finalize。
+全局掃描改回 JSON object：`{"findings":[],"dependency_reviews":[...]}`，不能再用單獨的空陣列通過。
+`dependency_reviews` 對每條 Claim 恰回一項 `claim_id/required_dependencies/unresolved/reason`，即使無相依也要明列空陣列與語義理由。
+模型須對照整份 Claim 目錄與 `history.claim_changes` 的 before／after 原物件，找出真正但未宣告的因果前提；不能以主題相近就猜連線。
+程式只檢查模型提供的 ID／完整性／循環，不從文字推斷因果。找到漏邊後只加入明確連線，不自動刪舊連線，經原有局部修補路徑清除該節點及後代的舊驗證，然後重驗並重新全局掃描。
+無法確認相依或補邊造成循環時封鎖。若同一全局回覆另有內容問題，補圖後仍保留待處理 finding；缺 ID 時繼續交給語義連結器，不因先修圖而丟失問題。
+每筆全局 finding 都由程式依審查輸入與陣列位置指定獨立識別碼；即使文字相同也分別保留，連結與重新載入不會合併不同問題的目標。
 超過修訂上限、雲端失敗、來源錯誤或無法定位，均回傳 blocked 且不附交付報告。
 命令列輸入或檢查點讀取失敗也會寫入本次 blocked 結果，覆蓋舊成功結果；檢查點保存失敗回報 blocked:checkpoint。
 若連結果檔都無法寫入，標準輸出會明列 blocked:output 與 result_written=false，不能把磁碟上的舊結果當成本次交付。
@@ -90,6 +101,9 @@ checkpoint（檢查點）以暫存檔與原子替換保存正式物件及稽核�
 因此重啟後全部 Claim 與全局掃描都會再驗一次，會有額外雲端費用。原角色生成尚未完成的檢查點會被封鎖，須重新由 manifest 執行角色流程；不會直接進 Phase 6 或交付半份報告。
 初始提交、修補、重新載入與最終驗證都共同要求 trader 的唯一 trade_plan，且它必須與衍生交易狀態一致。要撤單請修成 WAIT 方案，不能刪除或改型後留下舊 BUY／SHORT。
 V3 的 Markdown 或舊 Claim 缺欄位時，不能自動用文字猜成 V4；必須重新執行 V4 角色流程，或由明確結構化資料完成遷移。
+舊 V4 檢查點若有修訂歷史、卻缺少有效的修改前後 Claim 原物件，也會被拒絕，須由 manifest 重跑；沒有修訂歷史的既有檢查點可載入，但仍必須通過新契約的全部審查。
+尚待處理的全局內容 finding 會隨檢查點保存，重新載入不能藉重新驗圖而跳過它。
+待處理 finding 缺獨立識別碼或識別碼重複的檢查點會被拒絕，須從有效檢查點或 manifest 重跑。
 
 ## 驗證與限制
 

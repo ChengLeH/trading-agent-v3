@@ -13,6 +13,7 @@ from dataclasses import dataclass, asdict
 from typing import Any, Dict, Iterable, List, Tuple
 from copy import deepcopy
 from .schema import claim_index
+from .semantic_contracts import REFERENCE_INSTRUCTIONS, normalize_reference_checks
 
 
 @dataclass
@@ -127,6 +128,9 @@ ATOMIC_INSTRUCTIONS = r"""
 {
   "claim_id": "原 claim_id",
   "verdict": "PASS|SUSPICIOUS|FAIL",
+  "reference_checks": [{"ref_id":"實際引用或相依 ID","relation":"SUPPORTS|CONTRADICTS|INSUFFICIENT",
+    "attributed_assertion":"原文實際歸因給此來源的命題","source_evidence":"context 內來源內容／位置",
+    "reason":"為何支持、矛盾或不足"}],
   "findings": [
     {
       "category": "entity|metric|period|scope|unit|basis|date|value|source_distortion|dependency_state|risk_model|other",
@@ -137,7 +141,7 @@ ATOMIC_INSTRUCTIONS = r"""
   ]
 }
 PASS 時 findings 必須是空陣列。
-""".strip()
+""".strip() + "\n\n" + REFERENCE_INSTRUCTIONS
 
 
 def build_atomic_prompt(task: AtomicTask) -> str:
@@ -150,7 +154,7 @@ def build_atomic_prompt(task: AtomicTask) -> str:
     )
 
 
-def normalize_atomic_result(claim_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_atomic_result(claim_id: str, result: Dict[str, Any], *, expected_ref_ids=()) -> Dict[str, Any]:
     """Strict structural normalization; no semantic judgment in Python."""
     if not isinstance(result, dict):
         raise ValueError(f"atomic result for {claim_id} must be an object")
@@ -176,12 +180,14 @@ def normalize_atomic_result(claim_id: str, result: Dict[str, Any]) -> Dict[str, 
     out["claim_id"] = claim_id
     out["verdict"] = verdict
     out["findings"] = findings
+    out["reference_checks"] = normalize_reference_checks(expected_ref_ids, out)
     return out
 
 
 def summarize_atomic_results(
     expected_claim_ids: Iterable[str],
     results_by_claim: Dict[str, Dict[str, Any]],
+    *, expected_refs_by_claim=None,
 ) -> Dict[str, Any]:
     """Require an LLM result for every claim; missing reviews never auto-pass."""
 
@@ -202,7 +208,8 @@ def summarize_atomic_results(
         }
 
     normalized = {
-        cid: normalize_atomic_result(cid, results_by_claim[cid]) for cid in expected
+        cid: normalize_atomic_result(cid, results_by_claim[cid],
+                                     expected_ref_ids=(expected_refs_by_claim or {}).get(cid, ())) for cid in expected
     }
     passed, suspicious, failed, findings = [], [], [], []
     for cid, result in normalized.items():

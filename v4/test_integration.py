@@ -29,14 +29,37 @@ class CloudDouble:
     def complete(self, prompt):
         self.calls.append(prompt)
         if self.responder:
-            return self.responder(prompt)
+            result = self.responder(prompt)
+            # Legacy scripted global findings are expanded into explicit audit
+            # rows by the fixture only. Production accepts no such shortcut.
+            if isinstance(result, list) and "<context-data>" in prompt:
+                payload = json.loads(prompt.split("<context-data>\n")[1].split("\n</context-data>")[0])
+                if "report_markdown" in payload and "state" in payload:
+                    return global_fixture(payload["state"]["claims"], result)
+            return result
         # Parsing test protocol JSON is not production semantic routing.
         payload = json.loads(prompt.split("```json\n")[1].split("\n```")[0])
-        return verdict(payload["claim_id"])
+        return verdict(payload["claim_id"], ref_ids=reference_ids(payload["claim"]))
 
 
-def verdict(cid, status="PASS"):
+def reference_ids(claim):
+    return list(dict.fromkeys(claim["refs"] + claim["fact_refs"] + claim["dependencies"]))
+
+
+def global_fixture(claims, findings=None):
+    return dict(findings=findings or [], dependency_reviews=[
+        dict(claim_id=c["claim_id"], required_dependencies=c["dependencies"],
+             unresolved=False, reason="scripted dependency verdict") for c in claims])
+
+
+def global_verdict(r, findings=None):
+    return global_fixture(r.run.claims, findings)
+
+
+def verdict(cid, status="PASS", ref_ids=()):
     return dict(claim_id=cid, verdict=status,
+                reference_checks=[dict(ref_id=ref, relation="SUPPORTS", attributed_assertion="fixture attribution",
+                                       source_evidence="fixture evidence", reason="scripted supporting relation") for ref in ref_ids],
                 findings=[] if status == "PASS" else [dict(issue="來源與斷言不一致", evidence="test", suggested_fix="局部修正")])
 
 
@@ -62,7 +85,8 @@ def seeded():
 
 def review_all(r):
     prepared = r.prepare_phase6_atomic()
-    return r.collect_phase6_atomic({cid: verdict(cid) for cid, _ in prepared["atomic_prompts"]}, model_identity="test/first")
+    index = {c["claim_id"]: c for c in r.run.claims}
+    return r.collect_phase6_atomic({cid: verdict(cid, ref_ids=reference_ids(index[cid])) for cid, _ in prepared["atomic_prompts"]}, model_identity="test/first")
 
 
 class Integration(unittest.TestCase):
@@ -90,7 +114,7 @@ class Integration(unittest.TestCase):
         r = seeded()
         review_all(r)
         r.prepare_phase6_global_sweep()
-        r.collect_phase6_global_sweep([], model_identity="test/global")
+        r.collect_phase6_global_sweep(global_verdict(r), model_identity="test/global")
         completed = r.finalize()
         with tempfile.TemporaryDirectory() as temp:
             args = ["--resume", "unused.json", "--out", temp, "--author-model", "author",
@@ -114,7 +138,7 @@ class Integration(unittest.TestCase):
     def test_manual_collect_requires_models_and_distinct_deep_identity(self):
         r = seeded()
         prepared = r.prepare_phase6_atomic()
-        results = {cid: verdict(cid, "FAIL" if cid == "a" else "PASS") for cid, _ in prepared["atomic_prompts"]}
+        results = {cid: verdict(cid, "FAIL" if cid == "a" else "PASS", ref_ids=reference_ids(next(c for c in r.run.claims if c["claim_id"] == cid))) for cid, _ in prepared["atomic_prompts"]}
         for identity in (None, "", False, " "):
             with self.subTest(stage="atomic", identity=identity), self.assertRaises(ValueError):
                 r.collect_phase6_atomic(results, model_identity=identity)
@@ -129,9 +153,9 @@ class Integration(unittest.TestCase):
         r.prepare_phase6_global_sweep()
         for identity in (None, "", False, " "):
             with self.subTest(stage="global", identity=identity), self.assertRaises(ValueError):
-                r.collect_phase6_global_sweep([], model_identity=identity)
+                r.collect_phase6_global_sweep(global_verdict(r), model_identity=identity)
             self.assertIsNone(r.global_receipt)
-        r.collect_phase6_global_sweep([], model_identity="test/global")
+        r.collect_phase6_global_sweep(global_verdict(r), model_identity="test/global")
         self.assertFalse(r.finalize()["blocked"])
 
     def test_partial_role_checkpoint_never_skips_missing_roles_on_resume(self):
@@ -260,7 +284,7 @@ class Integration(unittest.TestCase):
         def atomic_response(prompt):
             task = json.loads(prompt.split("```json\n")[1].split("\n```")[0])
             status = "FAIL" if task["claim_id"] == "a" and task["claim"]["text"] != "修正版" else "PASS"
-            return verdict(task["claim_id"], status)
+            return verdict(task["claim_id"], status, ref_ids=reference_ids(task["claim"]))
         atomic = CloudDouble("test/atomic", atomic_response)
         deep = CloudDouble("test/deep", lambda _: verdict("a", "FAIL"))
         author = CloudDouble("test/author", lambda _: [dict(claim_id="a", text="修正版")])
@@ -398,7 +422,7 @@ class Integration(unittest.TestCase):
         r = seeded()
         review_all(r)
         r.prepare_phase6_global_sweep()
-        r.collect_phase6_global_sweep([], model_identity="test/global")
+        r.collect_phase6_global_sweep(global_verdict(r), model_identity="test/global")
         r.prepare_phase6_revision_v4([dict(claim_id="a", issue="fix")])
         result = r.collect_phase6_revision([dict(claim_id="a", text="修正版")])
         self.assertEqual(result["revalidate_claim_ids"], ["a", "b", "c"])
@@ -408,11 +432,11 @@ class Integration(unittest.TestCase):
         self.assertEqual(r.orch.get_packet(r.run_id, "trader")["claims"][0]["text"], "修正版")
         with self.assertRaises(ValueError):
             r.finalize()
-        r.collect_phase6_atomic({cid: verdict(cid) for cid, _ in result["atomic_prompts"]}, model_identity="test/first")
+        r.collect_phase6_atomic({cid: verdict(cid, ref_ids=reference_ids(next(c for c in r.run.claims if c["claim_id"] == cid))) for cid, _ in result["atomic_prompts"]}, model_identity="test/first")
         with self.assertRaises(ValueError):
             r.finalize()
         r.prepare_phase6_global_sweep()
-        r.collect_phase6_global_sweep([], model_identity="test/global")
+        r.collect_phase6_global_sweep(global_verdict(r), model_identity="test/global")
         self.assertIn("修正版", r.finalize()["report_markdown"])
 
     def test_patch_rolls_back_on_duplicate_unknown_author_or_cycle(self):
@@ -445,7 +469,7 @@ class Integration(unittest.TestCase):
         with self.assertRaises(ValueError):
             r.prepare_phase6_deep_review(["a"])
         r.prepare_phase6_atomic()
-        r.collect_phase6_atomic({c["claim_id"]: verdict(c["claim_id"], "SUSPICIOUS" if c["claim_id"] == "a" else "PASS")
+        r.collect_phase6_atomic({c["claim_id"]: verdict(c["claim_id"], "SUSPICIOUS" if c["claim_id"] == "a" else "PASS", ref_ids=reference_ids(c))
                                   for c in r.run.claims}, model_identity="test/first")
         with self.assertRaises(ValueError):
             r.prepare_phase6_deep_review(["independent"])
@@ -454,7 +478,7 @@ class Integration(unittest.TestCase):
             r.collect_phase6_deep_review({"a": verdict("a")}, model_identity="test/first")
         r.collect_phase6_deep_review({"a": verdict("a")}, model_identity="test/second")
         r.prepare_phase6_global_sweep()
-        r.collect_phase6_global_sweep([], model_identity="test/global")
+        r.collect_phase6_global_sweep(global_verdict(r), model_identity="test/global")
         self.assertFalse(r.finalize()["blocked"])
 
     def test_linker_complete_unique_known_nonempty_or_explicit_unresolved(self):
@@ -478,11 +502,11 @@ class Integration(unittest.TestCase):
         with self.assertRaises(ValueError):
             r.finalize()
         r.prepare_phase6_global_sweep()
-        r.collect_phase6_global_sweep([dict(issue="stale", claim_ids=["a"])], model_identity="test/global")
+        r.collect_phase6_global_sweep(global_verdict(r, [dict(issue="stale", claim_ids=["a"])]), model_identity="test/global")
         with self.assertRaises(ValueError):
             r.finalize()
         r.prepare_phase6_global_sweep()
-        r.collect_phase6_global_sweep([], model_identity="test/global")
+        r.collect_phase6_global_sweep(global_verdict(r), model_identity="test/global")
         r.run.manifest["as_of"] = "2026-10-17"
         with self.assertRaises(ValueError):
             r.finalize()
@@ -514,7 +538,7 @@ class Integration(unittest.TestCase):
         # Removal must block final delivery, even if an LLM says PASS.
         r.run.fact_store._facts.pop(f.fact_id)
         r.prepare_phase6_atomic()
-        r.collect_phase6_atomic({"source": verdict("source")}, model_identity="test/first")
+        r.collect_phase6_atomic({"source": verdict("source", ref_ids=["fact.test"])}, model_identity="test/first")
         with self.assertRaises(ValueError):
             r.prepare_phase6_global_sweep()
 
