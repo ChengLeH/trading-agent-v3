@@ -125,7 +125,10 @@ class SemanticAcceptance(unittest.TestCase):
         r.run.claims.extend(claim("bulk." + str(i)) for i in range(87 - len(r.run.claims)))
         r.orch._sync_views(r.run)
         prepared = r.prepare_phase6_atomic()
-        cache = {prompt: dict(claim_id=cid, verdict="PASS", findings=[])
+        from .cloud import structured_prompt
+        cache = {structured_prompt(prompt, json.dumps(prepared["response_schemas"][cid], ensure_ascii=False,
+                                                        separators=(",", ":"))):
+                 dict(claim_id=cid, verdict="PASS", findings=[])
                  for cid, prompt in prepared["atomic_prompts"]}
         generated = []
         def respond(prompt):

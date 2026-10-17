@@ -46,7 +46,7 @@ python -m v4 --manifest /path/to/manifest.json \
 回覆必須是完整 JSON，不能從 prose（一般文字）猜取或修補 JSON。每次成功回應記錄 transport 與 requested_model；文字輸出不提供可靠的實際服務模型身分及用量，因此 served_model 留空，不推測帳單或後端。
 
 程式庫亦可注入具 `execution="cloud"`、`identity`、`complete(prompt)` 的既有雲端連線介面。
-若連線介面另提供 `complete_structured(prompt, response_schema)`，原子與深度審查會明確傳入每條 Claim 的 JSON Schema（結構化回覆規格）；內建 Antigravity 把完整規格放進 stdin 的 `<response-schema>`，不使用 `--json-schema`：Mac agy 1.4.0 實測此旗標會出現多回合及重複串接 JSON，與官方宣告的 `structured_output` 行為不符。程式不從重複文字挑一份、不補預設 PASS；仍嚴格解析與逐條驗收。舊介面仍收到含完整規格的 prompt，回覆一樣須通過嚴格驗收。
+若連線介面另提供 `complete_structured(prompt, response_schema)`，原子與深度審查會明確傳入每條 Claim（或批次中逐條項目）的 JSON Schema（結構化回覆規格）；內建 Antigravity 把完整規格放進 stdin 的 `<response-schema>`，不使用 `--json-schema`：Mac agy 1.4.0 實測此旗標會出現多回合及重複串接 JSON，與官方宣告的 `structured_output` 行為不符。程式不從重複文字挑一份、不補預設 PASS；仍嚴格解析與逐條驗收。舊介面仍收到含完整規格的 prompt，回覆一樣須通過嚴格驗收。
 
 可先執行不含模型推論的啟動自檢：
 
@@ -62,6 +62,20 @@ python -m v4 --check-transport \
 `prepare_*`／`collect_*` API（程式介面）可供既有 assistant coordinator（助理協調流程）逐步驅動；每次 collect 必須提交完整 JSON。
 逐步入口與自動入口都要求非空的模型識別；第一層與深度審查可用同一模型，但各自的驗證紀錄仍必須完整，缺漏身分時不會發布驗證紀錄。
 舊名稱 `prepare_phase6`、`prepare_phase6_verify`、`collect_phase6`、`prepare_phase6_revision` 已重新指向 V4 契約，其回傳形狀不再與 V3 相同。
+
+## P6 效能、可選分批與進度
+
+預設維持每個請求驗證一條 Claim、最多 4 個並行請求。Mac 實測每批 2／4 條及 8 個工作槽均未比單條／4 槽更快，因此不預設啟用；不要從請求數減少推定時間或帳單一定下降。
+
+`--review-batch-size 2` 或 `4` 可選擇分批，`--review-batch-size 1` 回復逐條；`--max-workers` 控制並行請求（1..32），不是每批的 Claim 數。`--review-batch-max-bytes` 預設 65536，計入 UTF-8 提示與完整 schema，限制的是分組目標；單條超過目標仍完整送出並使用長文等待上限，不裁來源或跳過語義驗證。每批來源與相依物件只依明確 ID 去重，同 ID 內容矛盾即拒絕；每條 Claim 的 text、assertion、binding、引用與逐引用判定都保留。
+
+自動入口 `execute_phase6` 會依設定分組原子與深度審查。手動協調流程可用 `prepare_phase6_atomic_batches`／`collect_phase6_atomic_batches`，深度層用 `prepare_phase6_deep_review_batches`／`collect_phase6_deep_review_batches`。prepare 回傳 `review_batches`，各項有 `request_id/claim_ids/prompt/response_schema`；以 request_id 收回 `{results:[逐 Claim 結果]}`。原有逐條 API 與 `atomic_prompts` 仍保留。舊 VM driver 若繼續逐條讀 `atomic_prompts`，不會因更新程式自動變成分批，須改用新介面或自動入口。
+
+同批缺漏或格式不符時，只讓缺漏／不合格 Claim 用獨立請求重新語義審查，最多沿用既有 3 次契約預算；不補 `[]` 或自動 PASS。重複／未知 Claim ID 拒收。PASS 不進 deep；修補仍只重驗受影響 Claim 與 descendants（下游依賴），最後全局掃描不能省略。
+
+P6 的單條與分批路徑都會隨完成順序寫入合格收據與 `checkpoint.json`／`progress.json`，不等 87 條全部回來才保存。`progress.json` 包含 total_claims／atomic_verified／deep_verified、最後更新時間及工作槽設定；每項 response archive 另有 started_at、elapsed_seconds 與成功／失敗狀態。單項出錯會取消未啟動的請求，已在執行的兄弟仍收完保存。最後交付狀態仍以 `result.json` 為準。
+
+新執行會保存分批設定；續跑沿用檢查點，只有明確傳入旗標才覆蓋。沒有分批設定的舊檢查點預設逐條。重新載入後的舊語義收據仍只作稽核，須用新驗證識別碼重新驗證；這個安全契約沒有為省用量而取消。同一 runner 的失敗重試才可略過已合格且輸入雜湊未變的 Claim。
 
 ## Claim 與資料契約
 

@@ -1,5 +1,7 @@
 """Durable run progress and per-request responses, outside process temp storage."""
 import json
+import time
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 from pathlib import Path
 from .checkpoint import save_checkpoint, write_json
@@ -18,6 +20,10 @@ class RunJournal:
 
     def checkpoint(self, runner):
         save_checkpoint(runner, self.directory / "checkpoint.json")
+        write_json(self.directory / "progress.json", dict(run_id=runner.run_id, status=runner.status,
+            updated_at=datetime.now(timezone.utc).isoformat(), total_claims=len(runner.run.claims),
+            atomic_verified=len(runner.receipts), deep_verified=len(runner.deep_receipts),
+            max_workers=runner.max_workers, review_batch_size=runner.review_batch_size))
 
     def complete(self, runner, client, task_id, prompt, *, reuse_role_output=False, response_schema=None):
         metadata = dict(format="v4-response/1", run_id=runner.run_id, model=client.identity,
@@ -57,15 +63,19 @@ class RunJournal:
         # Fail before starting paid work if the output directory cannot be
         # written. An in-flight record never counts as a completed response.
         attempt = uuid4().hex
-        write_json(self.directory / relative, {**metadata, "attempt_id": attempt, "status": "in_flight"})
+        started = time.monotonic()
+        timing = dict(started_at=datetime.now(timezone.utc).isoformat())
+        write_json(self.directory / relative, {**metadata, **timing, "attempt_id": attempt, "status": "in_flight"})
         try:
             result = request_completion(client, prompt, response_schema)
         except AntigravityError as exc:
-            failed = {**metadata, "attempt_id": attempt, "status": "failed", **exc.details()}
+            failed = {**metadata, **timing, "elapsed_seconds": round(time.monotonic() - started, 3),
+                      "attempt_id": attempt, "status": "failed", **exc.details()}
             write_json(self.directory / "responses" / "archive" / (attempt + ".json"), failed)
             write_json(self.directory / relative, failed)
             raise
-        received = {**metadata, "attempt_id": attempt, "status": "received", "response": result}
+        received = {**metadata, **timing, "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "attempt_id": attempt, "status": "received", "response": result}
         # Keep previous attempts for audit, including explicitly retried roles.
         write_json(self.directory / "responses" / "archive" / (attempt + ".json"), received)
         write_json(self.directory / relative, received)

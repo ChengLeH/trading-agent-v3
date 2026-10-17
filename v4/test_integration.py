@@ -39,6 +39,9 @@ class CloudDouble:
             return result
         # Parsing test protocol JSON is not production semantic routing.
         payload = json.loads(prompt.split("```json\n")[1].split("\n```")[0])
+        if "tasks" in payload:
+            return dict(results=[verdict(row["claim"]["claim_id"], ref_ids=row["expected_reference_ids"])
+                                 for row in payload["tasks"]])
         return verdict(payload["claim_id"], ref_ids=reference_ids(payload["claim"]))
 
 
@@ -64,7 +67,8 @@ def verdict(cid, status="PASS", ref_ids=()):
 
 
 def seeded():
-    r = PipelineRunnerV4()
+    # Legacy one-Claim protocol fixtures; dedicated batch tests cover the default.
+    r = PipelineRunnerV4(review_batch_size=1, max_workers=4)
     r.run_id = "fixture"
     r.orch.runs[r.run_id] = RunState(run_id=r.run_id, ticker="TEST",
                                     manifest={"subject": {"ticker": "TEST"}, "as_of": "2026-10-16"})
@@ -166,7 +170,7 @@ class Integration(unittest.TestCase):
                     "--verifier-model", "first", "--deep-model", "second", "--global-model", "global"]
             with patch("v4.__main__.load_checkpoint", return_value=r), \
                  patch.object(r, "execute_phase6", return_value=completed), \
-                 patch("v4.__main__.save_checkpoint", side_effect=OSError("checkpoint unavailable")), \
+                 patch("v4.journal.save_checkpoint", side_effect=OSError("checkpoint unavailable")), \
                  contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(main(args), 2)
             saved = json.loads((Path(temp) / "result.json").read_text())
@@ -273,7 +277,7 @@ class Integration(unittest.TestCase):
             out = Path(temp) / "out"
             args = ["--manifest", str(manifest_path), "--out", str(out), "--author-model", "author",
                     "--verifier-model", "atomic", "--deep-model", "deep", "--global-model", "global"]
-            with patch("v4.__main__.AntigravityCloudClient", side_effect=lambda model: clients[model]), contextlib.redirect_stdout(io.StringIO()):
+            with patch("v4.__main__.AntigravityCloudClient", side_effect=lambda model, **kwargs: clients[model]), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(main(args), 0)
                 self.assertIn("report_markdown", json.loads((out / "result.json").read_text()))
                 self.assertTrue((out / "checkpoint.json").exists())
@@ -303,14 +307,15 @@ class Integration(unittest.TestCase):
             path.write_text(json.dumps({"items": [dict(title="來源測試", url="https://example.test/source", published="2026-10-15")]}))
             manifest = dict(subject={"ticker": "TEST"}, as_of="2026-10-16",
                             sources=[dict(id="news", type="news_json", path=str(path))])
-            r = PipelineRunnerV4()
+            r = PipelineRunnerV4(review_batch_size=4)
             author = CloudDouble("test/author", author_response)
             atomic, deep = CloudDouble(), CloudDouble("test/deep")
             sweep = CloudDouble("test/global", lambda _: [])
             result = r.execute("TEST", manifest, author, atomic, deep, sweep)
             self.assertFalse(result["blocked"], result)
             self.assertEqual(len(author.calls), len(ROLES))
-            self.assertEqual(len(atomic.calls), len(ROLES))
+            self.assertEqual(len(atomic.calls), 3)
+            self.assertEqual(set(r.receipts), {c["claim_id"] for c in r.run.claims})
             self.assertEqual(len(result["sidecar"]["evidence"]), 1)
             self.assertEqual(result["sidecar"]["total_claims"], len(ROLES))
             checkpoint = Path(temp) / "checkpoint.json"
@@ -395,7 +400,7 @@ class Integration(unittest.TestCase):
             save_checkpoint(r, checkpoint)
             args = ["--resume", str(checkpoint), "--out", str(out), "--author-model", "author",
                     "--verifier-model", "shared", "--deep-model", "shared", "--global-model", "global"]
-            with patch("v4.__main__.AntigravityCloudClient", side_effect=lambda model: clients[model]), \
+            with patch("v4.__main__.AntigravityCloudClient", side_effect=lambda model, **kwargs: clients[model]), \
                  contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(main(args), 0)
             result = json.loads((out / "result.json").read_text())

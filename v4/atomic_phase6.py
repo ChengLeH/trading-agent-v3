@@ -13,6 +13,7 @@ from dataclasses import dataclass, asdict
 from typing import Any, Dict, Iterable, List, Tuple
 from copy import deepcopy
 from uuid import uuid4
+from .cloud import structured_prompt
 from .schema import claim_index
 from .semantic_contracts import (REFERENCE_INSTRUCTIONS, normalize_reference_checks,
                                  SEMANTIC_REVIEW_CONTRACT, semantic_review_schema, review_ref_ids)
@@ -148,14 +149,15 @@ PASS 時 findings 必須是空陣列。
 
 def build_atomic_prompt(task: AtomicTask, *, verification_epoch=None) -> str:
     payload = task.to_dict()
-    payload.update(response_contract=SEMANTIC_REVIEW_CONTRACT, response_schema=semantic_review_schema(task.claim),
+    payload.update(response_contract=SEMANTIC_REVIEW_CONTRACT,
                    expected_reference_ids=review_ref_ids(task.claim), verification_epoch=verification_epoch or uuid4().hex)
-    return (
+    text = (
         ATOMIC_INSTRUCTIONS
         + "\n\n## Claim 與局部證據上下文\n```json\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
         + "\n```\n\n只回 JSON object，不要 markdown。"
     )
+    return structured_prompt(text, json.dumps(semantic_review_schema(task.claim), ensure_ascii=False, separators=(",", ":")))
 
 
 def normalize_atomic_result(claim_id: str, result: Dict[str, Any], *, expected_ref_ids=()) -> Dict[str, Any]:

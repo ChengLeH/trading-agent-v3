@@ -97,6 +97,27 @@ class Transport(unittest.TestCase):
             AntigravityCloudClient("model", timeout=1200).check_capabilities()
             self.assertEqual(run.call_args.args[2:4], (None, 60))
 
+    def test_schema_footer_is_idempotent_without_removing_any_evidence(self):
+        from .cloud import structured_prompt
+        schema = json.dumps(SEMANTIC_REVIEW_SCHEMA, ensure_ascii=False, separators=(",", ":"))
+        once = structured_prompt("complete evidence", schema)
+        self.assertEqual(structured_prompt(once, schema), once)
+        changed = structured_prompt(once, json.dumps(dict(type="object", required=["other"])))
+        self.assertTrue(changed.startswith(once))
+
+    def test_legacy_client_receives_full_schema_exactly_once(self):
+        from .cloud import request_completion
+        class LegacyClient:
+            def complete(self, prompt):
+                self.prompt = prompt
+                return dict(ok=True)
+        client = LegacyClient()
+        self.assertEqual(request_completion(client, "original evidence", SEMANTIC_REVIEW_SCHEMA), dict(ok=True))
+        self.assertTrue(client.prompt.startswith("original evidence"))
+        self.assertEqual(client.prompt.count("<response-schema>"), 1)
+        parsed = json.loads(client.prompt.split("<response-schema>\n")[1].split("\n</response-schema>")[0])
+        self.assertEqual(parsed, SEMANTIC_REVIEW_SCHEMA)
+
     def test_default_timeout_allows_five_to_ten_minute_reviews(self):
         with patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), \
              patch("v4.cloud.run_session", return_value="{}") as run:

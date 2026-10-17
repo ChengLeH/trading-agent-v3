@@ -19,11 +19,20 @@ def main(argv=None):
     for role in ("author", "verifier", "deep", "global"):
         parser.add_argument(f"--{role}-model", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--max-workers", type=int, default=4)
+    parser.add_argument("--request-timeout", type=float, default=1200,
+                        help="Per-request seconds (all roles and reviews); default 1200")
+    parser.add_argument("--max-workers", type=int, choices=range(1, 33),
+                        help="Concurrent requests; default 4, resume preserves checkpoint unless overridden")
+    parser.add_argument("--review-batch-size", type=int, choices=range(1, 17),
+                        help="Claims per Phase 6 request; default 1 (individual); larger batches are opt-in")
+    parser.add_argument("--review-batch-max-bytes", type=int,
+                        help="Target UTF-8 input bytes per review batch; default 65536")
     parser.add_argument("--max-revisions", type=int, default=3)
     parser.add_argument("--retry-role", action="append", choices=ROLES, default=[],
                         help="Re-request an uncommitted role output instead of replaying its saved response")
     args = parser.parse_args(argv)
+    if args.review_batch_max_bytes is not None and args.review_batch_max_bytes < 1024:
+        parser.error("--review-batch-max-bytes must be >=1024")
     out = Path(args.out)
     try:
         write_json(out / "result.json", dict(status="running", blocked=True))
@@ -33,17 +42,25 @@ def main(argv=None):
         return 2
     runner, clients = None, {}
     try:
-        clients = {role: AntigravityCloudClient(getattr(args, f"{role}_model")) for role in ("author", "verifier", "deep", "global")}
+        clients = {role: AntigravityCloudClient(getattr(args, f"{role}_model"), timeout=args.request_timeout) for role in ("author", "verifier", "deep", "global")}
         if args.check_transport:
             capabilities = {role: client.check_capabilities() for role, client in clients.items()}
             result = dict(blocked=False, status="transport_ready", capabilities=capabilities)
         elif args.resume:
             runner = load_checkpoint(args.resume)
+            if args.max_workers is not None:
+                runner.max_workers = args.max_workers
+            if args.review_batch_size is not None:
+                runner.review_batch_size = args.review_batch_size
+            if args.review_batch_max_bytes is not None:
+                runner.review_batch_max_bytes = args.review_batch_max_bytes
             runner.journal = RunJournal(out, resume_from=args.resume, retry_roles=args.retry_role)
             result = runner.resume(clients["author"], clients["verifier"], clients["deep"], clients["global"])
         else:
             manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
-            runner = PipelineRunnerV4(max_workers=args.max_workers, max_revisions=args.max_revisions)
+            runner = PipelineRunnerV4(max_workers=args.max_workers or 4, max_revisions=args.max_revisions,
+                                      review_batch_size=args.review_batch_size or 1,
+                                      review_batch_max_bytes=args.review_batch_max_bytes or 65536)
             runner.journal = RunJournal(out, retry_roles=args.retry_role)
             result = runner.execute(manifest["subject"]["ticker"], manifest, clients["author"], clients["verifier"], clients["deep"], clients["global"])
     except Exception as exc:
@@ -54,7 +71,10 @@ def main(argv=None):
         result.update(capability_check=True, user_prompt_sent=False)
     if runner is not None and runner.run_id:
         try:
-            save_checkpoint(runner, out / "checkpoint.json")
+            if runner.journal is not None:
+                runner.journal.checkpoint(runner)
+            else:
+                save_checkpoint(runner, out / "checkpoint.json")
         except Exception as exc:
             result = dict(blocked=True, status="blocked:checkpoint", reason=f"{type(exc).__name__}: {exc}")
     # Only result.json carries deliverable reports. A blocked run has none;

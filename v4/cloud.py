@@ -13,16 +13,19 @@ _STDIN_THRESHOLD = 64 * 1024  # UTF-8 bytes: long-prompt timeout
 def structured_prompt(prompt, serialized_schema):
     if serialized_schema is None:
         return prompt
-    return (prompt + "\n\n回覆必須是符合下列 schema 的單一 JSON object，不要 Markdown 或重複物件。"
+    footer = ("\n\n回覆必須是符合下列 schema 的單一 JSON object，不要 Markdown 或重複物件。"
             "每個引用仍須由你作語義驗證，不能以預設欄位代替。\n<response-schema>\n"
             + serialized_schema + "\n</response-schema>")
+    # Exact serialized schema footer deduplication only; no prose semantics.
+    return prompt if prompt.endswith(footer) else prompt + footer
 
 
 def request_completion(client, prompt, response_schema=None):
     structured = getattr(client, "complete_structured", None)
     if response_schema is not None and callable(structured):
         return structured(prompt, response_schema)
-    return client.complete(prompt)
+    schema = None if response_schema is None else json.dumps(response_schema, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    return client.complete(structured_prompt(prompt, schema))
 
 
 class AntigravityCloudClient:

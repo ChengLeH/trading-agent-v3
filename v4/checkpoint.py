@@ -39,6 +39,7 @@ def save_checkpoint(runner, path):
                           revision_round=runner.revision_round, history=runner.history,
                           deferred_global_findings=runner.deferred_global_findings,
                           max_revisions=runner.max_revisions, max_workers=runner.max_workers,
+                          review_batch_size=runner.review_batch_size, review_batch_max_bytes=runner.review_batch_max_bytes,
                           audit=dict(atomic=runner.receipts, deep=runner.deep_receipts, global_review=runner.global_receipt)))
 
 
@@ -47,7 +48,9 @@ def load_checkpoint(path):
     if data.get("format") != "v4-checkpoint/1":
         raise ValueError("unsupported V4 checkpoint")
     state = data["state"]
-    r = PipelineRunnerV4(max_revisions=data["max_revisions"], max_workers=data["max_workers"])
+    r = PipelineRunnerV4(max_revisions=data["max_revisions"], max_workers=data["max_workers"],
+                         review_batch_size=data.get("review_batch_size", 1),
+                         review_batch_max_bytes=data.get("review_batch_max_bytes", 65536))
     r.run_id = state["run_id"]
     run = RunState(run_id=r.run_id, ticker=state["ticker"], manifest=state["manifest"])
     run.events = {}
