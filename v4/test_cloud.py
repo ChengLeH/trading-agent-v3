@@ -41,20 +41,25 @@ class Transport(unittest.TestCase):
         self.sleep = sleeper.start()
         self.addCleanup(sleeper.stop)
 
-    def test_semantic_schema_is_forwarded_for_every_prompt_size(self):
+    def test_semantic_schema_uses_prompt_contract_not_repeating_native_cli_path(self):
         for prompt in ("short", "a" * (_STDIN_THRESHOLD + 1)):
             with self.subTest(size=len(prompt)), patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), \
                  patch("v4.cloud.run_session", return_value="{}") as run:
                 self.assertEqual(AntigravityCloudClient("model").complete_structured(prompt, SEMANTIC_REVIEW_SCHEMA), {})
-                schema = json.loads(run.call_args.args[4])
+                wire_prompt = run.call_args.args[2]
+                self.assertTrue(wire_prompt.startswith(prompt))
+                schema = json.loads(wire_prompt.split("<response-schema>\n")[1].split("\n</response-schema>")[0])
                 self.assertEqual(schema, SEMANTIC_REVIEW_SCHEMA)
                 self.assertIn("reference_checks", schema["required"])
+                self.assertIsNone(run.call_args.args[4])
 
-    def test_oversize_schema_blocks_before_cli_or_retries(self):
-        with patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), patch("v4.cloud.run_session") as run:
-            with self.assertRaisesRegex(ValueError, "schema exceeds"):
-                AntigravityCloudClient("model").complete_structured("prompt", dict(description="a" * _STDIN_THRESHOLD))
-            run.assert_not_called()
+    def test_large_schema_uses_stdin_instead_of_os_argument_limit(self):
+        with patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), patch("v4.cloud.run_session", return_value="{}") as run:
+            schema = dict(description="a" * _STDIN_THRESHOLD)
+            self.assertEqual(AntigravityCloudClient("model").complete_structured("prompt", schema), {})
+            self.assertIn(schema["description"], run.call_args.args[2])
+            self.assertIsNone(run.call_args.args[4])
+            self.assertEqual(run.call_args.args[3], 1800)
             self.sleep.assert_not_called()
 
     def test_empty_output_retries_and_recovers(self):
@@ -202,6 +207,22 @@ class ToolFreeSession(unittest.TestCase):
                     run_session("agy", "model", "evidence", 2)
                 self.assertEqual(caught.exception.code, "tool_policy_unverified")
                 start.assert_not_called()
+
+    def test_structured_client_places_schema_on_stdin_not_native_cli_flag(self):
+        body = '''
+assert "--json-schema" not in sys.argv
+assert sys.argv[sys.argv.index("--print-timeout") + 1] == "1200s"
+init()
+request = json.loads(sys.stdin.readline())
+content = request["message"]["content"]
+assert "<response-schema>" in content
+assert "reference_checks" in content
+assert sys.stdin.read() == ""
+result('{"ok":true}')
+'''
+        with cli_stub(body) as executable:
+            self.assertEqual(AntigravityCloudClient("model", executable=executable).complete_structured(
+                "semantic task", SEMANTIC_REVIEW_SCHEMA), dict(ok=True))
 
     def test_179kb_prompt_and_schema_reach_stdin_after_preflight(self):
         prompt = "資料\n" * 27000
