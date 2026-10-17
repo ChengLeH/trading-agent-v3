@@ -42,7 +42,7 @@ python -m v4 --manifest /path/to/manifest.json \
 程式先逐欄驗證內附 `evidence_agent.md` 的結構化設定，再於隔離工作目錄建立每次唯一的 `v4-evidence-only-<uuid>` 代理，透過 `--add-dir` 明列該隔離目錄。設定空工具清單、`excludeDefaultComponents: true`、`inheritCustomizations: false` 與 `commandExecutionPolicy: off`。只有 `init` 回報本次代理、指定模型及正確隔離目錄才送出證據，不退回預設代理。`init.tools` 是 CLI 宣告的全域工具登錄表，不是此代理的有效權限；非空不代表設定失效，也不能用它證明工具已停用。自檢分別回報 `declared_tools`、設定雜湊與 `advertised_tool_count`。依據：[官方代理規格](https://www.antigravity.google/docs/subagents/)、[排除預設工具與自訂設定的更新紀錄](https://www.antigravity.google/docs/changelog?tab=cli)。
 角色產生、原子驗證、深度覆核、修補、語義連結及全局掃描使用同一工具邊界，只依輸入物件作業。工具限制由專用代理設定提出，啟動檢查確認代理選取，並不獨立證明 CLI 的內部權限執行。若執行中仍出現工具或子代理事件，立即中止並拒收結果；這是違規偵測，不能保證事件一定先於工具執行。串流須恰有一個成功完整的 `result`，不能把中途片段當成答案。
 暫存工作目錄只放代理設定，不保存研究輸入、檢查點或回覆；正式狀態與稽核仍存於 `--out`。不修改全域 `settings.json`，不開放命令、不加入略過權限旗標。保留終端沙箱與停用指令展開，移除在此組合下無效的 `--mode plan`，不呼叫 V3 的 API fallback（失敗轉接）。
-超過 64 KiB UTF-8 的長文單次逾時為設定值與 1800 秒的較大者；短文維持設定值。空回覆（含純空白）及可重試傳輸失敗最多 3 次（首次＋2 次），間隔 15 秒。已識別的權限拒絕、工具清單不合格及工具誤用不重試；`AntigravityError` 提供安全的 `code/retryable/exit_code/attempts`，不公開原始 stderr 或 exception（例外）文字。非空答案仍須嚴格 JSON，不猜修。
+超過 64 KiB UTF-8 的長文單次逾時為設定值與 1800 秒的較大者；短文預設也提高至 1200 秒（20 分鐘），可由 V4 入口的 `--request-timeout` 指定；不是 agy 新旗標，內部仍使用 `--print-timeout`，且外層等待上限一致。提高等待上限不會加速模型，只避免 5～10 分鐘的有效請求被 120 秒截斷。空回覆（含純空白）及可重試傳輸失敗最多 3 次（首次＋2 次），間隔 15 秒。已識別的權限拒絕、工具清單不合格及工具誤用不重試；`AntigravityError` 提供安全的 `code/retryable/exit_code/attempts`，不公開原始 stderr 或 exception（例外）文字。非空答案仍須嚴格 JSON，不猜修。
 回覆必須是完整 JSON，不能從 prose（一般文字）猜取或修補 JSON。每次成功回應記錄 transport 與 requested_model；文字輸出不提供可靠的實際服務模型身分及用量，因此 served_model 留空，不推測帳單或後端。
 
 程式庫亦可注入具 `execution="cloud"`、`identity`、`complete(prompt)` 的既有雲端連線介面。

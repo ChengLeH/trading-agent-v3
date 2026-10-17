@@ -88,6 +88,7 @@ def run_session(executable, model, prompt, timeout, response_schema=None):
         except OSError:
             raise AntigravityError("cli_start_failed", retryable=True) from None
         deadline = time.monotonic() + timeout
+        init_deadline = time.monotonic() + min(timeout, 60)
         selector = selectors.DefaultSelector()
         stdout, stderr_tail = b"", b""
         request, offset, initialized, terminal = None, 0, False, None
@@ -156,7 +157,7 @@ def run_session(executable, model, prompt, timeout, response_schema=None):
                 if label != "stdin":
                     selector.register(pipe, selectors.EVENT_READ, label)
             while selector.get_map():
-                remaining = deadline - time.monotonic()
+                remaining = (deadline if initialized else init_deadline) - time.monotonic()
                 if remaining <= 0:
                     raise AntigravityError("timeout" if initialized else "missing_init", retryable=initialized)
                 for key, _ in selector.select(remaining):

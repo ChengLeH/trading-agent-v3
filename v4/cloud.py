@@ -20,7 +20,7 @@ def request_completion(client, prompt, response_schema=None):
 class AntigravityCloudClient:
     execution = "cloud"
 
-    def __init__(self, model, *, executable=None, timeout=120):
+    def __init__(self, model, *, executable=None, timeout=1200):
         if (not isinstance(model, str) or not model or model.startswith("-")
                 or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:/" for c in model)):
             raise ValueError("explicit Antigravity model ID required")
@@ -41,7 +41,7 @@ class AntigravityCloudClient:
 
     def check_capabilities(self):
         """Start CLI and check agent binding without sending any prompt or model turn."""
-        return run_session(self.executable, self.model, None, self.timeout)
+        return run_session(self.executable, self.model, None, min(self.timeout, 60))
 
     def complete(self, prompt, *, response_schema=None):
         schema = None if response_schema is None else json.dumps(response_schema, ensure_ascii=False, allow_nan=False)

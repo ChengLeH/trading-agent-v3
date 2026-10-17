@@ -86,6 +86,18 @@ class Transport(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
             self.sleep.assert_not_called()
 
+    def test_capability_preflight_keeps_short_deadline(self):
+        with patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), \
+             patch("v4.cloud.run_session", return_value={}) as run:
+            AntigravityCloudClient("model", timeout=1200).check_capabilities()
+            self.assertEqual(run.call_args.args[2:4], (None, 60))
+
+    def test_default_timeout_allows_five_to_ten_minute_reviews(self):
+        with patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), \
+             patch("v4.cloud.run_session", return_value="{}") as run:
+            AntigravityCloudClient("model").complete("small but slow semantic review")
+            self.assertEqual(run.call_args.args[3], 1200)
+
     def test_utf8_threshold_changes_timeout_without_using_argv_prompts(self):
         for prompt, timeout in (("a" * _STDIN_THRESHOLD, 60), ("語" * (_STDIN_THRESHOLD // 3 + 1), 1800)):
             with self.subTest(size=len(prompt)), patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), \
