@@ -35,7 +35,7 @@ class SemanticAcceptance(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "same-input.json"
             save_checkpoint(original, path)
-            runners = [original, load_checkpoint(path)]
+            runners = [original, load_checkpoint(path, continue_verification=False)]
         plans = [r.prepare_phase6_atomic() for r in runners]
         self.assertEqual(runners[0]._hash(), runners[1]._hash())
         self.assertNotEqual(plans[0]["atomic_prompts"], plans[1]["atomic_prompts"])

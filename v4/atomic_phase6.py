@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 from copy import deepcopy
 from uuid import uuid4
 from .cloud import structured_prompt
-from .schema import claim_index
+from .schema import claim_index, digest
 from .semantic_contracts import (REFERENCE_INSTRUCTIONS, normalize_reference_checks,
                                  SEMANTIC_REVIEW_CONTRACT, semantic_review_schema, review_ref_ids)
 
@@ -30,6 +30,42 @@ class AtomicTask:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    def review_dict(self):
+        """Wire context is local; the receipt fingerprint still covers ancestors.
+
+        Every ancestor remains a separate mandatory LLM task. A child checks
+        its use of direct premises instead of recursively re-reviewing them.
+        """
+        direct = set(self.claim.get("dependencies", []))
+        parents = [c for c in self.dependency_claims if c["claim_id"] in direct]
+        all_claim_ids = {c["claim_id"] for c in self.dependency_claims}
+        resolved, unresolved, visited = {}, [], set()
+        def source(ref):
+            if ref in visited:
+                return
+            visited.add(ref)
+            if ref in all_claim_ids:
+                return
+            if ref not in self.resolved_refs:
+                unresolved.append(ref)
+                return
+            item = self.resolved_refs[ref]
+            resolved[ref] = deepcopy(item)
+            if item["kind"] == "calc":
+                for parent in item["value"].get("input_refs", []):
+                    source(parent)
+            if item["kind"] == "event":
+                source(item["value"]["source_ref"])
+                if item["value"].get("aggregate_ref"):
+                    source(item["value"]["aggregate_ref"])
+        for claim in [self.claim] + parents:
+            for ref in claim.get("refs", []) + claim.get("fact_refs", []):
+                source(ref)
+        return dict(claim_id=self.claim_id, claim=deepcopy(self.claim), resolved_refs=resolved,
+                    dependency_claims=deepcopy(parents), unresolved_refs=unresolved, context=deepcopy(self.context),
+                    verification_input_hash=digest(self.to_dict()))
+
 
 
 def _evidence_dict(store) -> Dict[str, Any]:
@@ -126,6 +162,8 @@ ATOMIC_INSTRUCTIONS = r"""
 5. 如果 context 不足以判定真假，回 SUSPICIOUS，不得猜 PASS。
 6. 如果是 interpretation/forecast，只在它把來源事實說錯、或推論明確超出所引證據時才報。
 7. findings 必須綁定本 claim_id。不要自行改寫其他 claim。
+8. 本任務只查這條 Claim 對直接前提的使用；每個上游 Claim 另有必做驗證，不重審整條祖先鏈。
+   父 Claim 出錯會阻擋總體交付並在修補後重驗下游；沒有提供的來源仍不能猜測。
 
 輸出單一 JSON object：
 {
@@ -148,7 +186,7 @@ PASS 時 findings 必須是空陣列。
 
 
 def build_atomic_prompt(task: AtomicTask, *, verification_epoch=None) -> str:
-    payload = task.to_dict()
+    payload = task.review_dict()
     payload.update(response_contract=SEMANTIC_REVIEW_CONTRACT,
                    expected_reference_ids=review_ref_ids(task.claim), verification_epoch=verification_epoch or uuid4().hex)
     text = (

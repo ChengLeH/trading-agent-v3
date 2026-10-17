@@ -30,6 +30,8 @@ def main(argv=None):
     parser.add_argument("--max-revisions", type=int, default=3)
     parser.add_argument("--retry-role", action="append", choices=ROLES, default=[],
                         help="Re-request an uncommitted role output instead of replaying its saved response")
+    parser.add_argument("--fresh-verification", action="store_true",
+                        help="Explicitly start a new verification epoch instead of continuing saved requests")
     args = parser.parse_args(argv)
     if args.review_batch_max_bytes is not None and args.review_batch_max_bytes < 1024:
         parser.error("--review-batch-max-bytes must be >=1024")
@@ -42,19 +44,20 @@ def main(argv=None):
         return 2
     runner, clients = None, {}
     try:
-        clients = {role: AntigravityCloudClient(getattr(args, f"{role}_model"), timeout=args.request_timeout) for role in ("author", "verifier", "deep", "global")}
+        clients = {role: AntigravityCloudClient(getattr(args, f"{role}_model"), timeout=args.request_timeout, session_root=out / "sessions") for role in ("author", "verifier", "deep", "global")}
         if args.check_transport:
             capabilities = {role: client.check_capabilities() for role, client in clients.items()}
             result = dict(blocked=False, status="transport_ready", capabilities=capabilities)
         elif args.resume:
-            runner = load_checkpoint(args.resume)
+            runner = load_checkpoint(args.resume, continue_verification=not args.fresh_verification)
             if args.max_workers is not None:
                 runner.max_workers = args.max_workers
             if args.review_batch_size is not None:
                 runner.review_batch_size = args.review_batch_size
             if args.review_batch_max_bytes is not None:
                 runner.review_batch_max_bytes = args.review_batch_max_bytes
-            runner.journal = RunJournal(out, resume_from=args.resume, retry_roles=args.retry_role)
+            runner.journal = RunJournal(out, resume_from=args.resume, retry_roles=args.retry_role,
+                                        continue_verification=not args.fresh_verification)
             result = runner.resume(clients["author"], clients["verifier"], clients["deep"], clients["global"])
         else:
             manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))

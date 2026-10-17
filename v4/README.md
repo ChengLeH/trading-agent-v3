@@ -39,10 +39,10 @@ python -m v4 --manifest /path/to/manifest.json \
 模型 ID 由執行者從 `agy models` 清單明確選定，verifier（第一層驗證）與 deep（深度覆核）可使用相同或不同的模型 ID；兩者都是透過 Antigravity 接入。若要同一模型，將 `--verifier-model` 與 `--deep-model` 設為相同值即可。兩層仍分別提出請求、使用不同提示並保存各自的驗證紀錄；同模型兩輪覆核不代表跨模型交叉驗證，也可能重複同一模型的誤判。
 程式由 PATH 尋找 `agy`，或使用執行者設定的 `AGY_EXECUTABLE`。不安裝外掛、不建立／讀取金鑰檔、不啟動本地模型；失敗立即封鎖，不切換 direct API（直接 API）或其他後端。
 所有 prompt（提示）均以 stdin（標準輸入）傳送完整 `user` 事件，使用 `--input-format stream-json --output-format stream-json`。先收到並檢查啟動資訊，再送出任何提示位元組，不再使用 `-p`。協定依據：[Antigravity 官方 stdin 文件](https://www.antigravity.google/docs/cli/headless/#stream-prompts-from-stdin)。
-程式先逐欄驗證內附 `evidence_agent.md` 的結構化設定，再於隔離工作目錄建立每次唯一的 `v4-evidence-only-<uuid>` 代理，透過 `--add-dir` 明列該隔離目錄。設定空工具清單、`excludeDefaultComponents: true`、`inheritCustomizations: false` 與 `commandExecutionPolicy: off`。只有 `init` 回報本次代理、指定模型及正確隔離目錄才送出證據，不退回預設代理。`init.tools` 是 CLI 宣告的全域工具登錄表，不是此代理的有效權限；非空不代表設定失效，也不能用它證明工具已停用。自檢分別回報 `declared_tools`、設定雜湊與 `advertised_tool_count`。依據：[官方代理規格](https://www.antigravity.google/docs/subagents/)、[排除預設工具與自訂設定的更新紀錄](https://www.antigravity.google/docs/changelog?tab=cli)。
+程式先逐欄驗證內附 `evidence_agent.md` 的結構化設定，再於隔離工作目錄建立每個任務唯一的 `v4-evidence-only-<uuid>` 代理，透過 `--add-dir` 明列該隔離目錄。設定空工具清單、`excludeDefaultComponents: true`、`inheritCustomizations: false` 與 `commandExecutionPolicy: off`。只有 `init` 回報本次代理、指定模型及正確隔離目錄才送出證據，不退回預設代理。`init.tools` 是 CLI 宣告的全域工具登錄表，不是此代理的有效權限；非空不代表設定失效，也不能用它證明工具已停用。自檢分別回報 `declared_tools`、設定雜湊與 `advertised_tool_count`。依據：[官方代理規格](https://www.antigravity.google/docs/subagents/)、[排除預設工具與自訂設定的更新紀錄](https://www.antigravity.google/docs/changelog?tab=cli)。
 角色產生、原子驗證、深度覆核、修補、語義連結及全局掃描使用同一工具邊界，只依輸入物件作業。工具限制由專用代理設定提出，啟動檢查確認代理選取，並不獨立證明 CLI 的內部權限執行。若執行中仍出現工具或子代理事件，立即中止並拒收結果；這是違規偵測，不能保證事件一定先於工具執行。串流須恰有一個成功完整的 `result`，不能把中途片段當成答案。
-暫存工作目錄只放代理設定，不保存研究輸入、檢查點或回覆；正式狀態與稽核仍存於 `--out`。不修改全域 `settings.json`，不開放命令、不加入略過權限旗標。保留終端沙箱與停用指令展開，移除在此組合下無效的 `--mode plan`，不呼叫 V3 的 API fallback（失敗轉接）。
-超過 64 KiB UTF-8 的長文單次逾時為設定值與 1800 秒的較大者；短文預設也提高至 1200 秒（20 分鐘），可由 V4 入口的 `--request-timeout` 指定；不是 agy 新旗標，內部仍使用 `--print-timeout`，且外層等待上限一致。啟動握手另限最多 60 秒。提高等待上限不會加速模型，只避免 5～10 分鐘的有效請求被 120 秒截斷。空回覆（含純空白）及可重試傳輸失敗最多 3 次（首次＋2 次），間隔 15 秒。已識別的權限拒絕、代理設定不合格及工具誤用不重試；`AntigravityError` 提供安全的 `code/retryable/exit_code/attempts`，不公開原始 stderr 或 exception（例外）文字。非空答案仍須嚴格 JSON，不猜修。
+一般模型請求的隔離工作目錄、代理設定、原始請求、對話 ID 與串流事件都持久保存在 `--out/sessions/`；只有不送提示的啟動自檢使用暫存目錄。直接使用 client 時，預設為目前目錄的 `.v4-sessions/`，可透過 `session_root` 或 `V4_SESSION_DIR` 指定持久位置。不修改全域 `settings.json`，不開放命令、不加入略過權限旗標。保留終端沙箱與停用指令展開，移除在此組合下無效的 `--mode plan`，不呼叫 V3 的 API fallback（失敗轉接）。
+超過 64 KiB UTF-8 的長文單次逾時為設定值與 1800 秒的較大者；短文預設也提高至 1200 秒（20 分鐘），可由 V4 入口的 `--request-timeout` 指定；不是 agy 新旗標，內部仍使用 `--print-timeout`，且外層等待上限一致。啟動握手另限最多 60 秒。提高等待上限不會加速模型，只避免 5～10 分鐘的有效請求被 120 秒截斷。確認尚未送出任務的可重試啟動失敗最多 3 次（首次＋2 次），間隔 15 秒。任務送出後逾時或回空字串則保存並回報 `session_pending`，不在 client 內自動新開對話。已識別的權限拒絕、代理設定不合格及工具誤用不重試；`AntigravityError` 提供安全的 `code/retryable/exit_code/attempts`，不公開原始 stderr 或 exception（例外）文字。非空答案仍須嚴格 JSON，不猜修。
 回覆必須是完整 JSON，不能從 prose（一般文字）猜取或修補 JSON。每次成功回應記錄 transport 與 requested_model；文字輸出不提供可靠的實際服務模型身分及用量，因此 served_model 留空，不推測帳單或後端。
 
 程式庫亦可注入具 `execution="cloud"`、`identity`、`complete(prompt)` 的既有雲端連線介面。
@@ -67,7 +67,7 @@ python -m v4 --check-transport \
 
 預設維持每個請求驗證一條 Claim、最多 4 個並行請求。Mac 實測每批 2／4 條及 8 個工作槽均未比單條／4 槽更快，因此不預設啟用；不要從請求數減少推定時間或帳單一定下降。
 
-`--review-batch-size 2` 或 `4` 可選擇分批，`--review-batch-size 1` 回復逐條；`--max-workers` 控制並行請求（1..32），不是每批的 Claim 數。`--review-batch-max-bytes` 預設 65536，計入 UTF-8 提示與完整 schema，限制的是分組目標；單條超過目標仍完整送出並使用長文等待上限，不裁來源或跳過語義驗證。每批來源與相依物件只依明確 ID 去重，同 ID 內容矛盾即拒絕；每條 Claim 的 text、assertion、binding、引用與逐引用判定都保留。
+`--review-batch-size 2` 或 `4` 可選擇分批，`--review-batch-size 1` 回復逐條；`--max-workers` 控制並行請求（1..32），不是每批的 Claim 數。`--review-batch-max-bytes` 預設 65536，計入 UTF-8 提示與完整 schema，同時作為逐條請求的輸入預算；單條超過預算時會在模型呼叫前回報 `review_context_too_large`，要求提供範圍明確的結構化證據或明確調整預算，不偷偷裁來源或跳過語義驗證。每批來源與相依物件只依明確 ID 去重，同 ID 內容矛盾即拒絕；每條 Claim 的 text、assertion、binding、引用與逐引用判定都保留。
 
 自動入口 `execute_phase6` 會依設定分組原子與深度審查。手動協調流程可用 `prepare_phase6_atomic_batches`／`collect_phase6_atomic_batches`，深度層用 `prepare_phase6_deep_review_batches`／`collect_phase6_deep_review_batches`。prepare 回傳 `review_batches`，各項有 `request_id/claim_ids/prompt/response_schema`；以 request_id 收回 `{results:[逐 Claim 結果]}`。原有逐條 API 與 `atomic_prompts` 仍保留。舊 VM driver 若繼續逐條讀 `atomic_prompts`，不會因更新程式自動變成分批，須改用新介面或自動入口。
 
@@ -136,17 +136,29 @@ checkpoint（檢查點）以暫存檔與原子替換保存正式物件及稽核�
 資料匯入完成、每批角色提交、原子／深度驗證收集、語義連結、局部修補與全局掃描完成時，立即更新 `--out/checkpoint.json`，不等整份流程返回才寫。
 每筆模型呼叫開始前與成功返回後，分別將 `in_flight`／`received` 狀態寫入 `--out/responses/`；成功回覆另保留於 `responses/archive/`。並行工作的一筆失敗不會抹去其他已保存回覆。
 已分類的 Antigravity 失敗也立即保存 `failed` 與安全的錯誤碼／重試屬性／退出碼；沒有假造回覆，重新執行不會把失敗紀錄或更早的舊答案當成本次成功。
-未提交角色的不可重試失敗（含非法 JSON）會在一般續跑時保持封鎖；修正原因後，須明確用 `--retry-role` 指定該角色才重新請求。暫時性傳輸失敗可於新執行續試。這與每次執行都重新審查全部 Claim 的規則分開。
+未提交角色的不可重試失敗（含非法 JSON）會在一般續跑時保持封鎖；修正原因後，須明確用 `--retry-role` 指定該角色才重新請求。任務已送出且確認接收後的暫時性失敗，可在原對話續接；未確認是否送達時封鎖，不盲目重送。
 暫存檔只在同一輸出目錄內用於原子替換，檔案與目錄皆同步至磁碟。`--out` 必須由操作者指向持久磁碟或掛載目錄；指定 `/tmp`、非持久 VM 磁碟，或刪除該磁碟後，程式無法保證資料仍在。輸出目錄含研究資料，須按原本權限保存，不能提交到 Git。
 重新載入會驗證 schema 與 DAG，重建分析視圖；序列化的舊審查紀錄只作稽核，不能當成新執行的通行證。
 `--resume` 會先補齊尚未完成的角色階段，已提交的角色不重新生成；未提交批次的成功回覆只有在 run／角色／模型／完整 prompt 雜湊相同時才可重用，也可從原檢查點旁的 responses 續接到新的輸出目錄。階段次序錯亂或缺半批正式角色仍封鎖，不能跳過缺少的角色交付。
-全部 Claim 與全局掃描仍重新驗證，不重播舊語義驗證作為新通行證，因此會有額外雲端用量。若未提交的角色回覆格式錯誤，可明確加入 `--retry-role bull` 等選項，只重呼指定角色；其他同批成功回覆繼續重用，舊嘗試保留作稽核。已提交角色須走原有 Claim patch（論述修補）流程。
-保存失敗會停止後續流程；若程序在雲端收到請求後、回覆寫入前中止，該次呼叫是否完成或計費無法確知，續跑可能重送，不宣稱完全不重複呼叫。
+`--resume` 及 `load_checkpoint()` 預設延續原 verification epoch（驗證執行識別碼）。成功的回覆只在同一 run、epoch、完整提示、祖先／來源內容雜湊、回覆規格、模型與代理設定一致時重播，且重新通過逐引用與依賴契約驗收；不信任檢查點內的收據。缺少這些欄位的舊檢查點不能默默重跑付費驗證；要明確加入 `--fresh-verification`，程式庫則用 `load_checkpoint(..., continue_verification=False)` 啟動新一輪。若未提交的角色回覆格式錯誤，可明確加入 `--retry-role bull` 等選項，只重呼指定角色；其他同批成功回覆繼續重用，舊嘗試保留作稽核。已提交角色須走原有 Claim patch（論述修補）流程。
+保存失敗會停止後續流程。若請求可能已送出但沒有接收確認，回報 `delivery_unconfirmed`，不自動另開請求；不宣稱能確知供應商是否計費。若成功 result 已寫進串流事件、但最終回覆索引尚未寫入，會先恢復該結果，仍須嚴格驗收。
 初始提交、修補、重新載入與最終驗證都共同要求 trader 的唯一 trade_plan，且它必須與衍生交易狀態一致。要撤單請修成 WAIT 方案，不能刪除或改型後留下舊 BUY／SHORT。
 V3 的 Markdown 或舊 Claim 缺欄位時，不能自動用文字猜成 V4；必須重新執行 V4 角色流程，或由明確結構化資料完成遷移。
-舊 V4 檢查點若有修訂歷史、卻缺少有效的修改前後 Claim 原物件，也會被拒絕，須由 manifest 重跑；沒有修訂歷史的既有檢查點可載入，但仍必須通過新契約的全部審查。
+舊 V4 檢查點若有修訂歷史、卻缺少有效的修改前後 Claim 原物件，也會被拒絕，須由 manifest 重跑；沒有修訂歷史、但缺驗證執行識別碼的舊檢查點，須明確選擇新一輪驗證才能載入。
 尚待處理的全局內容 finding 會隨檢查點保存，重新載入不能藉重新驗圖而跳過它。
 待處理 finding 缺獨立識別碼或識別碼重複的檢查點會被拒絕，須從有效檢查點或 manifest 重跑。
+
+## P6 共用資料縮減與中斷續接
+
+每條 Claim 的線上任務只包含自己的完整物件、直接父 Claim 及兩者引用的完整來源；Calc／Event 的明確來源連結仍遞迴展開。每個父 Claim 本身另有必做的 LLM 驗證，不在每個子節點重新審整串祖先。收據與提示仍綁定全部祖先及來源的 canonical（正式狀態）雜湊，祖先或來源改變就使下游結果失效。這是結構化依賴投影，沒有以文字猜測重要性、截斷證據或漏驗 Claim。
+
+深度覆核保留第一層判決及 findings，不重帶第一層逐來源的冗長說明；仍獨立審原始證據。修補同樣使用局部任務。最終全局掃描仍檢查所有 Claim、章節／作者、DAG、交易物件及每次修改前後的完整 Claim；不再附內容重複的 Markdown、整份舊 finding／patch 歷史或 Evidence 的原始摘錄。完整正式狀態與歷史的雜湊仍綁定該次掃描。
+
+`session_pending` 不等於成功，也不允許自動 API 轉接或從頭重送。命令列以相同檢查點 `--resume`；程式庫使用同一 RunJournal，或直接 client 的 `resume_request(prompt, response_schema)`，會帶原本 `--conversation <id>`、相同代理設定與隔離目錄續接，只傳「接續完成原任務」的訊息。普通 `client.complete()` 再呼叫相同任務會回報待續，不開新對話。每個任務最多兩次續接，累計等待預算為初始單次上限的三倍；預算與次數跨程序保存，硬中止會保守扣除當次預留額度。每個任務的跨程序鎖防止同時重複呼叫；若主程序硬中止但舊子程序仍在，會回報 `session_busy`，不另開付費回合，也不擅自殺掉可能重用的程序識別碼。事件檔損壞則封鎖並保留原檔，不猜修、不盲目重算。
+
+這是恢復同一雲端對話的上下文，不是供應商保證的逐 token（輸出片段）游標續算；逾時仍會結束本機子程序，部分輸出保存作為進度證據，不能當作合格判決。只有完整成功結果且通過驗收才能交付。舊 run 沒有保存對話 ID，無法事後憑空恢復。
+
+Mac 真實測試已在接收任務後刻意中斷，再用原對話 ID 續接；未重傳原始測試標記，回覆仍正確保留標記及算術答案。這證明上下文續接可用，沒有宣稱 87 條真實分析的總時間或帳單已下降。87 層合成依賴鏈的回歸測試驗證線上資料量小於舊全祖先版本的十分之一，同時遠端祖先修改仍使最後一節點失效。
 
 ## 驗證與限制
 
@@ -166,3 +178,5 @@ python -m v3.test_p6_dedup
 目前角色證據包保留完整結構化資料；大型資料集仍可能需要明確的來源選取或分頁介面，不能以截掉 Claim／Fact 或語義快篩處理。
 
 影響只限 `v4/`，不需要重啟 V3 服務。回滾時停用 `python -m v4` 或回到既有 V3 入口；不要將 V4 checkpoint 當作 V3 狀態讀取。
+
+本輪共用流程根因、驗收數據及已知限制：[P6_RECOVERY.md](P6_RECOVERY.md)。

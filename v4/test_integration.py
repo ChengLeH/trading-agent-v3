@@ -34,7 +34,7 @@ class CloudDouble:
             # rows by the fixture only. Production accepts no such shortcut.
             if isinstance(result, list) and "<context-data>" in prompt:
                 payload = json.loads(prompt.split("<context-data>\n")[1].split("\n</context-data>")[0])
-                if "report_markdown" in payload and "state" in payload:
+                if payload.get("review_scope") == "global_consistency":
                     return global_fixture(payload["state"]["claims"], result)
             return result
         # Parsing test protocol JSON is not production semantic routing.

@@ -131,5 +131,17 @@ else:
                 run_session("agy", "model", "request", 2, session_dir=temp, resume=True)
             start.assert_not_called()
 
+    def test_pre_init_timeout_can_retry_without_resending_a_paid_turn(self):
+        with tempfile.TemporaryDirectory() as temp, cli_stub('time.sleep(10)') as stalled:
+            with patch("v4.agy_session.os.write", wraps=__import__('os').write) as write, self.assertRaises(AntigravityError) as caught:
+                run_session(stalled, "model", "request", .2, session_dir=temp)
+            self.assertEqual(caught.exception.code, "missing_init")
+            self.assertTrue(caught.exception.retryable)
+            write.assert_not_called()
+            state = json.loads((Path(temp) / "session.json").read_text())
+            self.assertFalse(state["request_sent"])
+            with cli_stub("""init()\nsys.stdin.readline()\nresult('{"done":true}')""") as working:
+                self.assertEqual(run_session(working, "model", "request", 2, session_dir=temp, resume=True), '{"done":true}')
+
 
 if __name__ == '__main__': unittest.main()

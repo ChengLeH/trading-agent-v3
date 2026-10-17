@@ -120,6 +120,11 @@ class Journal(unittest.TestCase):
                 r._complete(client, "bull", "same prompt", reuse_role_output=True)
             client.responder = lambda _: dict(claims="new reply")
             r.journal = RunJournal(target, resume_from=source / "checkpoint.json")
+            from .agy_session import AntigravityError
+            with self.assertRaisesRegex(AntigravityError, "delivery_unconfirmed"):
+                r._complete(client, "bull", "same prompt", reuse_role_output=True)
+            self.assertEqual(len(client.calls), 2)
+            r.journal.retry_roles.add("bull")
             self.assertEqual(r._complete(client, "bull", "same prompt", reuse_role_output=True), dict(claims="new reply"))
             self.assertEqual(len(client.calls), 3)
 
@@ -228,7 +233,7 @@ r.resume(CloudDouble("test/author", author), CloudDouble(), CloudDouble("test/de
                              {("bull", "received"), ("bear", "in_flight")})
             # Also support resuming into a different permanent directory.
             resumed = Path(temp) / "resumed-run"
-            r.journal = RunJournal(resumed, resume_from=checkpoint)
+            r.journal = RunJournal(resumed, resume_from=checkpoint, retry_roles=["bear"])
             author = CloudDouble("test/author", author_response)
             verifier = CloudDouble()
             result = r.resume(author, verifier, CloudDouble("test/deep"),
@@ -254,7 +259,7 @@ r.resume(CloudDouble("test/author", author), CloudDouble(), CloudDouble("test/de
             records = [json.loads(p.read_text()) for p in (Path(temp) / "responses").glob("*.json")]
             self.assertEqual({p["task_id"]: p["status"] for p in records}, {"good": "received", "bad": "in_flight"})
 
-    def test_review_responses_are_archived_but_never_replayed(self):
+    def test_explicit_new_execution_never_replays_old_review_responses(self):
         with tempfile.TemporaryDirectory() as temp:
             r = seeded()
             r.journal = RunJournal(temp)
@@ -262,7 +267,7 @@ r.resume(CloudDouble("test/author", author), CloudDouble(), CloudDouble("test/de
             first = r.execute_phase6(verifier, CloudDouble("test/deep"), CloudDouble("test/author"),
                                      CloudDouble("test/global", lambda _: global_verdict(r)))
             self.assertFalse(first["blocked"], first)
-            restored = load_checkpoint(Path(temp) / "checkpoint.json")
+            restored = load_checkpoint(Path(temp) / "checkpoint.json", continue_verification=False)
             restored.journal = RunJournal(temp)
             second = restored.execute_phase6(verifier, CloudDouble("test/deep"), CloudDouble("test/author"),
                                             CloudDouble("test/global", lambda _: global_verdict(restored)))

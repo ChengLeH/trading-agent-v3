@@ -1,9 +1,7 @@
-"""Atomic canonical-state persistence; reload always requires fresh reviews."""
+"""Atomic canonical-state persistence; reload revalidates durable responses instead of trusting receipt snapshots."""
 from dataclasses import asdict
 from pathlib import Path
 import json
-import os
-import tempfile
 from v3.pipeline import RunState
 from v3.facts import Fact
 from v3.evidence import EvidencePacket
@@ -11,30 +9,13 @@ from v3.sources import SourceRecord, SourceError
 from .runner import PipelineRunnerV4
 
 
-def write_json(path, payload):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
-            temporary = f.name
-            json.dump(payload, f, ensure_ascii=False, indent=2, allow_nan=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        if temporary:
-            Path(temporary).unlink(missing_ok=True)
+from .storage import write_json
 
 
 def save_checkpoint(runner, path):
     write_json(path, dict(format="v4-checkpoint/1", state=runner.orch.snapshot(runner.run_id),
-                          status=runner.status,
+                          status=runner.status, verification_epoch=runner._verification_epoch,
+                          contract_attempts=runner._contract_attempts,
                           records=[dict(kind=type(r).__name__, value=asdict(r)) for r in runner.run.records],
                           revision_round=runner.revision_round, history=runner.history,
                           deferred_global_findings=runner.deferred_global_findings,
@@ -43,7 +24,7 @@ def save_checkpoint(runner, path):
                           audit=dict(atomic=runner.receipts, deep=runner.deep_receipts, global_review=runner.global_receipt)))
 
 
-def load_checkpoint(path):
+def load_checkpoint(path, *, continue_verification=True):
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if data.get("format") != "v4-checkpoint/1":
         raise ValueError("unsupported V4 checkpoint")
@@ -51,6 +32,16 @@ def load_checkpoint(path):
     r = PipelineRunnerV4(max_revisions=data["max_revisions"], max_workers=data["max_workers"],
                          review_batch_size=data.get("review_batch_size", 1),
                          review_batch_max_bytes=data.get("review_batch_max_bytes", 65536))
+    if continue_verification:
+        from uuid import UUID
+        epoch = data.get("verification_epoch")
+        if not isinstance(epoch, str) or UUID(epoch).hex != epoch:
+            raise ValueError("checkpoint lacks a durable verification epoch; explicit fresh verification required")
+        attempts = data.get("contract_attempts", {})
+        if not isinstance(attempts, dict) or any(not isinstance(k, str) or type(v) is not int or v < 0 for k, v in attempts.items()):
+            raise ValueError("invalid persisted contract attempts")
+        r._verification_epoch = epoch
+        r._contract_attempts = attempts
     r.run_id = state["run_id"]
     run = RunState(run_id=r.run_id, ticker=state["ticker"], manifest=state["manifest"])
     run.events = {}
@@ -83,7 +74,8 @@ def load_checkpoint(path):
         raise ValueError("duplicate deferred finding_id")
     from .semantic_contracts import validate_revision_history
     validate_revision_history(run.claims, r.history)
-    # Serialized receipts are audit records, not proof of a new execution.
-    # Never trust a stale/mutated checkpoint to bypass atomic/global review.
+    # Never restore serialized receipts. Same-execution continuation replays
+    # exact request archives through all semantic-contract validators. A changed
+    # canonical ancestor, source, schema, model or policy gets a different key.
     r.status = run.stage = "resumed:requires_verification"
     return r

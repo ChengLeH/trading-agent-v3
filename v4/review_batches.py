@@ -38,16 +38,20 @@ def _request(tasks, *, layer, verification_epoch, first_reviews):
             raise ValueError(f"conflicting structured review context for {key}")
         catalog[key] = deepcopy(value)
     for task in tasks:
-        for ref, value in task.resolved_refs.items():
+        local = task.review_dict()
+        for ref, value in local["resolved_refs"].items():
             pool(evidence, ref, value)
-        for claim in task.dependency_claims:
+        for claim in local["dependency_claims"]:
             pool(dependencies, claim["claim_id"], claim)
-        row = dict(claim=deepcopy(task.claim), resolved_ref_ids=list(task.resolved_refs),
-                   dependency_claim_ids=[c["claim_id"] for c in task.dependency_claims],
-                   unresolved_refs=task.unresolved_refs, context=task.context,
+        row = dict(claim=deepcopy(task.claim), resolved_ref_ids=list(local["resolved_refs"]),
+                   verification_input_hash=local["verification_input_hash"],
+                   dependency_claim_ids=[c["claim_id"] for c in local["dependency_claims"]],
+                   unresolved_refs=local["unresolved_refs"], context=task.context,
                    expected_reference_ids=review_ref_ids(task.claim))
         if layer == "deep":
-            row["first_review"] = first_reviews[task.claim_id]
+            first = first_reviews[task.claim_id]
+            row["first_review"] = {k: first[k] for k in ("claim_id", "verdict", "findings")}
+            row["first_review_hash"] = digest(first)
         rows.append(row)
     payload = dict(response_contract=SEMANTIC_REVIEW_CONTRACT, review_layer=layer,
                    verification_epoch=verification_epoch, tasks=rows,
@@ -70,6 +74,14 @@ def pack_review_requests(tasks, *, batch_size, max_bytes, verification_epoch, la
         raise ValueError("invalid review layer")
     if len({t.claim_id for t in tasks}) != len(tasks):
         raise ValueError("duplicate review Claim IDs")
+    canonical_refs, canonical_claims = {}, {}
+    for task in tasks:
+        for catalog, rows in ((canonical_refs, task.resolved_refs.items()),
+                              (canonical_claims, [(c["claim_id"], c) for c in [task.claim] + task.dependency_claims])):
+            for key, value in rows:
+                if key in catalog and catalog[key] != value:
+                    raise ValueError(f"conflicting canonical review object for {key}")
+                catalog[key] = value
     output, current = [], []
     def request(group):
         return _request(group, layer=layer, verification_epoch=verification_epoch, first_reviews=first_reviews or {})

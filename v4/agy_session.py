@@ -126,6 +126,8 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
             except AntigravityError as exc:
                 sent = store.data["request_sent"]
                 store.save(status="paused" if sent else "failed", last_error=exc.code)
+                if not sent and exc.code == "missing_init":
+                    raise AntigravityError("missing_init", retryable=True) from None
                 if sent and exc.code in {"timeout", "empty_response", "cli_exit", "cli_io_failed", "result_failed"}:
                     raise AntigravityError("session_pending", conversation_id=store.data.get("conversation_id")) from None
                 raise

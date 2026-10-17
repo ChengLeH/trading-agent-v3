@@ -217,7 +217,7 @@ class ReviewBatches(unittest.TestCase):
         self.assertEqual(text.count("<response-schema>"), 1)
         self.assertEqual(json.loads(text.split("<response-schema>\n")[1].split("\n</response-schema>")[0]),
                          semantic_review_schema(task.claim))
-        for key, value in task.to_dict().items():
+        for key, value in task.review_dict().items():
             self.assertEqual(payload[key], value)
 
     def test_public_deep_batches_only_prepare_eligible_claims(self):
