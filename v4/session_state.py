@@ -1,5 +1,6 @@
 """Durable, locked identity for a single cloud request and its conversation."""
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -91,7 +92,16 @@ class SessionState:
         # Append and fsync before exposing progress. Partial output is evidence,
         # never an accepted verdict in the absence of a successful result.
         import os
+        received_at = datetime.now(timezone.utc).isoformat()
         with (self.directory / "events.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({**value, "v4_attempt_id": self.data.get("active_attempt_id")}, ensure_ascii=False) + "\n")
+            stream.write(json.dumps({**value, "v4_attempt_id": self.data.get("active_attempt_id"),
+                                     "v4_received_at": received_at}, ensure_ascii=False) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+        step = value.get("step_update", {})
+        if (value.get("event") == "step_update" and isinstance(step, dict)
+                and step.get("step_type") == "agent_response" and step.get("text_delta")
+                and not self.data.get("first_response_at")):
+            self.save(first_response_at=received_at)
+        if value.get("event") == "result":
+            self.save(result_received_at=received_at)

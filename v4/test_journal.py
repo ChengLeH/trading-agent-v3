@@ -274,6 +274,41 @@ r.resume(CloudDouble("test/author", author), CloudDouble(), CloudDouble("test/de
             self.assertFalse(second["blocked"], second)
             self.assertEqual(len(verifier.calls), 2 * len(r.run.claims))
 
+    def test_four_workers_commit_results_without_eof_and_restore_missing_receipt(self):
+        from .test_cloud import cli_stub
+        from .cloud import AntigravityCloudClient
+        body = """
+init()
+prompt = json.loads(sys.stdin.readline())["message"]["content"]
+task = json.loads(prompt.split("```json\\n", 1)[1].split("\\n```", 1)[0])
+checks = [dict(ref_id=ref, relation="SUPPORTS", attributed_assertion="fixture assertion", source_evidence="fixture source", reason="fixture entailment") for ref in task["expected_reference_ids"]]
+result(json.dumps(dict(claim_id=task["claim_id"], verdict="PASS", reference_checks=checks, findings=[])))
+time.sleep(10)
+"""
+        with tempfile.TemporaryDirectory() as temp, cli_stub(body) as executable:
+            r = seeded(); r.max_workers = 4; r.journal = RunJournal(temp)
+            r.journal.checkpoint(r)
+            client = AntigravityCloudClient("model", executable=executable, timeout=5)
+            prepared = r.prepare_phase6_atomic()
+            summary = r._execute_review_batch(client, prepared["atomic_prompts"], r.collect_phase6_atomic)
+            self.assertFalse(summary["blocked"], summary)
+            self.assertEqual(len(r.receipts), len(r.run.claims))
+            # Simulate a crash after a complete session result was fsynced but
+            # before its response archive/index or checkpoint receipt committed.
+            record_path = next((Path(temp) / "responses").glob("*.json"))
+            record = json.loads(record_path.read_text())
+            record["status"] = "in_flight"; record.pop("response")
+            record_path.write_text(json.dumps(record))
+            (Path(temp) / "responses/archive" / (record["attempt_id"] + ".json")).unlink()
+            resumed = load_checkpoint(Path(temp) / "checkpoint.json")
+            resumed.journal = RunJournal(temp)
+            prepared = resumed.prepare_phase6_atomic()
+            with patch("v4.agy_session.subprocess.Popen", side_effect=AssertionError("no fresh model turn permitted")) as start:
+                summary = resumed._execute_review_batch(client, prepared["atomic_prompts"], resumed.collect_phase6_atomic)
+            self.assertFalse(summary["blocked"], summary)
+            self.assertEqual(len(resumed.receipts), len(r.run.claims))
+            start.assert_not_called()
+
     def test_disk_failure_stops_before_cloud_work(self):
         r = seeded()
         r.journal = RunJournal("unused-output")

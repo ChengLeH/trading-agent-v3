@@ -328,6 +328,26 @@ result(json.dumps(dict(size=len(data), sha256=hashlib.sha256(data).hexdigest(), 
                     run_session(executable, "model", "evidence", 2)
                 self.assertEqual(caught.exception.code, "invalid_stream")
 
+    def test_complete_result_releases_worker_when_process_or_stderr_stays_open(self):
+        from time import monotonic
+        for close_stdout in (False, True):
+            body = ("init()\nsys.stdin.readline()\nresult('{\"done\":true}')\n"
+                    + ("sys.stdout.close()\n" if close_stdout else "") + "time.sleep(10)\n")
+            with self.subTest(close_stdout=close_stdout), tempfile.TemporaryDirectory() as temp, cli_stub(body) as executable:
+                started = monotonic()
+                self.assertEqual(run_session(executable, "model", "request", 5, session_dir=temp), '{"done":true}')
+                self.assertLess(monotonic() - started, 3)
+                state = json.loads((Path(temp) / "session.json").read_text())
+                self.assertEqual(state["status"], "complete")
+                self.assertIsNone(state["process_id"])
+                self.assertTrue(state["result_received_at"])
+                self.assertLess(state["result_to_completion_seconds"], 1)
+
+    def test_trailing_duplicate_after_terminal_result_is_still_rejected(self):
+        body = 'init()\nsys.stdin.readline()\nresult()\ntime.sleep(.05)\nresult()\n'
+        with cli_stub(body) as executable, self.assertRaisesRegex(AntigravityError, "invalid_stream"):
+            run_session(executable, "model", "request", 2)
+
     def test_headless_permission_denial_is_explicit_and_never_retried(self):
         body = '''
 sys.stderr.write('warning: mode ignored. jetski: a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied. secret account data\\n')

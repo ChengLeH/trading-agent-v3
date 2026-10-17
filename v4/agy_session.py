@@ -14,6 +14,7 @@ from .session_state import SessionState
 from .storage import write_json
 
 AGENT_NAME = "v4-evidence-only"
+_RESULT_DRAIN_SECONDS = 0.25  # bounded trailing-protocol validation, never model time
 
 
 class AntigravityError(RuntimeError):
@@ -189,10 +190,11 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
         selector = selectors.DefaultSelector()
         stdout, stderr_tail = b"", b""
         request, offset, initialized, terminal = None, 0, False, None
+        terminal_deadline = None
         advertised_count = None
 
         def event(line):
-            nonlocal initialized, terminal, request, advertised_count
+            nonlocal initialized, terminal, request, advertised_count, terminal_deadline
             try:
                 item = json.loads(line)
             except (ValueError, UnicodeError):
@@ -268,10 +270,12 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                     raise AntigravityError("result_failed", retryable=True)
                 if not isinstance(terminal.get("response"), str) or offset != len(request):
                     raise AntigravityError("invalid_stream")
+                # A result completes this turn. EOF belongs to process teardown,
+                # and may never arrive if a child retains stdout/stderr.
+                terminal_deadline = time.monotonic() + _RESULT_DRAIN_SECONDS
             else:
                 raise AntigravityError("invalid_stream")
 
-        failed = True
         try:
             if store:
                 store.save(process_id=process.pid)
@@ -280,8 +284,11 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                 if label != "stdin":
                     selector.register(pipe, selectors.EVENT_READ, label)
             while selector.get_map():
-                remaining = (deadline if initialized else init_deadline) - time.monotonic()
+                limit = terminal_deadline if terminal is not None else (deadline if initialized else init_deadline)
+                remaining = limit - time.monotonic()
                 if remaining <= 0:
+                    if terminal is not None:
+                        break
                     raise AntigravityError("timeout" if initialized else "missing_init", retryable=initialized)
                 for key, _ in selector.select(remaining):
                     if key.data == "stdin":
@@ -309,14 +316,18 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                             line, stdout = stdout.split(b"\n", 1)
                             if line.strip():
                                 event(line)
-            try:
-                code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                raise AntigravityError("timeout", retryable=True) from None
-            if code != 0:
+            if terminal is not None:
+                if stdout.strip():
+                    event(stdout)  # reject a trailing partial/second frame too
+                code = process.poll()
+            else:
+                try:
+                    code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    raise AntigravityError("timeout", retryable=True) from None
+            if code is not None and code != 0:
                 raise AntigravityError("cli_exit", retryable=True, exit_code=code)
             if initialized and prompt is None:
-                failed = False
                 return dict(agent=agent_name, declared_tools=[], agent_policy_verified=True,
                             agent_policy_sha256=policy_hash, agent_template_sha256=template_hash,
                             advertised_tool_count=advertised_count,
@@ -326,14 +337,16 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
             if store:
                 if not terminal["response"].strip():
                     raise AntigravityError("empty_response")
-                store.save(status="complete", response=terminal["response"], last_error=None)
-            failed = False
+                store.save(status="complete", response=terminal["response"], last_error=None,
+                           result_to_completion_seconds=round(time.monotonic() - (terminal_deadline - _RESULT_DRAIN_SECONDS), 3))
             return terminal["response"]
         except (BrokenPipeError, OSError):
             raise AntigravityError("cli_io_failed", retryable=True) from None
         finally:
             selector.close()
-            if failed or process.poll() is None:
+            # Only signal our still-live child. Once its leader has exited,
+            # close our pipe ends without risking a reused process/group ID.
+            if process.poll() is None:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
