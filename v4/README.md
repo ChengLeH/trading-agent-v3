@@ -38,7 +38,9 @@ python -m v4 --manifest /path/to/manifest.json \
 全部角色與審查統一透過既有 Antigravity `agy` 命令列連線，沿用其登入狀態及環境代理，不需要 `GEMINI_API_KEY`。
 模型 ID 由執行者從 `agy models` 清單明確選定，verifier 與 deep 必須不同；這是審查角色與模型 ID 的區分，並非兩套接入方式，也不能據此聲稱不同模型家族已驗證。
 程式由 PATH 尋找 `agy`，或使用執行者設定的 `AGY_EXECUTABLE`。不安裝外掛、不建立／讀取金鑰檔、不啟動本地模型；失敗立即封鎖，不切換 direct API（直接 API）或其他後端。
-沿用 V3 已有的 `agy --model ... -p ...` 接法，但不呼叫 V3 的 API fallback（失敗轉接）；採用計畫模式、終端沙箱與停用指令展開，不加入略過權限旗標。
+短 prompt 沿用 `agy --model ... -p ...`；超過 64 KiB UTF-8 位元組時，改以 stdin（標準輸入）傳送完整 `user` 事件，使用 `--input-format stream-json --output-format stream-json`，不把長文塞進命令列參數。協定依據：[Antigravity 官方 stdin 文件](https://www.antigravity.google/docs/cli/headless/#stream-prompts-from-stdin)。
+長文單次逾時為設定值與 1800 秒的較大者。兩條路徑都保留計畫模式、終端沙箱與停用指令展開，不加入略過權限旗標，也不呼叫 V3 的 API fallback（失敗轉接）。串流須恰有一個成功的完整 `result` 事件，不能把中途片段當成結果。
+空回覆（含純空白）與產生回覆時的例外，總共最多嘗試 3 次（首次＋2 次重試），重試間隔 15 秒；最終失敗封鎖，不切換模型或供應商。非空回覆仍須通過嚴格 JSON 解析，不因 JSON 格式錯誤自動重試或猜修。
 回覆必須是完整 JSON，不能從 prose（一般文字）猜取或修補 JSON。每次成功回應記錄 transport 與 requested_model；文字輸出不提供可靠的實際服務模型身分及用量，因此 served_model 留空，不推測帳單或後端。
 
 程式庫亦可注入具 `execution="cloud"`、`identity`、`complete(prompt)` 的既有雲端連線介面。
@@ -124,7 +126,7 @@ python -m v3.test_p6_dedup
 整合測試把 V3 舊證據包、舊驗證器與舊提示詞入口設為一經呼叫即失敗，證明沒有繞回舊流程。
 
 已在開發環境讀取既有 `agy --help` 與 `agy models`，確認旗標與模型目錄可用；尚未執行真實雲端模型的投資報告驗收。測試替身證明流程與不變條件，不能證明語義判斷品質、實際延遲、費用、模型推論可用性或市場資料正確性。
-目前以命令列參數傳送 prompt；超出作業系統參數長度限制時會明確封鎖，大型來源包仍需後續接入 CLI 支援的串流輸入協定，不能裁掉論述掩蓋問題。
+測試以真正的替身子程序驗證約 189 KB 的 stdin 傳輸與雜湊一致，沒有執行真實模型推論。長文內容不裁切；模型本身的 context（脈絡）容量限制仍由既有錯誤與封鎖流程處理。
 不支援重算的 Calc 操作會留下明確 WARN（警告），不會宣稱已有程式重算證明；LLM 仍收到引用脈絡。
 目前角色證據包保留完整結構化資料；大型資料集仍可能需要明確的來源選取或分頁介面，不能以截掉 Claim／Fact 或語義快篩處理。
 
