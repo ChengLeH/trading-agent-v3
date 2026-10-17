@@ -42,8 +42,8 @@ python -m v4 --manifest /path/to/manifest.json \
 程式先逐欄驗證內附 `evidence_agent.md` 的結構化設定，再於隔離工作目錄建立每個任務唯一的 `v4-evidence-only-<uuid>` 代理，透過 `--add-dir` 明列該隔離目錄。設定空工具清單、`excludeDefaultComponents: true`、`inheritCustomizations: false` 與 `commandExecutionPolicy: off`。只有 `init` 回報本次代理、指定模型及正確隔離目錄才送出證據，不退回預設代理。`init.tools` 是 CLI 宣告的全域工具登錄表，不是此代理的有效權限；非空不代表設定失效，也不能用它證明工具已停用。自檢分別回報 `declared_tools`、設定雜湊與 `advertised_tool_count`。依據：[官方代理規格](https://www.antigravity.google/docs/subagents/)、[排除預設工具與自訂設定的更新紀錄](https://www.antigravity.google/docs/changelog?tab=cli)。
 角色產生、原子驗證、深度覆核、修補、語義連結及全局掃描使用同一工具邊界，只依輸入物件作業。工具限制由專用代理設定提出，啟動檢查確認代理選取，並不獨立證明 CLI 的內部權限執行。若執行中仍出現工具或子代理事件，立即中止並拒收結果；這是違規偵測，不能保證事件一定先於工具執行。串流須恰有一個成功完整的 `result`，不能把中途片段當成答案。
 一般模型請求的隔離工作目錄、代理設定、原始請求、對話 ID 與串流事件都持久保存在 `--out/sessions/`；只有不送提示的啟動自檢使用暫存目錄。直接使用 client 時，預設為目前目錄的 `.v4-sessions/`，可透過 `session_root` 或 `V4_SESSION_DIR` 指定持久位置。不修改全域 `settings.json`，不開放命令、不加入略過權限旗標。保留終端沙箱與停用指令展開，移除在此組合下無效的 `--mode plan`，不呼叫 V3 的 API fallback（失敗轉接）。
-超過 64 KiB UTF-8 的長文單次逾時為設定值與 1800 秒的較大者；短文預設也提高至 1200 秒（20 分鐘），可由 V4 入口的 `--request-timeout` 指定；不是 agy 新旗標，內部仍使用 `--print-timeout`，且外層等待上限一致。啟動握手另限最多 60 秒。提高等待上限不會加速模型，只避免 5～10 分鐘的有效請求被 120 秒截斷。確認尚未送出任務的可重試啟動失敗最多 3 次（首次＋2 次），間隔 15 秒。任務送出後逾時或回空字串則保存並回報 `session_pending`，不在 client 內自動新開對話。已識別的權限拒絕、代理設定不合格及工具誤用不重試；`AntigravityError` 提供安全的 `code/retryable/exit_code/attempts`，不公開原始 stderr 或 exception（例外）文字。非空答案仍須嚴格 JSON，不猜修。
-回覆必須是完整 JSON，不能從 prose（一般文字）猜取或修補 JSON。每次成功回應記錄 transport 與 requested_model；文字輸出不提供可靠的實際服務模型身分及用量，因此 served_model 留空，不推測帳單或後端。
+超過 64 KiB UTF-8 的長文單次逾時為設定值與 1800 秒的較大者；短文預設也提高至 1200 秒（20 分鐘），可由 V4 入口的 `--request-timeout` 指定；不是 agy 新旗標，內部仍使用 `--print-timeout`，且外層等待上限一致。啟動握手另限最多 60 秒。提高等待上限不會加速模型，只避免 5～10 分鐘的有效請求被 120 秒截斷。確認尚未送出任務的可重試啟動失敗預設最多 3 次（首次＋2 次），可由 `--request-attempts` 調整，間隔 15 秒。任務送出後逾時或回空字串則保存並回報 `session_pending`，不在 client 內自動新開對話。已識別的權限拒絕、代理設定不合格及工具誤用不重試；`AntigravityError` 提供安全的 `code/retryable/exit_code/attempts`，不公開原始 stderr 或 exception（例外）文字。非空答案仍須完整 JSON；僅容許整份回覆外包一層 JSON／無語言標記的程式碼框，不猜修內容。
+回覆必須是完整 JSON；完整單一程式碼框可在本機移除外框，不增加模型呼叫。不能從 prose（一般文字）猜取、拼接片段或修補 JSON；語義欄位與引用驗收仍照原規則執行。每次成功回應記錄 transport 與 requested_model；文字輸出不提供可靠的實際服務模型身分及用量，因此 served_model 留空，不推測帳單或後端。
 
 程式庫亦可注入具 `execution="cloud"`、`identity`、`complete(prompt)` 的既有雲端連線介面。
 若連線介面另提供 `complete_structured(prompt, response_schema)`，原子與深度審查會明確傳入每條 Claim（或批次中逐條項目）的 JSON Schema（結構化回覆規格）；內建 Antigravity 把完整規格放進 stdin 的 `<response-schema>`，不使用 `--json-schema`：Mac agy 1.4.0 實測此旗標會出現多回合及重複串接 JSON，與官方宣告的 `structured_output` 行為不符。程式不從重複文字挑一份、不補預設 PASS；仍嚴格解析與逐條驗收。舊介面仍收到含完整規格的 prompt，回覆一樣須通過嚴格驗收。
@@ -137,7 +137,7 @@ checkpoint（檢查點）以暫存檔與原子替換保存正式物件及稽核�
 資料匯入完成、每批角色提交、原子／深度驗證收集、語義連結、局部修補與全局掃描完成時，立即更新 `--out/checkpoint.json`，不等整份流程返回才寫。
 每筆模型呼叫開始前與成功返回後，分別將 `in_flight`／`received` 狀態寫入 `--out/responses/`；成功回覆另保留於 `responses/archive/`。並行工作的一筆失敗不會抹去其他已保存回覆。
 已分類的 Antigravity 失敗也立即保存 `failed` 與安全的錯誤碼／重試屬性／退出碼；沒有假造回覆，重新執行不會把失敗紀錄或更早的舊答案當成本次成功。
-未提交角色的不可重試失敗（含非法 JSON）會在一般續跑時保持封鎖；修正原因後，須明確用 `--retry-role` 指定該角色才重新請求。任務已送出且確認接收後的暫時性失敗，可在原對話續接；未確認是否送達時封鎖，不盲目重送。
+實際不完整或非法 JSON 可在額度內用原對話補正；完整單一 JSON 程式碼框只在本機移除外框。未提交角色的不可重試失敗會在一般續跑時保持封鎖；修正原因後，須明確用 `--retry-role` 指定該角色才重新請求。任務已送出且確認接收後的暫時性失敗，可在原對話續接；未確認是否送達時封鎖，不盲目重送。
 暫存檔只在同一輸出目錄內用於原子替換，檔案與目錄皆同步至磁碟。`--out` 必須由操作者指向持久磁碟或掛載目錄；指定 `/tmp`、非持久 VM 磁碟，或刪除該磁碟後，程式無法保證資料仍在。輸出目錄含研究資料，須按原本權限保存，不能提交到 Git。
 重新載入會驗證 schema 與 DAG，重建分析視圖；序列化的舊審查紀錄只作稽核，不能當成新執行的通行證。
 `--resume` 會先補齊尚未完成的角色階段，已提交的角色不重新生成；未提交批次的成功回覆只有在 run／角色／模型／完整 prompt 雜湊相同時才可重用，也可從原檢查點旁的 responses 續接到新的輸出目錄。階段次序錯亂或缺半批正式角色仍封鎖，不能跳過缺少的角色交付。
@@ -155,7 +155,7 @@ V3 的 Markdown 或舊 Claim 缺欄位時，不能自動用文字猜成 V4；必
 
 深度覆核保留第一層判決及 findings，不重帶第一層逐來源的冗長說明；仍獨立審原始證據。修補同樣使用局部任務。最終全局掃描仍檢查所有 Claim、章節／作者、DAG、交易物件及每次修改前後的完整 Claim；不再附內容重複的 Markdown、整份舊 finding／patch 歷史或 Evidence 的原始摘錄。完整正式狀態與歷史的雜湊仍綁定該次掃描。
 
-`session_pending` 不等於成功，也不允許自動 API 轉接或從頭重送。命令列以相同檢查點 `--resume`；程式庫使用同一 RunJournal，或直接 client 的 `resume_request(prompt, response_schema)`，會帶原本 `--conversation <id>`、相同代理設定與隔離目錄續接，只傳「接續完成原任務」的訊息。普通 `client.complete()` 預設會在有限額度內自動接續相同對話，不開新對話；可用 `--no-auto-continue` 停用。新任務預設兩次續接、總時間為單回合期限三倍，但這些是可調政策：`--session-max-continuations` 與 `--session-budget-seconds` 可提高既有任務的總上限，保留已用次數與時間；`--request-attempts` 控制單次呼叫的嘗試次數。回覆格式補正與修訂輪數也可用 `--max-contract-attempts`、`--max-revisions` 調整。細節及續跑範例見 [P6 修復驗收](P6_BUGFIX_ACCEPTANCE.md#可調整的重試與續跑政策2026-10-18)。預算與次數跨程序保存，硬中止會保守扣除當次預留額度。每個任務的跨程序鎖防止同時重複呼叫；若主程序硬中止但舊子程序仍在，會回報 `session_busy`，不另開付費回合，也不擅自殺掉可能重用的程序識別碼。事件檔損壞則封鎖並保留原檔，不猜修、不盲目重算。
+`session_pending` 不等於成功，也不允許自動 API 轉接或從頭重送。命令列以相同檢查點 `--resume`；程式庫使用同一 RunJournal，或直接 client 的 `resume_request(prompt, response_schema)`，會帶原本 `--conversation <id>`、相同代理設定與隔離目錄續接，只傳「接續完成原任務」的訊息，要求重新交付完整原始物件／陣列及所有批次 Claim，不拼接跨回合片段。普通 `client.complete()` 預設會在有限額度內自動接續相同對話，不開新對話；可用 `--no-auto-continue` 停用。新任務預設兩次續接、總時間為單回合期限三倍，但這些是可調政策：`--session-max-continuations` 與 `--session-budget-seconds` 可提高既有任務的總上限，保留已用次數與時間；`--request-attempts` 控制單次呼叫的嘗試次數。回覆格式補正與修訂輪數也可用 `--max-contract-attempts`、`--max-revisions` 調整。細節及續跑範例見 [P6 修復驗收](P6_BUGFIX_ACCEPTANCE.md#可調整的重試與續跑政策2026-10-18)。預算與次數跨程序保存，硬中止會保守扣除當次預留額度。每個任務的跨程序鎖防止同時重複呼叫；若主程序硬中止但舊子程序仍在，會回報 `session_busy`，不另開付費回合，也不擅自殺掉可能重用的程序識別碼。事件檔損壞則封鎖並保留原檔，不猜修、不盲目重算。
 
 這是恢復同一雲端對話的上下文，不是供應商保證的逐 token（輸出片段）游標續算；逾時仍會結束本機子程序，部分輸出保存作為進度證據，不能當作合格判決。只有完整成功結果且通過驗收才能交付。舊 run 沒有保存對話 ID，無法事後憑空恢復。
 

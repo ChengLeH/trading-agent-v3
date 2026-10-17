@@ -130,8 +130,13 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
                 store.save(json_required=True)
             store.recover_terminal(require_json=require_json)
             if state["status"] == "complete":
-                if not require_json or not store.reject_invalid_json(state["response"]):
+                if not require_json:
                     return state["response"]
+                normalized = store.validate_json_response(state["response"])
+                if normalized is not None:
+                    if normalized != state["response"]:
+                        store.save(response=normalized)
+                    return normalized
             if state.get("last_error") == "invalid_json":
                 if not repair_json and not resume:
                     raise AntigravityError("invalid_json", retryable=True, conversation_id=state.get("conversation_id"))
@@ -313,7 +318,9 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                            "不得重送原始任務、重新搜尋、增刪必要欄位、用預設空陣列取代逐引用語義驗證。"
                            "保留原任務要求的物件或陣列形式；不要 Markdown、code fence 或任何前後說明。"
                            if repair_json else ("接續同一對話中尚未完成的上一個驗證任務，使用已有來源與推理進度。"
-                           "不要重新搜尋或從頭分析，也不要重複輸出先前物件；請完成並回傳符合原契約的單一最終 JSON。"
+                           "不要重新搜尋或從頭分析。前次輸出可能只是片段，本回合請重新完整輸出符合原契約的最終 JSON。"
+                           "即使先前已輸出部分欄位或物件，本次也必須包含全部必要內容；不要只回剩餘片段或省略已做項目。"
+                           "原任務要求物件就回完整物件，要求陣列就回完整陣列；批次任務須包含全部指定 Claim。"
                            if resuming else prompt))
                 if store:
                     # Persist the uncertain delivery boundary before any bytes:
@@ -423,14 +430,17 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                             user_prompt_sent=False)
             if terminal is None:
                 raise AntigravityError("empty_response", retryable=True)
+            response = terminal["response"]
             if store:
-                if not terminal["response"].strip():
+                if not response.strip():
                     raise AntigravityError("empty_response")
-                if require_json and store.reject_invalid_json(terminal["response"]):
-                    raise AntigravityError("invalid_json", retryable=True, conversation_id=store.data.get("conversation_id"))
-                store.save(status="complete", response=terminal["response"], last_error=None, turn_acknowledged=True,
+                if require_json:
+                    response = store.validate_json_response(response)
+                    if response is None:
+                        raise AntigravityError("invalid_json", retryable=True, conversation_id=store.data.get("conversation_id"))
+                store.save(status="complete", response=response, last_error=None, turn_acknowledged=True,
                            result_to_completion_seconds=round(time.monotonic() - (terminal_deadline - _RESULT_DRAIN_SECONDS), 3))
-            return terminal["response"]
+            return response
         except (BrokenPipeError, OSError):
             raise AntigravityError("cli_io_failed", retryable=True) from None
         finally:

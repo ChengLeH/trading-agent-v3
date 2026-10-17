@@ -14,7 +14,7 @@ init()
 request=json.loads(sys.stdin.readline())["message"]["content"]
 if "--conversation" not in sys.argv:
     assert request == "original evidence"
-    result('```json\\n{"ok":true}\\n```')
+    result('```json\\n{"ok":true,\\n```')
 else:
     assert request != "original evidence"
     assert "合法 JSON" in request
@@ -23,7 +23,7 @@ else:
 
 
 class JsonRepair(unittest.TestCase):
-    def test_bad_json_corrects_same_cid_without_extracting_fenced_content(self):
+    def test_malformed_json_inside_fence_corrects_same_cid_without_guessing_content(self):
         with tempfile.TemporaryDirectory() as temp,cli_stub(REPAIR_BODY) as executable:
             client=AntigravityCloudClient('model',executable=executable,timeout=3,session_root=temp)
             self.assertEqual(client.complete('original evidence'),dict(ok=True))

@@ -233,3 +233,35 @@ archive = abandon_session(session_directory, reason="操作者明確授權的原
 回滾可撤回本次提交並重啟；先備份所有輸出。舊版本不認得新 CLI 恢復旗標，但既有原始檔與歸檔不會被本次修復刪除。
 
 本輪最終驗收：V4 202 項、V3 基準 24 項通過，git diff --check 通過。獨立審查後新增限制：只准在已授權 run 根目錄的 sessions 直接子目錄恢復，拒絕外部路徑／跨目錄 symlink；核對 index metadata 雜湊、attempt ID、request.json 的 prompt／模型／schema footer 與 session 綁定。另測帶 schema 的真實請求格式與歸檔後中斷再授權，確認只保留原世代授權一次。
+
+
+## 跨 Claim 耗盡：完整回覆恢復與續接指令修正
+
+### Problem（問題）
+
+使用者回報進度由 49/57 到 51/57 後，仍在不同 Claim 遇到 continuation_exhausted。附件 stuck_claim_49.md 只有 1,201 bytes，包含被截斷的 Claim 摘錄，不是完整請求、session 或新版本的 session_budget。不能重現這次交易計劃請求，也不能確定它耗盡的直接原因。
+
+### Root Cause（已確認／未確認）
+
+確認兩個共用缺陷：原續接指令同時要求「完整最終 JSON」與「不要重複輸出先前物件」，但收集器不會跨回合拼接片段，兩者互相矛盾。另有歷史真實測試的 terminal SUCCESS（回合成功結束事件）已含完整可驗收 JSON，只因外包一層 JSON 程式碼框而被當成 invalid_json，再耗一次同對話補正。
+
+這兩點可能增加續接次數，但尚無證據證明就是此次 VM 交易計劃耗盡的原因。仍需失敗結果的 session_budget／last_session_error／exhausted_by 區分逾時、格式與供應商錯誤，不以單一 Claim 或 ticker 特例掩蓋未知原因。
+
+### Fix（修正）
+
+- 續接指令要求完整重新輸出原始物件／陣列，包括先前已輸出的欄位及所有批次 Claim；沿用原上下文，不重新搜尋或重傳整份任務。
+- 共用 JSON 正規化只接受整份回覆為一個完整 JSON 值，或單一完整 JSON／無語言標記程式碼框。拒絕夾帶解說、多個物件／程式碼框、截斷片段及其他語言標記。不做語義猜測、欄位補值或片段合併。
+- 原始事件保留原文，正式 session 結果保存移除外框後的 JSON。恢復端先查找安全的既有完整 SUCCESS，即使先前已標 invalid_json 或 continuation_exhausted，也可零模型呼叫恢復。仍要求有效的當次事件序列、唯一結果、送達證據及原本工具政策。
+- abandon_session 使用相同解析規則，拒絕丟棄已有可用完整結果的對話。沒有 terminal SUCCESS 的部分輸出仍不能當成完成。Claim 語義、引用與 typed binding（型別綁定）驗收不變。
+
+### Recommended Tests／Prevention（驗收）
+
+V4 208 項、V3 基準 24 項通過；git diff --check 通過，獨立審查未發現阻塞。新增測試涵蓋完整外框、非法內容、耗盡後零呼叫恢復、缺少成功事件、完整物件續接與缺少 reference_checks 仍拒絕通過。
+
+另將歷史真實 SUCCESS 原文與對應狀態複製到隔離目錄離線重播，禁止建立模型子程序：原子驗收 PASS、1 個 reference_check、續接次數仍為 0，沒有新增模型呼叫。這是先前測試回覆的恢復驗收，不是本次 COIN Claim，也不代表 VM 全量已通過。本輪未執行真實模型或操作 VM。
+
+### Confidence／影響與回滾
+
+已確認的兩項共用缺陷信心高；目前 VM 耗盡的直接原因仍未確認。影響所有使用共同 JSON 回覆／對話續接流程的 V4 階段，不修改 V3／main，不增加權限、重試額度或 API fallback（備援轉接）。更新後重啟驅動程序，保留完整輸出目錄並先一般續跑；已有完整外框結果可直接恢復，勿先丟棄 session。沒有完整結果的供應商失敗仍可能耗盡。
+
+回滾可撤回本次提交並重啟；先備份輸出。舊版會再拒絕外包程式碼框的完整 JSON，原始事件不受修改。

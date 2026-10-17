@@ -13,6 +13,7 @@ import threading
 from pathlib import Path
 from uuid import UUID, uuid4
 from .storage import write_json
+from .response_json import normalize_json_response
 
 _HELD = threading.local()
 
@@ -142,7 +143,7 @@ def abandon_session(session_dir, *, reason):
                         result = terminal[0].get('result', {})
                         if isinstance(result, dict) and result.get('status') == 'SUCCESS':
                             try:
-                                json.loads(result.get('response'))
+                                normalize_json_response(result.get('response'))
                             except (ValueError, TypeError):
                                 pass  # explicit replay of an unparseable answer is allowed
                             else:

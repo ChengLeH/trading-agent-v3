@@ -11,6 +11,7 @@ from .agy_session import AGENT_NAME, AntigravityError, run_session
 from .session_replay import lifecycle_lock
 from .session_state import SessionState, validate_limits
 from .agy_session import load_agent_profile
+from .response_json import normalize_json_response
 
 _STDIN_THRESHOLD = 64 * 1024  # UTF-8 bytes: long-prompt timeout
 
@@ -118,7 +119,7 @@ class AntigravityCloudClient:
                 if not text or not text.strip():
                     raise AntigravityError("empty_response", retryable=True)
                 try:
-                    parsed = json.loads(text)
+                    parsed = json.loads(normalize_json_response(text))
                 except (ValueError, TypeError):
                     raise AntigravityError("invalid_json", retryable=True) from None
                 break

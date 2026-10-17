@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 from .storage import write_json
 from .session_replay import lifecycle_lock, recover_authorized_replay
+from .response_json import normalize_json_response
 
 
 def validate_limits(max_continuations=None, budget_seconds=None):
@@ -111,17 +112,16 @@ class SessionState:
         except (OSError, ValueError, IndexError, AttributeError):
             return False
 
-    def reject_invalid_json(self, response):
+    def validate_json_response(self, response):
         try:
-            json.loads(response)
+            return normalize_json_response(response)
         except (ValueError, TypeError):
             self.save(status="paused", response=response, last_error="invalid_json",
                       json_required=True, turn_acknowledged=True)
-            return True
-        return False
+            return None
 
     def recover_terminal(self, *, require_json=False):
-        if self.data.get("last_error") not in (None, "timeout", "cli_io_failed"):
+        if self.data.get("last_error") not in (None, "timeout", "cli_io_failed", "invalid_json", "continuation_exhausted"):
             return False
         path = self.directory / "events.jsonl"
         if not path.exists():
@@ -151,8 +151,10 @@ class SessionState:
                 raise ValueError("unsafe terminal stream")
         response = result.get("response")
         if result.get("status") == "SUCCESS" and isinstance(response, str) and response.strip():
-            if (require_json or self.data.get("json_required")) and self.reject_invalid_json(response):
-                return False
+            if require_json or self.data.get("json_required"):
+                response = self.validate_json_response(response)
+                if response is None:
+                    return False
             self.save(status="complete", response=response, last_error=None, turn_acknowledged=True,
                       result_received_at=terminal[0].get("v4_received_at", self.data.get("result_received_at")))
             return True
