@@ -6,6 +6,30 @@ infers meaning from prose, invents edges or decides source entailment itself.
 from copy import deepcopy
 from .schema import Claim, claim_index, id_list
 
+SEMANTIC_REVIEW_CONTRACT = "v4-semantic-review/2"
+SEMANTIC_REVIEW_SCHEMA = {
+    "type": "object",
+    "required": ["claim_id", "verdict", "reference_checks", "findings"],
+    "properties": {
+        "claim_id": {"type": "string", "minLength": 1},
+        "verdict": {"type": "string", "enum": ["PASS", "SUSPICIOUS", "FAIL"]},
+        "reference_checks": {"type": "array", "items": {
+            "type": "object",
+            "required": ["ref_id", "relation", "attributed_assertion", "source_evidence", "reason"],
+            "properties": {
+                "ref_id": {"type": "string", "minLength": 1},
+                "relation": {"type": "string", "enum": ["SUPPORTS", "CONTRADICTS", "INSUFFICIENT"]},
+                **{k: {"type": "string", "minLength": 1}
+                   for k in ("attributed_assertion", "source_evidence", "reason")},
+            },
+        }},
+        "findings": {"type": "array", "items": {
+            "type": "object", "required": ["issue"],
+            "properties": {"issue": {"type": "string", "minLength": 1}},
+        }},
+    },
+}
+
 REFERENCE_INSTRUCTIONS = """逐引用語義驗收：每個 refs/fact_refs/dependencies 聯集 ID 恰有一筆 reference_checks，
 欄位為 ref_id/relation(SUPPORTS|CONTRADICTS|INSUFFICIENT)/attributed_assertion/source_evidence/reason。
 逐一理解 text 對該來源實際聲稱的內容，再與 assertion/binding 及實際來源比對。
@@ -18,6 +42,17 @@ source_evidence 必須指出 context 內的實際證據；不相關的真實摘�
 
 def review_ref_ids(claim):
     return list(dict.fromkeys(claim.get("refs", []) + claim.get("fact_refs", []) + claim.get("dependencies", [])))
+
+
+def semantic_review_schema(claim):
+    schema = deepcopy(SEMANTIC_REVIEW_SCHEMA)
+    refs = review_ref_ids(claim)
+    schema["properties"]["claim_id"]["enum"] = [claim["claim_id"]]
+    checks = schema["properties"]["reference_checks"]
+    checks.update(minItems=len(refs), maxItems=len(refs))
+    if refs:
+        checks["items"]["properties"]["ref_id"]["enum"] = refs
+    return schema
 
 
 def require_text(value, name):
@@ -38,7 +73,7 @@ def normalize_reference_checks(expected_refs, result):
             raise ValueError("unknown or duplicate reference check")
         seen.add(ref)
         relation = row.get("relation")
-        if relation not in {"SUPPORTS", "CONTRADICTS", "INSUFFICIENT"}:
+        if not isinstance(relation, str) or relation not in {"SUPPORTS", "CONTRADICTS", "INSUFFICIENT"}:
             raise ValueError("invalid reference semantic relation")
         for key in ("attributed_assertion", "source_evidence", "reason"):
             require_text(row.get(key), f"reference_checks.{key}")

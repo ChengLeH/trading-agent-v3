@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import call, patch
 from .cloud import AntigravityCloudClient, _STDIN_THRESHOLD
+from .semantic_contracts import SEMANTIC_REVIEW_SCHEMA
 
 
 def stream_response(text, status="SUCCESS"):
@@ -20,6 +21,28 @@ class Transport(unittest.TestCase):
         sleeper = patch("v4.cloud.time.sleep")
         self.sleep = sleeper.start()
         self.addCleanup(sleeper.stop)
+
+    def test_semantic_schema_is_sent_to_cli_for_both_transport_paths(self):
+        for prompt in ("short", "a" * (_STDIN_THRESHOLD + 1)):
+            with self.subTest(size=len(prompt)), patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), \
+                    patch("v4.cloud.subprocess.run") as run:
+                output = "{}" if len(prompt) <= _STDIN_THRESHOLD else stream_response("{}")
+                run.return_value = subprocess.CompletedProcess([], 0, output, "")
+                client = AntigravityCloudClient("model")
+                self.assertEqual(client.complete_structured(prompt, SEMANTIC_REVIEW_SCHEMA), {})
+                args = run.call_args.args[0]
+                schema_text = args[args.index("--json-schema") + 1]
+                schema = json.loads(schema_text)
+                self.assertIn("reference_checks", schema["required"])
+                self.assertEqual(schema, SEMANTIC_REVIEW_SCHEMA)
+                self.assertLess(len(schema_text.encode("utf-8")), _STDIN_THRESHOLD)
+
+    def test_oversize_schema_blocks_before_cli_or_retries(self):
+        with patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), patch("v4.cloud.subprocess.run") as run:
+            with self.assertRaisesRegex(ValueError, "schema exceeds"):
+                AntigravityCloudClient("model").complete_structured("prompt", dict(description="a" * _STDIN_THRESHOLD))
+            run.assert_not_called()
+            self.sleep.assert_not_called()
 
     def test_179kb_prompt_reaches_child_stdin_without_entering_argv(self):
         prompt = "資料\n" * 27000

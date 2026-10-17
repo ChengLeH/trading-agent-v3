@@ -27,6 +27,25 @@ def author_response(prompt):
 
 
 class Journal(unittest.TestCase):
+    def test_structured_schema_changes_journal_identity_and_is_forwarded(self):
+        class StructuredDouble(CloudDouble):
+            def complete(self, _):
+                raise AssertionError("structured request must use structured capability")
+
+            def complete_structured(self, prompt, schema):
+                self.calls.append((prompt, copy.deepcopy(schema)))
+                return dict(ok=True)
+        with tempfile.TemporaryDirectory() as temp:
+            r = seeded()
+            r.journal = RunJournal(temp)
+            client = StructuredDouble()
+            for schema in (dict(type="object"), dict(type="array")):
+                self.assertEqual(r._complete(client, "task", "same prompt", response_schema=schema), dict(ok=True))
+            records = [json.loads(p.read_text()) for p in (Path(temp) / "responses").glob("*.json")]
+            self.assertEqual(len(records), 2)
+            self.assertEqual(len({rec["response_schema_hash"] for rec in records}), 2)
+            self.assertEqual([schema for _, schema in client.calls], [dict(type="object"), dict(type="array")])
+
     def test_archive_recovers_current_attempt_when_index_write_fails(self):
         from .checkpoint import write_json
         with tempfile.TemporaryDirectory() as temp:

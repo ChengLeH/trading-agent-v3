@@ -7,7 +7,7 @@ from v3.facts import Fact
 from collections import Counter
 from pathlib import Path
 import tempfile
-from .atomic_phase6 import build_atomic_tasks
+from .atomic_phase6 import build_atomic_tasks, normalize_atomic_result
 
 
 def reference_ids(task):
@@ -29,6 +29,143 @@ def global_review(r, findings=None, required=None, unresolved=()):
 
 
 class SemanticAcceptance(unittest.TestCase):
+    def test_new_execution_uses_fresh_atomic_and_deep_requests_with_exact_schema(self):
+        from .checkpoint import save_checkpoint, load_checkpoint
+        original = seeded()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "same-input.json"
+            save_checkpoint(original, path)
+            runners = [original, load_checkpoint(path)]
+        plans = [r.prepare_phase6_atomic() for r in runners]
+        self.assertEqual(runners[0]._hash(), runners[1]._hash())
+        self.assertNotEqual(plans[0]["atomic_prompts"], plans[1]["atomic_prompts"])
+        self.assertEqual(plans[0]["response_schemas"]["b"]["properties"]["reference_checks"]["minItems"], 1)
+        self.assertEqual(plans[0]["response_schemas"]["a"]["properties"]["reference_checks"]["maxItems"], 0)
+        deep = []
+        for r in runners:
+            results = self.atomic_results(r)
+            results["a"] = verdict("a", "FAIL")
+            r.collect_phase6_atomic(results, model_identity="test/first")
+            deep.append(r.prepare_phase6_deep_review()["deep_prompts"])
+        self.assertNotEqual(deep[0], deep[1])
+
+    def test_schema_retries_do_not_preserve_legacy_pass_or_skip_deep_review(self):
+        from .semantic_contracts import semantic_review_schema
+        class StructuredDouble(CloudDouble):
+            def complete(self, _):
+                raise AssertionError("semantic requests must use schema capability")
+
+            def complete_structured(self, prompt, schema):
+                cid = schema["properties"]["claim_id"]["enum"][0]
+                self.assert_schema(cid, schema)
+                return super().complete(prompt)
+        r, counts, deep_calls = seeded(), Counter(), []
+        def atomic(prompt):
+            payload = json.loads(prompt.split("```json\n")[1].split("\n```\n")[0])
+            cid = payload["claim_id"]
+            counts[cid] += 1
+            result = verdict(cid, ref_ids=reference_ids(payload))
+            if cid == "b" and counts[cid] == 1:
+                result.pop("reference_checks")
+            elif cid == "b" and counts[cid] == 2:
+                result = verdict(cid, "FAIL", ref_ids=["a"])
+                result["reference_checks"] = source_checks(["a"], "CONTRADICTS")
+            return result
+        def deep(_):
+            deep_calls.append(True)
+            result = verdict("b", "FAIL", ref_ids=["a"])
+            result["reference_checks"] = source_checks(["a"], "CONTRADICTS")
+            if len(deep_calls) == 1:
+                result.pop("reference_checks")
+            return result
+        first, second = StructuredDouble("test/first", atomic), StructuredDouble("test/second", deep)
+        first.assert_schema = second.assert_schema = lambda cid, s: self.assertEqual(
+            s, semantic_review_schema(next(c for c in r.run.claims if c["claim_id"] == cid)))
+        patcher = CloudDouble("test/author", lambda _: [dict(claim_id="b", text="corrected semantic attribution")])
+        result = r.execute_phase6(first, second, patcher, CloudDouble("test/global", lambda _: global_review(r)))
+        self.assertFalse(result["blocked"], result)
+        self.assertEqual((counts["b"], counts["c"], len(deep_calls), len(patcher.calls)), (3, 2, 2, 1))
+        self.assertIn("corrected semantic attribution", result["report_markdown"])
+
+    def test_contract_retry_rejects_source_state_changed_in_flight(self):
+        r = seeded()
+        results = self.atomic_results(r)
+        results["b"].pop("reference_checks")
+        result = r.collect_phase6_atomic(results, model_identity="test/first")
+        self.assertTrue(result["needs_retry"])
+        r.run.claims[0]["text"] = "new upstream state"
+        with self.assertRaisesRegex(ValueError, "state changed"):
+            r.collect_phase6_atomic({"b": verdict("b", ref_ids=["a"])}, model_identity="test/first")
+        self.assertNotIn("b", r.receipts)
+        with self.assertRaises(ValueError):
+            r.finalize()
+
+    def test_invalid_atomic_contract_returns_retry_plan_and_keeps_valid_receipts(self):
+        from .journal import RunJournal
+        r = seeded()
+        results = self.atomic_results(r)
+        results["b"].pop("reference_checks")
+        with tempfile.TemporaryDirectory() as temp:
+            r.journal = RunJournal(temp)
+            result = r.collect_phase6_atomic(results, model_identity="test/first")
+            self.assertTrue(result["blocked"])
+            self.assertTrue(result["needs_retry"])
+            self.assertEqual(result["retry_claim_ids"], ["b"])
+            self.assertEqual(set(r.receipts), set(results) - {"b"})
+            self.assertNotIn("b", json.loads((Path(temp) / "checkpoint.json").read_text())["audit"]["atomic"])
+            self.assertEqual([cid for cid, _ in result["retry_prompts"]], ["b"])
+            with self.assertRaises(ValueError):
+                r.prepare_phase6_global_sweep()
+            repaired = r.collect_phase6_atomic({"b": verdict("b", ref_ids=["a"])}, model_identity="test/first")
+            self.assertFalse(repaired["blocked"])
+
+    def test_87_cached_legacy_results_are_semantically_regenerated(self):
+        from .test_contracts import claim
+        r = seeded()
+        r.run.claims.extend(claim("bulk." + str(i)) for i in range(87 - len(r.run.claims)))
+        r.orch._sync_views(r.run)
+        prepared = r.prepare_phase6_atomic()
+        cache = {prompt: dict(claim_id=cid, verdict="PASS", findings=[])
+                 for cid, prompt in prepared["atomic_prompts"]}
+        generated = []
+        def respond(prompt):
+            if prompt in cache:
+                return copy.deepcopy(cache[prompt])
+            payload = json.loads(prompt.split("```json\n")[1].split("\n```\n")[0])
+            generated.append(payload["claim_id"])
+            return verdict(payload["claim_id"], ref_ids=reference_ids(payload))
+        verifier, deep = CloudDouble("test/first", respond), CloudDouble("test/deep")
+        result = r.execute_phase6(verifier, deep, CloudDouble("test/author"),
+                                 CloudDouble("test/global", lambda _: global_review(r)))
+        self.assertFalse(result["blocked"], result)
+        self.assertEqual(len(verifier.calls), 174)
+        self.assertEqual(set(generated), {c["claim_id"] for c in r.run.claims})
+        self.assertEqual(len(generated), 87)
+        self.assertEqual(deep.calls, [])
+        self.assertTrue(all("reference_checks" in x["result"] for x in r.receipts.values()))
+
+    def test_contract_retry_limit_blocks_without_repeating_valid_claims(self):
+        r = seeded()
+        counts = Counter()
+        def respond(prompt):
+            payload = json.loads(prompt.split("```json\n")[1].split("\n```\n")[0])
+            cid = payload["claim_id"]
+            counts[cid] += 1
+            result = verdict(cid, ref_ids=reference_ids(payload))
+            if cid == "b":
+                result.pop("reference_checks")
+            return result
+        deep, sweep = CloudDouble("test/deep"), CloudDouble("test/global")
+        result = r.execute_phase6(CloudDouble("test/first", respond), deep, CloudDouble("test/author"), sweep)
+        self.assertTrue(result["blocked"])
+        self.assertEqual(result["status"], "blocked:atomic_contract")
+        self.assertFalse(result["needs_retry"])
+        self.assertEqual(result["invalid_claim_ids"], ["b"])
+        self.assertEqual(counts["b"], 3)
+        self.assertTrue(all(n == 1 for cid, n in counts.items() if cid != "b"))
+        self.assertEqual((deep.calls, sweep.calls), ([], []))
+        self.assertNotIn("report_markdown", result)
+
     def test_identical_findings_keep_independent_targets_across_reload(self):
         from .checkpoint import save_checkpoint, load_checkpoint
         r = seeded()
@@ -229,9 +366,16 @@ class SemanticAcceptance(unittest.TestCase):
         r.collect_phase6_atomic(results, model_identity="test/first")
         r.prepare_phase6_deep_review()
         for rows in ([], source_checks(["a", "a"]), source_checks(["unknown"]), source_checks(["a"], "INSUFFICIENT")):
-            with self.subTest(rows=rows), self.assertRaises(ValueError):
-                r.collect_phase6_deep_review({"b": {**verdict("b"), "reference_checks": rows}}, model_identity="test/second")
-            self.assertEqual(r.deep_receipts, {})
+            with self.subTest(rows=rows):
+                raw = {**verdict("b"), "reference_checks": rows}
+                with self.assertRaises(ValueError):
+                    normalize_atomic_result("b", raw, expected_ref_ids=["a"])
+                result = r.collect_phase6_deep_review({"b": raw}, model_identity="test/second")
+                self.assertTrue(result["blocked"])
+                self.assertEqual(result["invalid_claim_ids"], ["b"])
+                self.assertEqual(r.deep_receipts, {})
+                with self.assertRaises(ValueError):
+                    r.prepare_phase6_global_sweep()
         r.collect_phase6_deep_review({"b": {**verdict("b"), "reference_checks": source_checks(["a"])}}, model_identity="test/second")
 
     def atomic_results(self, r):
@@ -250,18 +394,30 @@ class SemanticAcceptance(unittest.TestCase):
                 results["b"]["reference_checks"] *= 2
             else:
                 results["b"]["reference_checks"] = source_checks(["not-a-ref"])
-            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
-                r.collect_phase6_atomic(results, model_identity="test/first")
-            self.assertEqual(r.receipts, {})
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(ValueError):
+                    normalize_atomic_result("b", results["b"], expected_ref_ids=["a"])
+                result = r.collect_phase6_atomic(results, model_identity="test/first")
+                self.assertTrue(result["blocked"])
+                self.assertEqual(result["invalid_claim_ids"], ["b"])
+                self.assertNotIn("b", r.receipts)
+                with self.assertRaises(ValueError):
+                    r.prepare_phase6_global_sweep()
 
     def test_pass_cannot_override_semantic_contradiction_or_insufficient_evidence(self):
         for relation in ("CONTRADICTS", "INSUFFICIENT"):
             r = seeded()
             results = self.atomic_results(r)
             results["b"]["reference_checks"] = source_checks(["a"], relation)
-            with self.subTest(relation=relation), self.assertRaises(ValueError):
-                r.collect_phase6_atomic(results, model_identity="test/first")
-            self.assertEqual(r.receipts, {})
+            with self.subTest(relation=relation):
+                with self.assertRaises(ValueError):
+                    normalize_atomic_result("b", results["b"], expected_ref_ids=["a"])
+                result = r.collect_phase6_atomic(results, model_identity="test/first")
+                self.assertTrue(result["blocked"])
+                self.assertEqual(result["invalid_claim_ids"], ["b"])
+                self.assertNotIn("b", r.receipts)
+                with self.assertRaises(ValueError):
+                    r.prepare_phase6_global_sweep()
 
     def test_empty_global_array_is_no_longer_dependency_acceptance(self):
         r = seeded()

@@ -12,8 +12,10 @@ import json
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Iterable, List, Tuple
 from copy import deepcopy
+from uuid import uuid4
 from .schema import claim_index
-from .semantic_contracts import REFERENCE_INSTRUCTIONS, normalize_reference_checks
+from .semantic_contracts import (REFERENCE_INSTRUCTIONS, normalize_reference_checks,
+                                 SEMANTIC_REVIEW_CONTRACT, semantic_review_schema, review_ref_ids)
 
 
 @dataclass
@@ -144,8 +146,10 @@ PASS 時 findings 必須是空陣列。
 """.strip() + "\n\n" + REFERENCE_INSTRUCTIONS
 
 
-def build_atomic_prompt(task: AtomicTask) -> str:
+def build_atomic_prompt(task: AtomicTask, *, verification_epoch=None) -> str:
     payload = task.to_dict()
+    payload.update(response_contract=SEMANTIC_REVIEW_CONTRACT, response_schema=semantic_review_schema(task.claim),
+                   expected_reference_ids=review_ref_ids(task.claim), verification_epoch=verification_epoch or uuid4().hex)
     return (
         ATOMIC_INSTRUCTIONS
         + "\n\n## Claim 與局部證據上下文\n```json\n"
@@ -164,7 +168,7 @@ def normalize_atomic_result(claim_id: str, result: Dict[str, Any], *, expected_r
     verdict = str(result.get("verdict", "")).upper()
     if verdict not in {"PASS", "SUSPICIOUS", "FAIL"}:
         raise ValueError(f"invalid atomic verdict for {claim_id}: {verdict!r}")
-    findings = result.get("findings", [])
+    findings = result.get("findings")
     if not isinstance(findings, list):
         raise ValueError(f"findings for {claim_id} must be a list")
     if verdict == "PASS" and findings:
@@ -187,7 +191,7 @@ def normalize_atomic_result(claim_id: str, result: Dict[str, Any], *, expected_r
 def summarize_atomic_results(
     expected_claim_ids: Iterable[str],
     results_by_claim: Dict[str, Dict[str, Any]],
-    *, expected_refs_by_claim=None,
+    *, expected_refs_by_claim=None, report_invalid=False,
 ) -> Dict[str, Any]:
     """Require an LLM result for every claim; missing reviews never auto-pass."""
 
@@ -197,7 +201,7 @@ def summarize_atomic_results(
     if set(results_by_claim) - set(expected):
         raise ValueError("unexpected atomic review IDs")
     missing = [cid for cid in expected if cid not in results_by_claim]
-    if missing:
+    if missing and not report_invalid:
         return {
             "complete": False,
             "missing_claim_ids": missing,
@@ -207,10 +211,17 @@ def summarize_atomic_results(
             "findings": [],
         }
 
-    normalized = {
-        cid: normalize_atomic_result(cid, results_by_claim[cid],
-                                     expected_ref_ids=(expected_refs_by_claim or {}).get(cid, ())) for cid in expected
-    }
+    normalized, invalid = {}, {}
+    for cid in expected:
+        if cid not in results_by_claim:
+            continue
+        try:
+            normalized[cid] = normalize_atomic_result(cid, results_by_claim[cid],
+                                                      expected_ref_ids=(expected_refs_by_claim or {}).get(cid, ()))
+        except (ValueError, TypeError) as exc:
+            if not report_invalid:
+                raise
+            invalid[cid] = str(exc)
     passed, suspicious, failed, findings = [], [], [], []
     for cid, result in normalized.items():
         verdict = result["verdict"]
@@ -227,8 +238,10 @@ def summarize_atomic_results(
             findings.append(f)
 
     return {
-        "complete": True,
-        "missing_claim_ids": [],
+        "complete": not missing and not invalid,
+        "missing_claim_ids": missing,
+        "invalid_claim_ids": list(invalid),
+        "validation_errors": invalid,
         "pass_claim_ids": passed,
         "suspicious_claim_ids": suspicious,
         "fail_claim_ids": failed,

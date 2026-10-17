@@ -10,6 +10,13 @@ import time
 _STDIN_THRESHOLD = 64 * 1024  # UTF-8 bytes; margin below a 128 KiB argv-string limit
 
 
+def request_completion(client, prompt, response_schema=None):
+    structured = getattr(client, "complete_structured", None)
+    if response_schema is not None and callable(structured):
+        return structured(prompt, response_schema)
+    return client.complete(prompt)
+
+
 class AntigravityCloudClient:
     execution = "cloud"
 
@@ -29,11 +36,17 @@ class AntigravityCloudClient:
         self.calls = []
         self._lock = threading.Lock()
 
-    def complete(self, prompt):
+    def complete_structured(self, prompt, response_schema):
+        return self.complete(prompt, response_schema=response_schema)
+
+    def complete(self, prompt, *, response_schema=None):
+        schema = None if response_schema is None else json.dumps(response_schema, ensure_ascii=False, allow_nan=False)
+        if schema is not None and len(schema.encode("utf-8")) > _STDIN_THRESHOLD:
+            raise ValueError("response schema exceeds CLI argument limit")
         text, last_reason = None, "empty response"
         for attempt in range(3):
             try:
-                text = self._generate(prompt)
+                text = self._generate(prompt, response_schema=schema) if schema is not None else self._generate(prompt)
                 if text and text.strip():
                     break
                 last_reason = "empty response"
@@ -54,14 +67,15 @@ class AntigravityCloudClient:
             self.calls.append(dict(transport="antigravity", requested_model=self.identity, served_model=None))
         return parsed
 
-    def _generate(self, prompt):
+    def _generate(self, prompt, *, response_schema=None):
         if len(prompt.encode("utf-8")) > _STDIN_THRESHOLD:
-            return self._generate_stdin(prompt)
+            return self._generate_stdin(prompt, response_schema=response_schema)
+        schema_args = [] if response_schema is None else ["--json-schema", response_schema]
         try:
             result = subprocess.run(
                 [self.executable, "--model", self.model, "--output-format", "text",
                  "--disable-slash-commands", "--mode", "plan", "--sandbox",
-                 "--print-timeout", f"{self.timeout}s", "-p", prompt],
+                 "--print-timeout", f"{self.timeout}s", "-p", prompt] + schema_args,
                 capture_output=True, text=True, timeout=self.timeout, check=False,
             )
         except subprocess.TimeoutExpired:
@@ -74,15 +88,16 @@ class AntigravityCloudClient:
             raise RuntimeError(f"Antigravity CLI failed (exit {result.returncode}); no API fallback")
         return result.stdout
 
-    def _generate_stdin(self, prompt):
+    def _generate_stdin(self, prompt, *, response_schema=None):
         timeout = max(self.timeout, 1800)
         message = json.dumps(dict(event="user", message=dict(role="user", content=prompt)), ensure_ascii=False) + "\n"
+        schema_args = [] if response_schema is None else ["--json-schema", response_schema]
         try:
             result = subprocess.run(
                 [self.executable, "--model", self.model,
                  "--disable-slash-commands", "--mode", "plan", "--sandbox",
                  "--input-format", "stream-json", "--output-format", "stream-json",
-                 "--print-timeout", f"{timeout}s"],
+                 "--print-timeout", f"{timeout}s"] + schema_args,
                 input=message, capture_output=True, text=True, timeout=timeout, check=False,
             )
         except subprocess.TimeoutExpired:

@@ -44,6 +44,7 @@ python -m v4 --manifest /path/to/manifest.json \
 回覆必須是完整 JSON，不能從 prose（一般文字）猜取或修補 JSON。每次成功回應記錄 transport 與 requested_model；文字輸出不提供可靠的實際服務模型身分及用量，因此 served_model 留空，不推測帳單或後端。
 
 程式庫亦可注入具 `execution="cloud"`、`identity`、`complete(prompt)` 的既有雲端連線介面。
+若連線介面另提供 `complete_structured(prompt, response_schema)`，原子與深度審查會明確傳入每條 Claim 的 JSON Schema（結構化回覆規格）；內建 Antigravity 兩條傳輸路徑都會送出 `--json-schema`。舊介面仍收到含完整規格的 prompt，回覆一樣須通過嚴格驗收。
 這是呼叫端的信任界線；V4 不會把任意呼叫介面的自述當成供應商認證。
 `prepare_*`／`collect_*` API（程式介面）可供既有 assistant coordinator（助理協調流程）逐步驅動；每次 collect 必須提交完整 JSON。
 逐步入口與自動入口都要求非空的模型識別；第一層與深度審查必須不同，缺漏身分時不會發布驗證紀錄。
@@ -69,6 +70,11 @@ python -m v4 --manifest /path/to/manifest.json \
 引用反證時，檢查原文對反證內容的歸因是否正確，不要求每個來源獨立支持整個投資結論。
 漏回、重複、未知引用、缺說明都會被拒絕；矛盾必須 FAIL，證據不足不能 PASS。第二模型推翻第一層時，也必須重新交完整逐引用紀錄。
 漏回、錯 ID、重複 ID、非法 verdict、過期回覆，都不能通過。深度審查可以推翻第一層的誤報。
+原子與深度審查的結構化規格明列四個必要欄位，並固定 Claim ID、引用 ID 集合與逐引用紀錄筆數；即使 schema（規格）合格，程式仍檢查重複引用、覆蓋完整性及 verdict／relation 一致性，不把欄位齊全等同語義正確。
+有效 JSON 卻缺欄位或不符合回覆契約時，collector（結果收集器）不再因單筆錯誤丟棄整批：已合格的驗證保存，不合格項不發布驗證紀錄，回傳 `blocked=true`、`needs_retry`、`retry_claim_ids`、`retry_prompts`、逐 Claim 的 `response_schemas` 與 `validation_errors`。
+內建執行流程只重新送出不合格／漏回的 Claim，使用完整原始 Claim、來源與相依物件，要求模型重新判斷，不由程式補 `[]` 或沿用舊 PASS。每個 runner（本次執行）、層級、模型與輸入版本最多收集 3 次不合格結果；用盡回 `blocked:atomic_contract` 或 `blocked:deep_contract`，不進後續階段、不附報告。載入檢查點後全部審查重新開始，契約重試預算也重新開始；與連線層的 3 次重試及 Claim 修訂輪次分開計算，可能增加雲端呼叫。
+自訂 driver（驅動流程）須在 `needs_retry=true` 時送出 `retry_prompts`，並把對應的 `response_schemas[claim_id]` 傳給支援結構化輸出的介面，再收集回覆；不得把 blocked 視為完成。非 JSON 回覆與過期狀態依原有錯誤處理封鎖。
+回覆契約版本為 `v4-semantic-review/2`。每次新執行／重載使用新的驗證識別碼，每次契約修復另有新的請求識別碼。外接快取必須將完整 prompt（含版本與識別碼）、模型與來源脈絡納入鍵，不能只以 Claim ID 命中；內建 journal（執行紀錄）另保存回覆規格雜湊，不重用舊語義驗證。缺少 `reference_checks` 的舊快取只能保留作稽核，不能手工補欄位冒充驗收。
 確定性驗證失敗不會使該 Claim 跳過第一層 LLM；它會在所有有效 Claim 驗過之後阻止最終交付。
 來源或計算本身錯誤時回報 blocked，不允許修稿模型藉改 Python 或來源物件來消除錯誤。
 

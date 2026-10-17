@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 from pathlib import Path
 from .checkpoint import save_checkpoint, write_json
 from .schema import digest
+from .cloud import request_completion
 
 
 class RunJournal:
@@ -17,9 +18,11 @@ class RunJournal:
     def checkpoint(self, runner):
         save_checkpoint(runner, self.directory / "checkpoint.json")
 
-    def complete(self, runner, client, task_id, prompt, *, reuse_role_output=False):
+    def complete(self, runner, client, task_id, prompt, *, reuse_role_output=False, response_schema=None):
         metadata = dict(format="v4-response/1", run_id=runner.run_id, model=client.identity,
                         task_id=task_id, prompt_hash=digest(prompt))
+        if response_schema is not None:
+            metadata["response_schema_hash"] = digest(response_schema)
         relative = Path("responses") / (digest(metadata) + ".json")
         if reuse_role_output and task_id not in self.retry_roles:
             for directory in self.read_directories:
@@ -48,7 +51,7 @@ class RunJournal:
         # written. An in-flight record never counts as a completed response.
         attempt = uuid4().hex
         write_json(self.directory / relative, {**metadata, "attempt_id": attempt, "status": "in_flight"})
-        result = client.complete(prompt)
+        result = request_completion(client, prompt, response_schema)
         received = {**metadata, "attempt_id": attempt, "status": "received", "response": result}
         # Keep previous attempts for audit, including explicitly retried roles.
         write_json(self.directory / "responses" / "archive" / (attempt + ".json"), received)
