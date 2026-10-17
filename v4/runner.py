@@ -75,6 +75,16 @@ class PipelineRunnerV4:
         self.pending_patch = None
         self.revision_round = 0
         self.status = "created"
+        self.journal = None
+
+    def _persist(self):
+        if self.journal is not None:
+            self.journal.checkpoint(self)
+
+    def _complete(self, client, task_id, prompt, *, reuse_role_output=False):
+        raw = (self.journal.complete(self, client, task_id, prompt, reuse_role_output=reuse_role_output)
+               if self.journal is not None else client.complete(prompt))
+        return decode_response(raw)
 
     @property
     def run(self):
@@ -117,8 +127,10 @@ class PipelineRunnerV4:
         failures, blocked = self.orch.validate_stage(self.run_id, "ingest")
         if blocked:
             self.status = "blocked:ingest"
+            self._persist()
             return dict(blocked=True, findings=failures)
         self.status = "roles"
+        self._persist()
         return self._role_prompts(PHASE_2_ROLES)
 
     def _collect_roles(self, claims_by_role, expected):
@@ -132,6 +144,7 @@ class PipelineRunnerV4:
             raise ValueError("prerequisite roles have not completed")
         self.orch.submit_batch(self.run_id, claims_by_role)
         self.global_receipt = None
+        self._persist()
 
     def collect_phase2(self, claims_by_role, texts_by_role=None):
         self._collect_roles(claims_by_role, PHASE_2_ROLES)
@@ -203,6 +216,7 @@ class PipelineRunnerV4:
                                             expected_refs_by_claim=expected_refs)
         suspicious = combined["suspicious_claim_ids"] + combined["fail_claim_ids"]
         self.status = "deep" if suspicious else "global"
+        self._persist()
         return {**combined, "blocked": False, "needs_deep_review": bool(suspicious), "deep_review_claim_ids": suspicious}
 
     def _require_atomic(self):
@@ -252,6 +266,7 @@ class PipelineRunnerV4:
         self.pending_deep = None
         findings = self._review_findings()
         self.status = "revision" if findings else "global"
+        self._persist()
         return {**summary, "blocked": False, "findings": findings}
 
     def _review_findings(self):
@@ -309,6 +324,7 @@ class PipelineRunnerV4:
         linked_by_id = {f["finding_id"]: f for f in linked if "finding_id" in f}
         self.deferred_global_findings = [deepcopy(linked_by_id.get(f["finding_id"], f))
                                          for f in self.deferred_global_findings]
+        self._persist()
         return linked
 
     def prepare_phase6_revision_v4(self, findings):
@@ -361,6 +377,7 @@ class PipelineRunnerV4:
                                  affected_claim_ids=affected, before_hash=pending["input_hash"], after_hash=self._hash()))
         self.pending_patch = None
         self.status = "atomic"
+        self._persist()
         return dict(revalidate_claim_ids=affected, **self.prepare_phase6_atomic())
 
     def _ready_for_global(self):
@@ -428,6 +445,7 @@ class PipelineRunnerV4:
                                    dependency_reviews=deepcopy(audit["dependency_reviews"]))
         self.pending_global = None
         self.status = "revision" if findings else "verified"
+        self._persist()
         return dict(blocked=bool(findings), needs_revision=bool(findings), findings=deepcopy(findings), **audit)
 
     def finalize(self):
@@ -442,6 +460,7 @@ class PipelineRunnerV4:
                                     global_review=deepcopy(self.global_receipt), revision_history=deepcopy(self.history),
                                     deterministic_findings=findings)
         self.status = self.run.stage = "complete"
+        self._persist()
         return {**rendered, "blocked": False, "status": "complete"}
 
     # Old coordinator names are redirected to the V4 contracts, never inherited.
@@ -450,11 +469,10 @@ class PipelineRunnerV4:
     prepare_phase6_verify = prepare_phase6_atomic
     prepare_phase6_revision = prepare_phase6_revision_v4
 
-    def _parallel(self, client, prompts):
+    def _parallel(self, client, prompts, *, reuse_role_output=False):
         def one(item):
             key, prompt = item
-            result = client.complete(prompt)
-            return key, decode_response(result)
+            return key, self._complete(client, key, prompt, reuse_role_output=reuse_role_output)
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             return dict(pool.map(one, prompts))
 
@@ -495,8 +513,7 @@ class PipelineRunnerV4:
                         return dict(blocked=True, reason="source or calculation repair required", findings=failures)
                 if not findings:
                     role, prompt = self.prepare_phase6_global_sweep()
-                    raw = global_reviewer.complete(prompt)
-                    global_findings = decode_response(raw)
+                    global_findings = self._complete(global_reviewer, role, prompt)
                     result = self.collect_phase6_global_sweep(global_findings, model_identity=global_reviewer.identity)
                     if result["dependency_patches"]:
                         revision = self.prepare_phase6_revision_v4(result["dependency_findings"])
@@ -511,16 +528,15 @@ class PipelineRunnerV4:
                         return self.finalize()
                 revision = self.prepare_phase6_revision_v4(findings)
                 if revision.get("needs_linking"):
-                    raw = (linker or global_reviewer).complete(revision["linker_prompt"][1])
-                    links = decode_response(raw)
+                    links = self._complete(linker or global_reviewer, *revision["linker_prompt"])
                     unrouted = revision["unrouted_findings"]
                     linked = self.apply_finding_links(unrouted, links)
                     routed = [f for f in findings if self._finding_claim_ids(f)]
                     revision = self.prepare_phase6_revision_v4(routed + linked)
                 if revision.get("blocked"):
                     return revision
-                patches = patcher.complete(revision["revision_prompts"][0][1])
-                self.collect_phase6_revision(decode_response(patches))
+                patches = self._complete(patcher, *revision["revision_prompts"][0])
+                self.collect_phase6_revision(patches)
         except Exception as exc:
             self.status = "blocked:execution"
             return dict(blocked=True, reason=f"{type(exc).__name__}: {exc}", status=self.status)
@@ -532,16 +548,39 @@ class PipelineRunnerV4:
             prompts = self.prepare(ticker, manifest)
             if isinstance(prompts, dict):
                 return prompts
-            for collect in (self.collect_phase2, self.collect_phase3):
-                outputs = self._parallel(author, prompts)
-                prompts = collect({role: value["claims"] for role, value in outputs.items()})
-            rm = self._parallel(author, prompts)["research_manager"]
-            trader_prompt = self.collect_rm(rm["claims"])
-            trader = self._parallel(author, [trader_prompt])["trader"]
-            risk_prompt = self.collect_trader(trader["claims"], trade=trader["trade"])
-            risk = self._parallel(author, [risk_prompt])["risk_manager"]
-            self.collect_risk(risk["claims"])
-            return self.execute_phase6(verifier, deep_reviewer, author, global_reviewer)
+            return self.resume(author, verifier, deep_reviewer, global_reviewer)
         except Exception as exc:
             self.status = "blocked:roles"
             return dict(blocked=True, reason=f"{type(exc).__name__}: {exc}", status=self.status)
+
+    def resume(self, author, verifier, deep_reviewer, global_reviewer):
+        """Finish role stages from canonical objects, then run fresh reviews."""
+        if getattr(author, "execution", None) != "cloud":
+            raise ValueError("role author must be an explicit cloud client")
+        require_model_identity(author.identity)
+        try:
+            groups = (PHASE_2_ROLES, PHASE_3_ROLES, ("research_manager",), ("trader",), ("risk_manager",))
+            completed = {c["author_role"] for c in self.run.claims}
+            for pos, roles in enumerate(groups):
+                if set(roles) <= completed:
+                    continue
+                later = {role for group in groups[pos + 1:] for role in group}
+                if completed.intersection(set(roles) | later):
+                    raise ValueError("incomplete or out-of-order role batch; restart from a valid checkpoint")
+                self._persist()
+                outputs = self._parallel(author, self._role_prompts(roles), reuse_role_output=True)
+                if roles == PHASE_2_ROLES:
+                    self.collect_phase2({role: outputs[role]["claims"] for role in roles})
+                elif roles == PHASE_3_ROLES:
+                    self.collect_phase3({role: outputs[role]["claims"] for role in roles})
+                elif roles == ("research_manager",):
+                    self.collect_rm(outputs["research_manager"]["claims"])
+                elif roles == ("trader",):
+                    self.collect_trader(outputs["trader"]["claims"], trade=outputs["trader"]["trade"])
+                else:
+                    self.collect_risk(outputs["risk_manager"]["claims"])
+                completed.update(roles)
+        except Exception as exc:
+            self.status = "blocked:roles"
+            return dict(blocked=True, reason=f"{type(exc).__name__}: {exc}", status=self.status)
+        return self.execute_phase6(verifier, deep_reviewer, author, global_reviewer)

@@ -22,6 +22,11 @@ def write_json(path, payload):
             f.flush()
             os.fsync(f.fileno())
         os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if temporary:
             Path(temporary).unlink(missing_ok=True)
@@ -29,6 +34,7 @@ def write_json(path, payload):
 
 def save_checkpoint(runner, path):
     write_json(path, dict(format="v4-checkpoint/1", state=runner.orch.snapshot(runner.run_id),
+                          status=runner.status,
                           records=[dict(kind=type(r).__name__, value=asdict(r)) for r in runner.run.records],
                           revision_round=runner.revision_round, history=runner.history,
                           deferred_global_findings=runner.deferred_global_findings,

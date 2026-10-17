@@ -2,9 +2,10 @@
 import argparse
 import json
 from pathlib import Path
-from .runner import PipelineRunnerV4
-from .cloud import GeminiCloudClient
+from .runner import PipelineRunnerV4, ROLES
+from .cloud import AntigravityCloudClient
 from .checkpoint import save_checkpoint, load_checkpoint, write_json
+from .journal import RunJournal
 
 
 def main(argv=None):
@@ -17,22 +18,32 @@ def main(argv=None):
     parser.add_argument("--out", required=True)
     parser.add_argument("--max-workers", type=int, default=4)
     parser.add_argument("--max-revisions", type=int, default=3)
+    parser.add_argument("--retry-role", action="append", choices=ROLES, default=[],
+                        help="Re-request an uncommitted role output instead of replaying its saved response")
     args = parser.parse_args(argv)
+    out = Path(args.out)
+    try:
+        write_json(out / "result.json", dict(status="running", blocked=True))
+    except Exception as exc:
+        print(json.dumps(dict(status="blocked:output", blocked=True, result_written=False,
+                              reason=f"{type(exc).__name__}: {exc}"), ensure_ascii=False))
+        return 2
     runner, clients = None, {}
     try:
-        clients = {role: GeminiCloudClient(getattr(args, f"{role}_model")) for role in ("author", "verifier", "deep", "global")}
+        clients = {role: AntigravityCloudClient(getattr(args, f"{role}_model")) for role in ("author", "verifier", "deep", "global")}
         if clients["verifier"].identity == clients["deep"].identity:
             raise ValueError("--verifier-model and --deep-model must differ")
         if args.resume:
             runner = load_checkpoint(args.resume)
-            result = runner.execute_phase6(clients["verifier"], clients["deep"], clients["author"], clients["global"])
+            runner.journal = RunJournal(out, resume_from=args.resume, retry_roles=args.retry_role)
+            result = runner.resume(clients["author"], clients["verifier"], clients["deep"], clients["global"])
         else:
             manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
             runner = PipelineRunnerV4(max_workers=args.max_workers, max_revisions=args.max_revisions)
+            runner.journal = RunJournal(out, retry_roles=args.retry_role)
             result = runner.execute(manifest["subject"]["ticker"], manifest, clients["author"], clients["verifier"], clients["deep"], clients["global"])
     except Exception as exc:
         result = dict(blocked=True, status="blocked:input", reason=f"{type(exc).__name__}: {exc}")
-    out = Path(args.out)
     if runner is not None and runner.run_id:
         try:
             save_checkpoint(runner, out / "checkpoint.json")

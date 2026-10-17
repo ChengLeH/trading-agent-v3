@@ -1,73 +1,63 @@
-"""Transport contract tests with HTTP replaced; no external model calls."""
-import io
-import json
+"""Antigravity transport tests replace subprocesses, never call real models."""
 import os
+import subprocess
 import unittest
 from unittest.mock import patch
-from urllib.error import HTTPError
-from urllib.request import ProxyHandler
-from .cloud import GeminiCloudClient, NoRedirect
+from .cloud import AntigravityCloudClient
 
 
 class Transport(unittest.TestCase):
-    def response(self, payload):
-        return io.BytesIO(json.dumps(payload).encode())
+    def test_agy_without_api_key_inherits_environment(self):
+        with patch.dict(os.environ, {"https_proxy": "http://egress.invalid:3128"}, clear=True), \
+                patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), \
+                patch("v4.cloud.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, '{"ok":true}', "")
+            client = AntigravityCloudClient("selected-model")
+            self.assertEqual(client.complete("claim context"), dict(ok=True))
+            args = run.call_args.args[0]
+            self.assertEqual(args[:3], ["/existing/bin/agy", "--model", "selected-model"])
+            self.assertEqual(args[-2:], ["-p", "claim context"])
+            self.assertIn("--disable-slash-commands", args)
+            self.assertIn("--sandbox", args)
+            self.assertNotIn("--dangerously-skip-permissions", args)
+            self.assertNotIn("env", run.call_args.kwargs)
+            self.assertFalse(run.call_args.kwargs.get("shell", False))
+            self.assertEqual(client.calls, [dict(transport="antigravity", requested_model="antigravity/selected-model", served_model=None)])
 
-    def test_environment_proxy_is_used_without_allowing_redirects(self):
-        for env, expected in (({"https_proxy": "http://egress.invalid:3128"},
-                               {"https": "http://egress.invalid:3128"}), ({}, {})):
-            with self.subTest(env=env), patch.dict(os.environ, {"GEMINI_API_KEY": "test-key", **env}, clear=True), \
-                    patch("v4.cloud.build_opener") as opener:
-                opener.return_value.open.return_value = self.response(dict(candidates=[
-                    dict(finishReason="STOP", content=dict(parts=[dict(text='{"ok":true}')]))]))
-                self.assertEqual(GeminiCloudClient("test").complete("test"), {"ok": True})
-                handlers = opener.call_args.args
-                self.assertEqual(next(h.proxies for h in handlers if isinstance(h, ProxyHandler)), expected)
-                self.assertTrue(any(isinstance(h, NoRedirect) for h in handlers))
+    def test_missing_cli_never_falls_back(self):
+        with patch("v4.cloud.shutil.which", return_value=None), patch("v4.cloud.subprocess.run") as run:
+            with self.assertRaisesRegex(RuntimeError, "Antigravity CLI unavailable"):
+                AntigravityCloudClient("model")
+            run.assert_not_called()
 
-    def test_explicit_cloud_endpoint_model_and_audit(self):
-        client = GeminiCloudClient("test-model")
-        payload = dict(modelVersion="served-test", responseId="response", usageMetadata={"totalTokenCount": 10},
-                       candidates=[dict(finishReason="STOP", content=dict(parts=[dict(text='{"ok":true}')]))])
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}), patch("v4.cloud.build_opener") as opener:
-            opener.return_value.open.return_value = self.response(payload)
-            self.assertEqual(client.complete("test"), {"ok": True})
-            request = opener.return_value.open.call_args.args[0]
-            self.assertEqual(request.full_url, "https://generativelanguage.googleapis.com/v1beta/models/test-model:generateContent")
-            self.assertNotIn("test-key", request.full_url)
-            self.assertEqual(client.calls[0]["served_model"], "served-test")
-            self.assertEqual(client.calls[0]["requested_model"], "google/test-model")
+    def test_cli_failure_never_exposes_output_or_switches_transport(self):
+        with patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), \
+                patch("v4.cloud.subprocess.run", return_value=subprocess.CompletedProcess([], 3, "secret", "secret")) as run:
+            client = AntigravityCloudClient("model")
+            with self.assertRaisesRegex(RuntimeError, "no API fallback") as caught:
+                client.complete("test")
+            self.assertNotIn("secret", str(caught.exception))
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(client.calls, [])
 
-    def test_missing_key_never_opens_network(self):
-        with patch.dict(os.environ, {}, clear=True), patch("v4.cloud.build_opener") as opener:
-            with self.assertRaises(RuntimeError):
-                GeminiCloudClient("test").complete("test")
-            opener.assert_not_called()
+    def test_timeout_start_failure_and_non_json_fail_closed(self):
+        for failure in (subprocess.TimeoutExpired(["secret"], 1), OSError("secret"), None):
+            with self.subTest(failure=type(failure).__name__), \
+                    patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), \
+                    patch("v4.cloud.subprocess.run", side_effect=failure) as run:
+                run.return_value = subprocess.CompletedProcess([], 0, "prose ```json {} ```", "")
+                with self.assertRaises((RuntimeError, ValueError)) as caught:
+                    AntigravityCloudClient("model").complete("secret")
+                self.assertNotIn("secret", str(caught.exception))
 
-    def test_truncated_or_invalid_completion_fails_closed(self):
-        for payload in ({"candidates": []},
-                        {"candidates": [dict(finishReason="MAX_TOKENS", content={})]},
-                        {"candidates": [dict(finishReason="STOP", content=dict(parts=[dict(text="not JSON")]))]}):
-            with self.subTest(payload=payload), patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}), \
-                 patch("v4.cloud.build_opener") as opener:
-                opener.return_value.open.return_value = self.response(payload)
-                with self.assertRaises(ValueError):
-                    GeminiCloudClient("test").complete("test")
-
-    def test_http_failure_does_not_leak_credential_or_body(self):
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}), patch("v4.cloud.build_opener") as opener:
-            opener.return_value.open.side_effect = HTTPError("sensitive-url", 401, "secret", {}, None)
-            with self.assertRaisesRegex(RuntimeError, "^Gemini cloud HTTP 401$"):
-                GeminiCloudClient("test").complete("test")
-
-    def test_no_local_endpoint_or_redirect(self):
-        for model in ("http://localhost:8080/model", "../local", ""):
+    def test_explicit_model_and_executable_selection(self):
+        for model in ("", "--other-option", "model with spaces", "$(command)"):
             with self.assertRaises(ValueError):
-                GeminiCloudClient(model)
-        with self.assertRaises(TypeError):
-            GeminiCloudClient("test", base_url="http://localhost")
-        with self.assertRaises(ValueError):
-            NoRedirect().redirect_request(None, None, 302, "", {}, "http://localhost")
+                AntigravityCloudClient(model)
+        with patch.dict(os.environ, {"AGY_EXECUTABLE": "/chosen/agy"}), \
+                patch("v4.cloud.shutil.which", return_value="/chosen/agy") as which:
+            AntigravityCloudClient("selected-model")
+            which.assert_called_once_with("/chosen/agy")
 
 
 if __name__ == "__main__":

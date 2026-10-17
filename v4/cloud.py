@@ -1,61 +1,51 @@
-"""Explicit Gemini cloud transport. No local endpoints, CLI, or fallback.
-
-Protocol reference: https://ai.google.dev/api/generate-content
-Models are caller-selected, not inferred from the host's installed tools.
-"""
+"""Existing Antigravity (agy) cloud connection only; no direct API fallback."""
 import json
+import math
 import os
+import shutil
+import subprocess
 import threading
-from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHandler
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote
 
 
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise ValueError("cloud transport does not follow redirects")
-
-
-class GeminiCloudClient:
+class AntigravityCloudClient:
     execution = "cloud"
 
-    def __init__(self, model, *, key_env="GEMINI_API_KEY", timeout=120):
-        if not isinstance(model, str) or not model or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_." for c in model):
-            raise ValueError("explicit Gemini model ID required")
+    def __init__(self, model, *, executable=None, timeout=120):
+        if (not isinstance(model, str) or not model or model.startswith("-")
+                or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:/" for c in model)):
+            raise ValueError("explicit Antigravity model ID required")
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("positive finite Antigravity timeout required")
+        command = executable or os.environ.get("AGY_EXECUTABLE", "agy")
+        self.executable = shutil.which(command)
+        if not self.executable:
+            raise RuntimeError("Antigravity CLI unavailable; configure existing agy on PATH or AGY_EXECUTABLE")
         self.model = model
-        self.identity = f"google/{model}"
-        self.key_env = key_env
+        self.identity = f"antigravity/{model}"
         self.timeout = timeout
         self.calls = []
         self._lock = threading.Lock()
 
     def complete(self, prompt):
-        key = os.environ.get(self.key_env)
-        if not key:
-            raise RuntimeError(f"missing cloud credential environment variable: {self.key_env}")
-        url = "https://generativelanguage.googleapis.com/v1beta/models/" + quote(self.model, safe="") + ":generateContent"
-        payload = dict(contents=[dict(role="user", parts=[dict(text=prompt)])],
-                       generationConfig=dict(responseMimeType="application/json", temperature=0.1))
-        req = Request(url, data=json.dumps(payload).encode(), method="POST",
-                      headers={"Content-Type": "application/json", "x-goog-api-key": key})
-        # Honor system/egress proxies while keeping the fixed Google HTTPS
-        # endpoint, TLS verification and redirect rejection. No key in URLs/logs.
-        opener = build_opener(ProxyHandler(), NoRedirect())
         try:
-            with opener.open(req, timeout=self.timeout) as response:
-                data = json.load(response)
-        except HTTPError as exc:
-            exc.close()
-            raise RuntimeError(f"Gemini cloud HTTP {exc.code}") from None
-        except URLError:
-            raise RuntimeError("Gemini cloud connection failed") from None
-        candidates = data.get("candidates", [])
-        if len(candidates) != 1 or candidates[0].get("finishReason") != "STOP":
-            raise ValueError("cloud returned blocked, incomplete, or ambiguous completion")
-        parts = candidates[0].get("content", {}).get("parts", [])
-        text = "".join(p["text"] for p in parts if "text" in p and not p.get("thought"))
-        result = json.loads(text)  # no prose/regex extraction or repair guessing
+            result = subprocess.run(
+                [self.executable, "--model", self.model, "--output-format", "text",
+                 "--disable-slash-commands", "--mode", "plan", "--sandbox",
+                 "--print-timeout", f"{self.timeout}s", "-p", prompt],
+                capture_output=True, text=True, timeout=self.timeout, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Antigravity cloud request timed out") from None
+        except OSError:
+            raise RuntimeError("Antigravity CLI could not start") from None
+        if result.returncode != 0:
+            # Diagnostics may contain prompts or account data; keep them out
+            # of delivery artifacts. Failure must never switch transports.
+            raise RuntimeError(f"Antigravity CLI failed (exit {result.returncode}); no API fallback")
+        try:
+            parsed = json.loads(result.stdout)
+        except (ValueError, TypeError):
+            raise ValueError("Antigravity response must be strict JSON") from None
         with self._lock:
-            self.calls.append(dict(requested_model=self.identity, served_model=data.get("modelVersion"),
-                                   response_id=data.get("responseId"), usage=data.get("usageMetadata", {})))
-        return result
+            self.calls.append(dict(transport="antigravity", requested_model=self.identity, served_model=None))
+        return parsed

@@ -228,7 +228,7 @@ class Integration(unittest.TestCase):
             out = Path(temp) / "out"
             args = ["--manifest", str(manifest_path), "--out", str(out), "--author-model", "author",
                     "--verifier-model", "atomic", "--deep-model", "deep", "--global-model", "global"]
-            with patch("v4.__main__.GeminiCloudClient", side_effect=lambda model: clients[model]), contextlib.redirect_stdout(io.StringIO()):
+            with patch("v4.__main__.AntigravityCloudClient", side_effect=lambda model: clients[model]), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(main(args), 0)
                 self.assertIn("report_markdown", json.loads((out / "result.json").read_text()))
                 self.assertTrue((out / "checkpoint.json").exists())

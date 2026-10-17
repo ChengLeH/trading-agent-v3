@@ -1,0 +1,234 @@
+"""Crash/restart tests exercise disk artifacts, not real cloud requests."""
+import copy
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+from .checkpoint import load_checkpoint, save_checkpoint
+from .journal import RunJournal
+from .runner import PHASE_2_ROLES
+from .test_contracts import claim
+from .test_integration import seeded, CloudDouble, global_verdict
+
+
+def author_response(prompt):
+    packet = json.loads(prompt.split("<context-data>\n")[1].split("\n</context-data>")[0])
+    role = packet["role"]
+    c = claim(role + ".restart")
+    c["author_role"] = role
+    result = dict(claims=[c])
+    if role == "trader":
+        result["trade"] = dict(direction="WAIT")
+        c["assertion"] = dict(kind="trade_plan", trade=result["trade"])
+    return result
+
+
+class Journal(unittest.TestCase):
+    def test_archive_recovers_current_attempt_when_index_write_fails(self):
+        from .checkpoint import write_json
+        with tempfile.TemporaryDirectory() as temp:
+            r = seeded()
+            r.journal = RunJournal(temp)
+            client = CloudDouble("test/author", lambda _: dict(claims="saved reply"))
+            def fail_index(path, data):
+                if data.get("status") == "received" and Path(path).parent.name == "responses":
+                    raise OSError("interrupted index write")
+                write_json(path, data)
+            with patch("v4.journal.write_json", side_effect=fail_index), self.assertRaises(OSError):
+                r._complete(client, "bull", "same prompt", reuse_role_output=True)
+            r.journal = RunJournal(temp)
+            recovered = r._complete(client, "bull", "same prompt", reuse_role_output=True)
+            self.assertEqual(recovered, dict(claims="saved reply"))
+            self.assertEqual(len(client.calls), 1)
+
+    def test_incomplete_retry_never_recovers_older_attempt_or_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source, target = Path(temp) / "source", Path(temp) / "target"
+            r = seeded()
+            client = CloudDouble("test/author", lambda _: dict(claims="old invalid reply"))
+            r.journal = RunJournal(source)
+            r._complete(client, "bull", "same prompt", reuse_role_output=True)
+            r.journal = RunJournal(target, resume_from=source / "checkpoint.json", retry_roles=["bull"])
+            def interrupted(_):
+                raise RuntimeError("interrupted retry")
+            client.responder = interrupted
+            with self.assertRaises(RuntimeError):
+                r._complete(client, "bull", "same prompt", reuse_role_output=True)
+            client.responder = lambda _: dict(claims="new reply")
+            r.journal = RunJournal(target, resume_from=source / "checkpoint.json")
+            self.assertEqual(r._complete(client, "bull", "same prompt", reuse_role_output=True), dict(claims="new reply"))
+            self.assertEqual(len(client.calls), 3)
+
+    def test_cli_hard_exit_replaces_old_delivery_before_cloud_calls(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp)
+            save_checkpoint(seeded(), out / "checkpoint.json")
+            (out / "result.json").write_text(json.dumps(dict(blocked=False, report_markdown="OLD SUCCESS")))
+            code = '''
+import os, sys
+from unittest.mock import patch
+from v4.__main__ import main
+from v4.test_integration import CloudDouble
+with patch("v4.__main__.AntigravityCloudClient", side_effect=lambda model: CloudDouble(model, lambda _: os._exit(19))):
+    main(["--resume", sys.argv[1], "--out", sys.argv[2], "--author-model", "author", "--verifier-model", "first", "--deep-model", "deep", "--global-model", "global"])
+'''
+            proc = subprocess.run([sys.executable, "-B", "-c", code, str(out / "checkpoint.json"), str(out)],
+                                  cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True, timeout=15)
+            self.assertEqual(proc.returncode, 19, proc.stderr)
+            result = json.loads((out / "result.json").read_text())
+            self.assertEqual(result, dict(status="running", blocked=True))
+            self.assertTrue(load_checkpoint(out / "checkpoint.json").run.claims)
+
+    def test_explicit_role_retry_preserves_old_response_and_other_cached_roles(self):
+        with tempfile.TemporaryDirectory() as temp:
+            r = seeded()
+            r.journal = RunJournal(temp)
+            bad = CloudDouble("test/author", lambda _: dict(claims="invalid"))
+            good = CloudDouble("test/author", lambda _: dict(claims=[]))
+            r._complete(bad, "bull", "bull prompt", reuse_role_output=True)
+            r._complete(good, "bear", "bear prompt", reuse_role_output=True)
+            r.journal = RunJournal(temp, retry_roles=["bull"])
+            retry = CloudDouble("test/author", lambda _: dict(claims=["new response"]))
+            self.assertEqual(r._complete(retry, "bull", "bull prompt", reuse_role_output=True), dict(claims=["new response"]))
+            self.assertEqual(r._complete(retry, "bear", "bear prompt", reuse_role_output=True), dict(claims=[]))
+            self.assertEqual(len(retry.calls), 1)
+            archived = [json.loads(p.read_text()) for p in (Path(temp) / "responses" / "archive").glob("*.json")]
+            self.assertEqual(len(archived), 3)
+            self.assertIn(dict(claims="invalid"), [p["response"] for p in archived])
+
+    def test_received_response_write_failure_does_not_corrupt_checkpoint(self):
+        from .checkpoint import write_json
+        with tempfile.TemporaryDirectory() as temp:
+            r = seeded()
+            r.journal = RunJournal(temp)
+            r._persist()
+            before = (Path(temp) / "checkpoint.json").read_bytes()
+            client = CloudDouble("test/model", lambda _: dict(ok=True))
+            writes = []
+            def fail_received(path, data):
+                writes.append(data)
+                if data.get("status") == "received":
+                    raise OSError("disk full")
+                write_json(path, data)
+            with patch("v4.journal.write_json", side_effect=fail_received), self.assertRaises(OSError):
+                r._complete(client, "task", "prompt")
+            self.assertEqual(len(client.calls), 1)
+            self.assertEqual((Path(temp) / "checkpoint.json").read_bytes(), before)
+            self.assertEqual([w["status"] for w in writes], ["in_flight", "received"])
+
+    def test_trader_checkpoint_failure_rolls_back_trade_and_claims(self):
+        r = seeded()
+        r.run.claims = [c for c in r.run.claims if c["author_role"] not in {"trader", "risk_manager"}]
+        r.run.analyses = {}
+        r.run.trade = {}
+        r.orch._sync_views(r.run)
+        before = copy.deepcopy(r.orch.snapshot(r.run_id))
+        r.journal = RunJournal("unused-output")
+        c = claim("new.trader")
+        c.update(author_role="trader", assertion=dict(kind="trade_plan", trade=dict(direction="WAIT")))
+        with patch.object(r.journal, "checkpoint", side_effect=OSError("disk full")), self.assertRaises(OSError):
+            r.collect_trader([c], trade=dict(direction="WAIT"))
+        self.assertEqual(r.orch.snapshot(r.run_id), before)
+
+    def test_hard_exit_preserves_parallel_response_and_resumes_roles(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "durable-run"
+            code = '''
+import json, os, sys
+from v4.test_integration import seeded, CloudDouble
+from v4.test_journal import author_response
+from v4.runner import PHASE_2_ROLES
+from v4.journal import RunJournal
+r = seeded()
+r.max_workers = 1
+r.run.claims = [c for c in r.run.claims if c["author_role"] in PHASE_2_ROLES]
+r.run.analyses = {}
+r.run.trade = {}
+r.orch._sync_views(r.run)
+r.journal = RunJournal(sys.argv[1])
+def author(prompt):
+    packet = json.loads(prompt.split("<context-data>\\n")[1].split("\\n</context-data>")[0])
+    if packet["role"] == "bear":
+        os._exit(17)
+    return author_response(prompt)
+r.resume(CloudDouble("test/author", author), CloudDouble(), CloudDouble("test/deep"), CloudDouble("test/global"))
+'''
+            proc = subprocess.run([sys.executable, "-B", "-c", code, str(out)],
+                                  cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True, timeout=15)
+            self.assertEqual(proc.returncode, 17, proc.stderr)
+            checkpoint = out / "checkpoint.json"
+            r = load_checkpoint(checkpoint)
+            self.assertEqual({c["author_role"] for c in r.run.claims}, set(PHASE_2_ROLES))
+            saved = [json.loads(p.read_text()) for p in (out / "responses").glob("*.json")]
+            self.assertEqual({(p["task_id"], p["status"]) for p in saved},
+                             {("bull", "received"), ("bear", "in_flight")})
+            # Also support resuming into a different permanent directory.
+            resumed = Path(temp) / "resumed-run"
+            r.journal = RunJournal(resumed, resume_from=checkpoint)
+            author = CloudDouble("test/author", author_response)
+            verifier = CloudDouble()
+            result = r.resume(author, verifier, CloudDouble("test/deep"),
+                              CloudDouble("test/global", lambda _: global_verdict(r)))
+            self.assertFalse(result["blocked"], result)
+            roles_called = [json.loads(p.split("<context-data>\n")[1].split("\n</context-data>")[0])["role"]
+                            for p in author.calls]
+            self.assertEqual(roles_called, ["bear", "research_manager", "trader", "risk_manager"])
+            self.assertEqual(len(verifier.calls), len(r.run.claims))
+            self.assertTrue((resumed / "checkpoint.json").exists())
+            self.assertEqual(load_checkpoint(resumed / "checkpoint.json").receipts, {})
+
+    def test_failed_parallel_sibling_keeps_each_received_response(self):
+        with tempfile.TemporaryDirectory() as temp:
+            r = seeded()
+            r.journal = RunJournal(temp)
+            def respond(prompt):
+                if prompt == "bad":
+                    raise RuntimeError("network failure")
+                return dict(ok=prompt)
+            with self.assertRaises(RuntimeError):
+                r._parallel(CloudDouble("test/model", respond), [("good", "good"), ("bad", "bad")])
+            records = [json.loads(p.read_text()) for p in (Path(temp) / "responses").glob("*.json")]
+            self.assertEqual({p["task_id"]: p["status"] for p in records}, {"good": "received", "bad": "in_flight"})
+
+    def test_review_responses_are_archived_but_never_replayed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            r = seeded()
+            r.journal = RunJournal(temp)
+            verifier = CloudDouble()
+            first = r.execute_phase6(verifier, CloudDouble("test/deep"), CloudDouble("test/author"),
+                                     CloudDouble("test/global", lambda _: global_verdict(r)))
+            self.assertFalse(first["blocked"], first)
+            restored = load_checkpoint(Path(temp) / "checkpoint.json")
+            restored.journal = RunJournal(temp)
+            second = restored.execute_phase6(verifier, CloudDouble("test/deep"), CloudDouble("test/author"),
+                                            CloudDouble("test/global", lambda _: global_verdict(restored)))
+            self.assertFalse(second["blocked"], second)
+            self.assertEqual(len(verifier.calls), 2 * len(r.run.claims))
+
+    def test_disk_failure_stops_before_cloud_work(self):
+        r = seeded()
+        r.journal = RunJournal("unused-output")
+        client = CloudDouble("test/model", lambda _: dict(ok=True))
+        with patch("v4.journal.write_json", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                r._complete(client, "task", "prompt")
+        self.assertEqual(client.calls, [])
+
+    def test_request_identity_changes_prevent_role_output_reuse(self):
+        with tempfile.TemporaryDirectory() as temp:
+            r = seeded()
+            r.journal = RunJournal(temp)
+            one = CloudDouble("test/one", lambda _: dict(value=1))
+            two = CloudDouble("test/two", lambda _: dict(value=2))
+            r._complete(one, "author", "original", reuse_role_output=True)
+            r._complete(one, "author", "original", reuse_role_output=True)
+            r._complete(one, "author", "changed context", reuse_role_output=True)
+            r._complete(two, "author", "original", reuse_role_output=True)
+            self.assertEqual((len(one.calls), len(two.calls)), (2, 1))
+
+
+if __name__ == "__main__":
+    unittest.main()
