@@ -265,3 +265,10 @@ V4 208 項、V3 基準 24 項通過；git diff --check 通過，獨立審查未�
 已確認的兩項共用缺陷信心高；目前 VM 耗盡的直接原因仍未確認。影響所有使用共同 JSON 回覆／對話續接流程的 V4 階段，不修改 V3／main，不增加權限、重試額度或 API fallback（備援轉接）。更新後重啟驅動程序，保留完整輸出目錄並先一般續跑；已有完整外框結果可直接恢復，勿先丟棄 session。沒有完整結果的供應商失敗仍可能耗盡。
 
 回滾可撤回本次提交並重啟；先備份輸出。舊版會再拒絕外包程式碼框的完整 JSON，原始事件不受修改。
+
+
+### 補充：此次 VM 的額度與錯誤已回覆
+
+使用者後續提供 continuations_used=2、max_continuations=2、elapsed_seconds=1220、budget_seconds=2700、exhausted_by=["continuations"]、last_session_error=result_failed。可確認當下是續接次數上限，並非 2700 秒總時間耗盡；不能由此推論先前回合完全沒有逾時。
+
+依 agy_session.py，result_failed 來自 agy 的 error_message 步驟事件，或 terminal result 的 status 不是 SUCCESS；不是原子 Claim 語義驗收失敗的代碼，也不保證已有可解析答案。此次 JSON 外框／續接指令修復不能直接解釋該錯誤。仍需最後失敗事件的 status／error 或 error_message 內容，判斷 agy 底層失敗原因；不為此盲目提高次數或自動放棄原對話。
