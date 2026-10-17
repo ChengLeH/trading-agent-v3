@@ -134,7 +134,9 @@ else:
     def test_pre_init_timeout_can_retry_without_resending_a_paid_turn(self):
         with tempfile.TemporaryDirectory() as temp, cli_stub('time.sleep(10)') as stalled:
             with patch("v4.agy_session.os.write", wraps=__import__('os').write) as write, self.assertRaises(AntigravityError) as caught:
-                run_session(stalled, "model", "request", .2, session_dir=temp)
+                # The initial timeout also sets the persisted total budget;
+                # leave room for real subprocess startup on the next attempt.
+                run_session(stalled, "model", "request", 1, session_dir=temp)
             self.assertEqual(caught.exception.code, "missing_init")
             self.assertTrue(caught.exception.retryable)
             write.assert_not_called()

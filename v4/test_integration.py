@@ -165,16 +165,22 @@ class Integration(unittest.TestCase):
         r.prepare_phase6_global_sweep()
         r.collect_phase6_global_sweep(global_verdict(r), model_identity="test/global")
         completed = r.finalize()
-        with tempfile.TemporaryDirectory() as temp:
+        # Storage failures must be testable without an installed cloud CLI.
+        with tempfile.TemporaryDirectory() as temp, \
+             patch("v4.cloud.shutil.which", return_value=None), \
+             patch("v4.__main__.AntigravityCloudClient",
+                   side_effect=lambda model, **kwargs: CloudDouble("test/" + model)):
             args = ["--resume", "unused.json", "--out", temp, "--author-model", "author",
                     "--verifier-model", "first", "--deep-model", "second", "--global-model", "global"]
             with patch("v4.__main__.load_checkpoint", return_value=r), \
                  patch.object(r, "execute_phase6", return_value=completed), \
-                 patch("v4.journal.save_checkpoint", side_effect=OSError("checkpoint unavailable")), \
+                 patch("v4.journal.save_checkpoint", side_effect=OSError("checkpoint unavailable")) as checkpoint_write, \
                  contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(main(args), 2)
+                checkpoint_write.assert_called_once_with(r, Path(temp) / "checkpoint.json")
             saved = json.loads((Path(temp) / "result.json").read_text())
             self.assertEqual(saved["status"], "blocked:checkpoint")
+            self.assertIn("checkpoint unavailable", saved["reason"])
             self.assertNotIn("report_markdown", saved)
             stdout = io.StringIO()
             with patch("v4.__main__.load_checkpoint", side_effect=ValueError("input invalid")), \
