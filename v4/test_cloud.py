@@ -23,7 +23,8 @@ import json, os, sys, time
 from pathlib import Path
 def emit(value):
     print(json.dumps(value), flush=True)
-def init(tools=None, agent="v4-evidence-only", cwd=None, model=None):
+def init(tools=None, agent=None, cwd=None, model=None):
+    agent = sys.argv[sys.argv.index("--agent") + 1] if agent is None else agent
     emit(dict(event="init", init=dict(agent=agent, tools=[] if tools is None else tools,
                                      cwd=str(Path.cwd()) if cwd is None else cwd,
                                      model=sys.argv[sys.argv.index("--model") + 1] if model is None else model)))
@@ -137,7 +138,7 @@ class Transport(unittest.TestCase):
             self.assertEqual(client.complete("claim context"), dict(ok=True))
             self.assertEqual(run.call_args.args[:2], ("/existing/bin/agy", "selected-model"))
             self.assertEqual(client.calls, [dict(transport="antigravity", requested_model="antigravity/selected-model",
-                                                served_model=None, agent=AGENT_NAME, tools_verified=True)])
+                                                served_model=None, agent_profile=AGENT_NAME, agent_policy_verified=True)])
 
     def test_missing_cli_never_falls_back(self):
         with patch("v4.cloud.shutil.which", return_value=None), patch("v4.cloud.run_session") as run:
@@ -160,17 +161,47 @@ class ToolFreeSession(unittest.TestCase):
         with cli_stub('init()\nassert sys.stdin.read() == ""\n') as executable, \
              patch("v4.agy_session.os.write", wraps=os.write) as write:
             result = AntigravityCloudClient("model", executable=executable).check_capabilities()
-            self.assertEqual(result, dict(agent=AGENT_NAME, tools=[], tools_verified=True, user_prompt_sent=False))
+            self.assertTrue(result["agent"].startswith(AGENT_NAME + "-"))
+            self.assertEqual(result["declared_tools"], [])
+            self.assertTrue(result["agent_policy_verified"])
+            self.assertFalse(result["user_prompt_sent"])
+            template = Path(__file__).with_name("evidence_agent.md").read_bytes()
+            self.assertEqual(result["agent_template_sha256"], hashlib.sha256(template).hexdigest())
+            self.assertNotEqual(result["agent_policy_sha256"], result["agent_template_sha256"])
+            self.assertEqual(len(result["agent_policy_sha256"]), 64)
             write.assert_not_called()
+
+    def test_advertised_global_tools_do_not_reject_selected_agent(self):
+        with cli_stub('init(["run_command", "write_to_file"])\nsys.stdin.readline()\nresult()\n') as executable:
+            self.assertEqual(run_session(executable, "model", "evidence", 2), "{}")
+        with cli_stub('init(["run_command"])\nassert sys.stdin.read() == ""\n') as executable:
+            self.assertEqual(run_session(executable, "model", None, 2)["advertised_tool_count"], 1)
+
+    def test_invalid_agent_policy_blocks_before_process_start(self):
+        from .agy_session import load_agent_profile
+        content, _ = load_agent_profile()
+        for before, after in (('"tools": []', '"tools": ["run_command"]'),
+                              ('"inheritCustomizations": false', '"inheritCustomizations": true'),
+                              ('"excludeDefaultComponents": true', '"excludeDefaultComponents": false'),
+                              ('"commandExecutionPolicy": "off"', '"commandExecutionPolicy": "auto"')):
+            with self.subTest(setting=before), patch("v4.agy_session.Path.read_text", return_value=content.replace(before, after)), \
+                 patch("v4.agy_session.subprocess.Popen") as start:
+                with self.assertRaises(AntigravityError) as caught:
+                    run_session("agy", "model", "evidence", 2)
+                self.assertEqual(caught.exception.code, "tool_policy_unverified")
+                start.assert_not_called()
 
     def test_179kb_prompt_and_schema_reach_stdin_after_preflight(self):
         prompt = "資料\n" * 27000
         body = '''
 import hashlib, select
 assert not select.select([sys.stdin], [], [], 0.05)[0], "prompt arrived before init"
-profile = Path(".agents/agents/v4-evidence-only/agent.md").read_text()
-for setting in ("tools: []", "excludeDefaultComponents: true", "inheritCustomizations: false"):
-    assert setting in profile
+name = sys.argv[sys.argv.index("--agent") + 1]
+assert sys.argv[sys.argv.index("--add-dir") + 1] == str(Path.cwd())
+profile = Path(".agents/agents") / name / "agent.md"
+config = json.loads(profile.read_text().split("---", 2)[1])
+assert config["name"] == name and config["tools"] == []
+assert config["excludeDefaultComponents"] is True and config["inheritCustomizations"] is False
 init()
 request = json.loads(sys.stdin.readline())
 assert sys.stdin.read() == ""
@@ -193,8 +224,8 @@ result(json.dumps(dict(size=len(data), sha256=hashlib.sha256(data).hexdigest(), 
         self.assertEqual(result["schema"], SEMANTIC_REVIEW_SCHEMA)
         self.assertEqual(result["proxy"], "http://egress.invalid:3128")
 
-    def test_tools_or_wrong_agent_or_workspace_never_receive_prompt_bytes(self):
-        for init_code in ('init(["run_command"])', 'init(agent="other")', 'init(cwd="/elsewhere")',
+    def test_wrong_agent_or_workspace_never_receive_prompt_bytes(self):
+        for init_code in ('init(agent="other")', 'init(cwd="/elsewhere")',
                           'emit(dict(event="init", init=dict(agent="v4-evidence-only", cwd=str(Path.cwd()))))'):
             with self.subTest(init_code=init_code), cli_stub(init_code + '\ntime.sleep(10)\n') as executable, \
                  patch("v4.agy_session.os.write", wraps=os.write) as write:
@@ -216,7 +247,7 @@ result(json.dumps(dict(size=len(data), sha256=hashlib.sha256(data).hexdigest(), 
 
     def test_missing_or_wrong_model_blocks_before_sending_prompt(self):
         for init_code in ('init(model="wrong-model")',
-                          'emit(dict(event="init", init=dict(agent="v4-evidence-only", tools=[], cwd=str(Path.cwd()))))'):
+                          'emit(dict(event="init", init=dict(agent=sys.argv[sys.argv.index("--agent") + 1], tools=[], cwd=str(Path.cwd()))))'):
             with self.subTest(init_code=init_code), cli_stub(init_code + '\ntime.sleep(10)\n') as executable, \
                  patch("v4.agy_session.os.write", wraps=os.write) as write:
                 with self.assertRaises(AntigravityError) as caught:

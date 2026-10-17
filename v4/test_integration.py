@@ -112,7 +112,7 @@ class Integration(unittest.TestCase):
         for blocked in (False, True):
             with self.subTest(blocked=blocked), tempfile.TemporaryDirectory() as temp:
                 client = CloudDouble("test/shared")
-                client.check_capabilities = lambda: dict(tools_verified=True, tools=[], user_prompt_sent=False)
+                client.check_capabilities = lambda: dict(agent_policy_verified=True, declared_tools=[], advertised_tool_count=60, user_prompt_sent=False)
                 if blocked:
                     def failed_check():
                         raise AntigravityError("tool_policy_unverified")

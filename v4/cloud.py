@@ -40,7 +40,7 @@ class AntigravityCloudClient:
         return self.complete(prompt, response_schema=response_schema)
 
     def check_capabilities(self):
-        """Start CLI and check tools without sending any prompt or model turn."""
+        """Start CLI and check agent binding without sending any prompt or model turn."""
         return run_session(self.executable, self.model, None, self.timeout)
 
     def complete(self, prompt, *, response_schema=None):
@@ -73,7 +73,7 @@ class AntigravityCloudClient:
             raise AntigravityError("invalid_json") from None
         with self._lock:
             self.calls.append(dict(transport="antigravity", requested_model=self.identity, served_model=None,
-                                   agent=AGENT_NAME, tools_verified=True))
+                                   agent_profile=AGENT_NAME, agent_policy_verified=True))
         return parsed
 
     def _generate(self, prompt, *, response_schema=None):
