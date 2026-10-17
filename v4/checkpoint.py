@@ -18,6 +18,7 @@ def save_checkpoint(runner, path):
                           contract_attempts=runner._contract_attempts,
                           records=[dict(kind=type(r).__name__, value=asdict(r)) for r in runner.run.records],
                           revision_round=runner.revision_round, history=runner.history,
+                          pending_patch=runner.pending_patch,
                           deferred_global_findings=runner.deferred_global_findings,
                           max_revisions=runner.max_revisions, max_workers=runner.max_workers,
                           review_batch_size=runner.review_batch_size, review_batch_max_bytes=runner.review_batch_max_bytes,
@@ -74,8 +75,41 @@ def load_checkpoint(path, *, continue_verification=True):
         raise ValueError("duplicate deferred finding_id")
     from .semantic_contracts import validate_revision_history
     validate_revision_history(run.claims, r.history)
+    pending = data.get("pending_patch")
+    if pending is not None:
+        from .schema import id_list, claim_index
+        try:
+            if not isinstance(pending, dict) or set(pending) != {"input_hash", "ids", "findings"}:
+                raise ValueError("invalid fields")
+            ids = id_list(pending["ids"], "pending repair IDs")
+            findings = pending["findings"]
+            if (not ids or set(ids) - claim_index(run.claims).keys()
+                    or pending["input_hash"] != r._hash()
+                    or not isinstance(findings, list) or not findings):
+                raise ValueError("stale state or empty repairs")
+            mapped = set()
+            for finding in findings:
+                if (not isinstance(finding, dict) or not isinstance(finding.get("issue"), str)
+                        or not finding["issue"].strip() or finding.get("routing_unresolved")):
+                    raise ValueError("invalid finding")
+                if "claim_ids" in finding:
+                    id_list(finding["claim_ids"], "pending finding IDs")
+                if "claim_id" in finding and (not isinstance(finding["claim_id"], str) or not finding["claim_id"].strip()):
+                    raise ValueError("invalid finding ID")
+                targets = r._finding_claim_ids(finding)
+                if not targets:
+                    raise ValueError("unmapped finding")
+                mapped.update(targets)
+            if mapped != set(ids):
+                raise ValueError("finding targets differ from allowed IDs")
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ValueError(f"invalid pending claim repair: {exc}") from exc
+        r.pending_patch = pending
+    elif data.get("status") in {"blocked:revision_no_changes", "blocked:pending_revision"}:
+        raise ValueError("missing pending claim repair for blocked revision")
     # Never restore serialized receipts. Same-execution continuation replays
     # exact request archives through all semantic-contract validators. A changed
     # canonical ancestor, source, schema, model or policy gets a different key.
-    r.status = run.stage = "resumed:requires_verification"
+    r.status = run.stage = (data["status"] if r.pending_patch and data.get("status") == "blocked:revision_no_changes"
+                           else "blocked:pending_revision" if r.pending_patch else "resumed:requires_verification")
     return r

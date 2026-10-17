@@ -106,7 +106,7 @@ class PipelineRunnerV4:
 
     def _blocked(self, exc, status):
         details = exc.details() if isinstance(exc, AntigravityError) else {}
-        self.status = "blocked:cloud_policy" if details and not details["retryable"] else status
+        self.status = exc.blocked_status(status) if isinstance(exc, AntigravityError) else status
         return dict(blocked=True, reason=f"{type(exc).__name__}: {exc}", status=self.status, **details)
 
     @property
@@ -469,12 +469,34 @@ class PipelineRunnerV4:
             '回傳 JSON array，每項至少 claim_id 加必要更改的欄位。所有未改欄位保留。'
             '修正內容必須符合 V4 Claim schema，並更新 assertion/bindings/dependencies。',
             dict(findings=findings, tasks=[tasks[cid].review_dict() for cid in wanted]))
+        self._persist()
         return dict(needs_linking=False, revision_prompts=[("claim_patcher", prompt)], allowed_claim_ids=wanted)
+
+    def _pending_revision_block(self):
+        """Keep manual or restored repair requests pending without paid retries."""
+        if self.pending_patch is None:
+            return None
+        if self.pending_patch["input_hash"] != self._hash():
+            raise ValueError("stale pending claim repairs")
+        if self.status != "blocked:revision_no_changes":
+            self.status = "blocked:pending_revision"
+        return dict(blocked=True, status=self.status, reason="pending claim repairs require explicit patches",
+                    findings=deepcopy(self.pending_patch["findings"]),
+                    allowed_claim_ids=list(self.pending_patch["ids"]))
 
     def collect_phase6_revision(self, patches):
         pending = self.pending_patch
         if not pending or pending["input_hash"] != self._hash():
             raise ValueError("stale or unprepared claim patch")
+        if isinstance(patches, list) and not patches:
+            # An empty model response leaves the requested repairs unresolved.
+            # Preserve the pending evidence and existing receipts; no mutation,
+            # revision round, history entry, or new verification occurred.
+            self.status = "blocked:revision_no_changes"
+            self._persist()
+            return dict(blocked=True, status=self.status, reason="claim patcher returned no changes",
+                        findings=deepcopy(pending["findings"]),
+                        allowed_claim_ids=list(pending["ids"]))
         before = {c["claim_id"]: deepcopy(c) for c in self.run.claims if c["claim_id"] in pending["ids"]}
         affected = self.orch.patch(self.run_id, patches, pending["ids"])
         changed_ids = {p["claim_id"] for p in patches}
@@ -501,6 +523,8 @@ class PipelineRunnerV4:
     def _ready_for_global(self):
         self._require_complete_roles()
         self._require_atomic()
+        if self.pending_patch:
+            raise ValueError("pending claim repairs must be resolved before global sweep or delivery")
         if self._review_findings():
             raise ValueError("outstanding semantic findings")
         findings, blocked = self.orch.validate_stage(self.run_id, "final")
@@ -668,6 +692,9 @@ class PipelineRunnerV4:
                 raise ValueError("V4 requires explicit cloud client identities")
             require_model_identity(client.identity)
         try:
+            pending_revision = self._pending_revision_block()
+            if pending_revision:
+                return pending_revision
             self._require_complete_roles()
             while True:
                 prepared = self.prepare_phase6_atomic()
@@ -702,7 +729,9 @@ class PipelineRunnerV4:
                             return revision
                         # Apply only explicit LLM-authored graph metadata, never
                         # derive semantic edges from text or rewrite conclusions.
-                        self.collect_phase6_revision(result["dependency_patches"])
+                        patched = self.collect_phase6_revision(result["dependency_patches"])
+                        if patched.get("blocked"):
+                            return patched
                         continue
                     findings = result["findings"]
                     if not findings:
@@ -717,7 +746,9 @@ class PipelineRunnerV4:
                 if revision.get("blocked"):
                     return revision
                 patches = self._complete(patcher, *revision["revision_prompts"][0])
-                self.collect_phase6_revision(patches)
+                patched = self.collect_phase6_revision(patches)
+                if patched.get("blocked"):
+                    return patched
         except Exception as exc:
             return self._blocked(exc, "blocked:execution")
 
@@ -738,6 +769,9 @@ class PipelineRunnerV4:
             raise ValueError("role author must be an explicit cloud client")
         require_model_identity(author.identity)
         try:
+            pending_revision = self._pending_revision_block()
+            if pending_revision:
+                return pending_revision
             groups = (PHASE_2_ROLES, PHASE_3_ROLES, ("research_manager",), ("trader",), ("risk_manager",))
             completed = {c["author_role"] for c in self.run.claims}
             for pos, roles in enumerate(groups):

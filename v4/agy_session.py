@@ -12,6 +12,7 @@ import time
 from uuid import uuid4, UUID
 from .session_state import SessionState
 from .storage import write_json
+from .session_replay import abandon_session  # public, explicitly authorized escape hatch
 
 AGENT_NAME = "v4-evidence-only"
 _RESULT_DRAIN_SECONDS = 0.25  # bounded trailing-protocol validation, never model time
@@ -48,6 +49,12 @@ class AntigravityError(RuntimeError):
         return result
 
 
+    def blocked_status(self, default):
+        return {"invalid_json": "blocked:response_format", "session_pending": "blocked:session_pending",
+                "continuation_exhausted": "blocked:session_exhausted"}.get(
+                    self.code, "blocked:cloud_policy" if not self.retryable else default)
+
+
 def permission_denied(diagnostic):
     # Match a CLI protocol diagnostic, never claim/finding/source prose.
     return b"permission that headless mode cannot prompt for" in diagnostic.lower()
@@ -72,7 +79,9 @@ def load_agent_profile():
     return content, hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def run_session(executable, model, prompt, timeout, response_schema=None, *, session_dir=None, resume=False):
+def run_session(executable, model, prompt, timeout, response_schema=None, *, session_dir=None, resume=False, require_json=False, repair_json=False):
+    if (require_json or repair_json) and (session_dir is None or prompt is None):
+        raise ValueError("persistent session_dir and prompt required for JSON validation or correction")
     if session_dir is None or prompt is None:
         return _run_session(executable, model, prompt, timeout, response_schema)
     _, template_hash = load_agent_profile()
@@ -80,9 +89,26 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
     try:
         with store.lock():
             state = store.data
-            store.recover_terminal()
+            require_json = require_json or state.get("json_required", False)
+            if require_json and not state.get("json_required"):
+                store.save(json_required=True)
+            store.recover_terminal(require_json=require_json)
             if state["status"] == "complete":
-                return state["response"]
+                if not require_json or not store.reject_invalid_json(state["response"]):
+                    return state["response"]
+            if state.get("last_error") == "invalid_json":
+                if not repair_json and not resume:
+                    raise AntigravityError("invalid_json", retryable=True, conversation_id=state.get("conversation_id"))
+                repair_json = True
+            if repair_json and not state["request_sent"]:
+                raise AntigravityError("conversation_unverified")
+            legacy_step = store.interrupted_application_step()
+            if legacy_step and permission_denied(json.dumps(legacy_step).encode()):
+                raise AntigravityError("permission_denied", conversation_id=state.get("conversation_id"))
+            if (not state["request_sent"] and state.get("last_error") in
+                    {"invalid_stream", "tool_policy_unverified", "workspace_unverified", "model_unverified",
+                     "unexpected_tool_use", "permission_denied", "unexpected_result", "unexpected_error"}):
+                raise AntigravityError(state["last_error"])
             previous_pid = state.get("process_id")
             if previous_pid is not None:
                 if type(previous_pid) is not int or previous_pid <= 0:
@@ -103,9 +129,9 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
                     raise AntigravityError("delivery_unconfirmed", conversation_id=cid)
                 if not resume:
                     raise AntigravityError("session_pending", conversation_id=cid)
-                if (state.get("last_error") not in {"timeout", "empty_response", "cli_exit", "cli_io_failed", "result_failed"}
+                if (state.get("last_error") not in {"timeout", "empty_response", "cli_exit", "cli_io_failed", "result_failed", "invalid_json"}
                         and not (state.get("last_error") is None and state.get("status") == "in_flight")
-                        and not store.interrupted_system_step()):
+                        and not legacy_step):
                     raise AntigravityError("conversation_unverified", conversation_id=cid)
                 if not cid:
                     raise AntigravityError("conversation_unverified")
@@ -120,10 +146,10 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
             prior_elapsed = state["elapsed_seconds"]
             # Reserve the full allowance before spawn: a hard crash cannot
             # reset the cross-process budget. Normal completion refunds unused time.
-            store.save(active_attempt_id=uuid4().hex, last_error=None,
+            store.save(active_attempt_id=uuid4().hex,
                        elapsed_seconds=prior_elapsed + min(timeout, remaining))
             try:
-                return _run_session(executable, model, prompt, min(timeout, remaining), response_schema, store=store)
+                return _run_session(executable, model, prompt, min(timeout, remaining), response_schema, store=store, require_json=require_json, repair_json=repair_json)
             except AntigravityError as exc:
                 sent = store.data["request_sent"]
                 store.save(status="paused" if sent else "failed", last_error=exc.code)
@@ -140,7 +166,7 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
         raise AntigravityError("session_binding_changed") from None
 
 
-def _run_session(executable, model, prompt, timeout, response_schema=None, *, store=None):
+def _run_session(executable, model, prompt, timeout, response_schema=None, *, store=None, require_json=False, repair_json=False):
     """No prompt bytes leave stdin until init binds the controlled agent/model/cwd.
 
     prompt=None performs a startup check only, without any user turn.
@@ -232,13 +258,16 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                 if prompt is None:
                     process.stdin.close()
                     return
-                content = ("接續同一對話中尚未完成的上一個驗證任務，使用已有來源與推理進度。"
+                content = ("上一輪回覆不是合法 JSON。請依同一對話中的原任務、證據及回覆規格，重新完整輸出單一合法 JSON。"
+                           "不得重送原始任務、重新搜尋、增刪必要欄位、用預設空陣列取代逐引用語義驗證。"
+                           "保留原任務要求的物件或陣列形式；不要 Markdown、code fence 或任何前後說明。"
+                           if repair_json else ("接續同一對話中尚未完成的上一個驗證任務，使用已有來源與推理進度。"
                            "不要重新搜尋或從頭分析，也不要重複輸出先前物件；請完成並回傳符合原契約的單一最終 JSON。"
-                           if resuming else prompt)
+                           if resuming else prompt))
                 if store:
                     # Persist the uncertain delivery boundary before any bytes:
                     # after a crash it is unsafe to assume nothing was sent.
-                    store.save(request_sent=True, turn_acknowledged=False, status="in_flight",
+                    store.save(request_sent=True, request_written=False, turn_acknowledged=False, status="in_flight", last_error=None,
                                continuations=store.data["continuations"] + int(resuming))
                 request = (json.dumps(dict(event="user", message=dict(role="user", content=content)),
                                       ensure_ascii=False) + "\n").encode("utf-8")
@@ -252,6 +281,13 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                 if step.get("step_type") in ("tool", "subagent") or any(
                         key in step for key in ("tool_name", "tool_info", "subagent_info")):
                     raise AntigravityError("unexpected_tool_use")
+                if step.get("step_type") == "error_message":
+                    if permission_denied(json.dumps(step).encode()):
+                        raise AntigravityError("permission_denied")
+                    # A typed application error is not stream corruption. The
+                    # wrapper pauses this turn; only explicit, bounded same-CID
+                    # continuation is allowed, not an automatic fresh request.
+                    raise AntigravityError("result_failed", retryable=True)
                 if store and step.get("step_type") == "user_input" and step.get("state") == "DONE":
                     store.save(turn_acknowledged=True)
                 if step.get("step_type") not in ("user_input", "agent_response", "checkpoint") and not (resuming and step.get("step_type") == "system_message"):
@@ -295,6 +331,8 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                         count = os.write(key.fd, request[offset:offset + 65536])
                         offset += count
                         if offset == len(request):
+                            if store:
+                                store.save(request_written=True)
                             selector.unregister(key.fileobj)
                             process.stdin.close()
                         continue
@@ -337,7 +375,9 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
             if store:
                 if not terminal["response"].strip():
                     raise AntigravityError("empty_response")
-                store.save(status="complete", response=terminal["response"], last_error=None,
+                if require_json and store.reject_invalid_json(terminal["response"]):
+                    raise AntigravityError("invalid_json", retryable=True, conversation_id=store.data.get("conversation_id"))
+                store.save(status="complete", response=terminal["response"], last_error=None, turn_acknowledged=True,
                            result_to_completion_seconds=round(time.monotonic() - (terminal_deadline - _RESULT_DRAIN_SECONDS), 3))
             return terminal["response"]
         except (BrokenPipeError, OSError):

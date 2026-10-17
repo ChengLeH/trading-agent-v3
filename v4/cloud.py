@@ -8,6 +8,9 @@ import shutil
 import threading
 from time import sleep
 from .agy_session import AGENT_NAME, AntigravityError, run_session
+from .session_replay import lifecycle_lock
+from .session_state import SessionState
+from .agy_session import load_agent_profile
 
 _STDIN_THRESHOLD = 64 * 1024  # UTF-8 bytes: long-prompt timeout
 
@@ -54,6 +57,15 @@ class AntigravityCloudClient:
         self.calls = []
         self._lock = threading.Lock()
 
+    def prepare_session(self, prompt, response_schema=None, *, session_dir):
+        """Persist an unsent request identity before a journal in-flight record."""
+        schema = None if response_schema is None else json.dumps(response_schema, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        wire = structured_prompt(prompt, schema)
+        store = SessionState(session_dir, self.model, wire, load_agent_profile()[1])
+        with store.lock():
+            if not store.data.get("json_required"):
+                store.save(json_required=True)
+
     def complete_in_session(self, prompt, response_schema=None, *, session_dir, resume=False):
         old = getattr(self._request_context, "value", None)
         self._request_context.value = (Path(session_dir), resume)
@@ -80,36 +92,51 @@ class AntigravityCloudClient:
 
     def complete(self, prompt, *, response_schema=None):
         schema = None if response_schema is None else json.dumps(response_schema, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        text, last_error = None, AntigravityError("empty_response", retryable=True)
+        wire = structured_prompt(prompt, schema)
+        context = getattr(self._request_context, "value", None)
+        directory = context[0] if context else self._session_directory(wire)
+        try:
+            with lifecycle_lock(directory):
+                return self._complete_locked(prompt, response_schema=response_schema)
+        except BlockingIOError:
+            raise AntigravityError("session_busy") from None
+
+    def _complete_locked(self, prompt, *, response_schema=None):
+        schema = None if response_schema is None else json.dumps(response_schema, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        last_error, repair_json = AntigravityError("empty_response", retryable=True), False
         for attempt in range(3):
             try:
-                text = self._generate(prompt, response_schema=schema)
-                if text and text.strip():
-                    break
-                last_error = AntigravityError("empty_response", retryable=True)
+                text = self._generate(prompt, response_schema=schema, repair_json=repair_json)
+                if not text or not text.strip():
+                    raise AntigravityError("empty_response", retryable=True)
+                try:
+                    parsed = json.loads(text)
+                except (ValueError, TypeError):
+                    raise AntigravityError("invalid_json", retryable=True) from None
+                break
             except AntigravityError as exc:
                 if not exc.retryable:
-                    raise AntigravityError(exc.code, exit_code=exc.exit_code, attempts=attempt + 1, conversation_id=exc.conversation_id) from None
+                    raise AntigravityError(exc.code, exit_code=exc.exit_code, attempts=attempt + 1,
+                                           conversation_id=exc.conversation_id) from None
                 last_error = exc
+                if exc.code == "invalid_json":
+                    repair_json = True  # same-CID correction, never a fresh prompt
+                    continue
             except Exception:
-                # Unexpected exception text may contain request/account data.
                 raise AntigravityError("unexpected_error") from None
-            text = None
             if attempt < 2:
                 sleep(15)
-        if text is None:
-            raise AntigravityError(last_error.code, retryable=last_error.retryable,
-                                   exit_code=last_error.exit_code, attempts=3) from None
-        try:
-            parsed = json.loads(text)
-        except (ValueError, TypeError):
-            raise AntigravityError("invalid_json") from None
+        else:
+            raise AntigravityError(last_error.code,
+                                   retryable=last_error.retryable and last_error.code != "invalid_json",
+                                   exit_code=last_error.exit_code, attempts=3,
+                                   conversation_id=last_error.conversation_id) from None
         with self._lock:
             self.calls.append(dict(transport="antigravity", requested_model=self.identity, served_model=None,
                                    agent_profile=AGENT_NAME, agent_policy_verified=True))
         return parsed
 
-    def _generate(self, prompt, *, response_schema=None):
+    def _generate(self, prompt, *, response_schema=None, repair_json=False):
         # Every size uses stdin so init can be checked before sending evidence.
         # agy native --json-schema produced repeated responses/multiple turns
         # without structured_output in the real stdin test. Keep the contract
@@ -119,4 +146,4 @@ class AntigravityCloudClient:
         context = getattr(self._request_context, "value", None)
         directory, resume = context or (self._session_directory(wire_prompt), False)
         return run_session(self.executable, self.model, wire_prompt, timeout, None,
-                           session_dir=directory, resume=resume)
+                           session_dir=directory, resume=resume or repair_json, require_json=True, repair_json=repair_json)

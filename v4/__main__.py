@@ -68,7 +68,7 @@ def main(argv=None):
             result = runner.execute(manifest["subject"]["ticker"], manifest, clients["author"], clients["verifier"], clients["deep"], clients["global"])
     except Exception as exc:
         details = exc.details() if isinstance(exc, AntigravityError) else {}
-        result = dict(blocked=True, status="blocked:cloud_policy" if details and not details["retryable"] else "blocked:input",
+        result = dict(blocked=True, status=exc.blocked_status("blocked:input") if isinstance(exc, AntigravityError) else "blocked:input",
                       reason=f"{type(exc).__name__}: {exc}", **details)
     if args.check_transport:
         result.update(capability_check=True, user_prompt_sent=False)

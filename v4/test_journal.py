@@ -51,23 +51,20 @@ class Journal(unittest.TestCase):
             self.assertEqual(len(client.calls), 2)
             self.assertEqual(len(list((Path(temp) / "responses/archive").glob("*.json"))), 2)
 
-    def test_invalid_json_failure_requires_explicit_role_retry_after_reload(self):
-        from .agy_session import AntigravityError
+    def test_invalid_json_correction_and_success_replay_preserve_journal_session(self):
         from .cloud import AntigravityCloudClient
         r = seeded()
         with tempfile.TemporaryDirectory() as temp, patch("v4.cloud.shutil.which", return_value="/test/agy"), \
              patch("v4.cloud.run_session", side_effect=["not JSON", '{"ok":true}']) as run:
             r.journal = RunJournal(temp)
             client = AntigravityCloudClient("model")
-            with self.assertRaisesRegex(AntigravityError, "invalid_json"):
-                r._complete(client, "bull", "prompt", reuse_role_output=True)
+            self.assertEqual(r._complete(client,"bull","prompt",reuse_role_output=True),dict(ok=True))
+            self.assertEqual(run.call_count,2)
+            self.assertEqual(run.call_args_list[0].kwargs['session_dir'],run.call_args_list[1].kwargs['session_dir'])
+            self.assertTrue(run.call_args_list[1].kwargs['repair_json'])
             r.journal = RunJournal(temp)
-            with self.assertRaisesRegex(AntigravityError, "invalid_json"):
-                r._complete(client, "bull", "prompt", reuse_role_output=True)
-            self.assertEqual(run.call_count, 1)
-            r.journal.retry_roles.add("bull")
-            self.assertEqual(r._complete(client, "bull", "prompt", reuse_role_output=True), dict(ok=True))
-            self.assertEqual(run.call_count, 2)
+            self.assertEqual(r._complete(client,"bull","prompt",reuse_role_output=True),dict(ok=True))
+            self.assertEqual(run.call_count,2)
 
     def test_structured_schema_changes_journal_identity_and_is_forwarded(self):
         class StructuredDouble(CloudDouble):
@@ -192,7 +189,9 @@ with patch("v4.__main__.AntigravityCloudClient", side_effect=lambda model, **kwa
         r.run.trade = {}
         r.orch._sync_views(r.run)
         before = copy.deepcopy(r.orch.snapshot(r.run_id))
-        r.journal = RunJournal("unused-output")
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        r.journal = RunJournal(temp.name)
         c = claim("new.trader")
         c.update(author_role="trader", assertion=dict(kind="trade_plan", trade=dict(direction="WAIT")))
         with patch.object(r.journal, "checkpoint", side_effect=OSError("disk full")), self.assertRaises(OSError):
@@ -311,12 +310,30 @@ time.sleep(10)
 
     def test_disk_failure_stops_before_cloud_work(self):
         r = seeded()
-        r.journal = RunJournal("unused-output")
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        r.journal = RunJournal(temp.name)
         client = CloudDouble("test/model", lambda _: dict(ok=True))
         with patch("v4.journal.write_json", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 r._complete(client, "task", "prompt")
         self.assertEqual(client.calls, [])
+
+    def test_crash_after_inflight_before_spawn_remains_provably_unsent(self):
+        from .cloud import AntigravityCloudClient
+        from .test_cloud import cli_stub
+        with tempfile.TemporaryDirectory() as temp, cli_stub("init()\nsys.stdin.readline()\nresult('{\"ok\":true}')") as executable:
+            r = seeded()
+            r.journal = RunJournal(temp)
+            client = AntigravityCloudClient("model", executable=executable, timeout=3)
+            with patch("v4.journal.request_completion", side_effect=SystemExit("crash before spawn")):
+                with self.assertRaises(SystemExit):
+                    r._complete(client, "bull", "original request", reuse_role_output=True)
+            state = json.loads(next((Path(temp) / "sessions").glob("*/session.json")).read_text())
+            self.assertFalse(state["request_sent"])
+            r.journal = RunJournal(temp)
+            self.assertEqual(r._complete(client, "bull", "original request", reuse_role_output=True), dict(ok=True))
+            self.assertEqual(len(client.calls), 1)
 
     def test_request_identity_changes_prevent_role_output_reuse(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -8,6 +8,7 @@ from .checkpoint import save_checkpoint, write_json
 from .schema import digest
 from .cloud import request_completion
 from .agy_session import AntigravityError
+from .session_replay import replay_marker, lifecycle_lock
 
 
 class RunJournal:
@@ -52,6 +53,11 @@ class RunJournal:
                 attempt = saved.get("attempt_id")
                 if not isinstance(attempt, str) or UUID(attempt).hex != attempt:
                     raise ValueError("invalid saved response attempt_id")
+                origin = Path(saved.get("session_directory", directory / "sessions" / digest(metadata)))
+                authorization = replay_marker(origin) if can_use_session else None
+                if authorization and saved.get("replay_generation") != authorization["generation"]:
+                    session_directory = origin
+                    break  # explicit one-generation replay authorization
                 if saved.get("status") == "in_flight":
                     archive = directory / "responses" / "archive" / (attempt + ".json")
                     if not archive.exists():
@@ -72,20 +78,41 @@ class RunJournal:
                                                exit_code=saved.get("exit_code"), attempts=saved.get("attempts"),
                                                conversation_id=saved.get("conversation_id"))
                     origin = Path(saved.get("session_directory", directory / "sessions" / digest(metadata)))
-                    if can_use_session and (origin / "session.json").is_file() and failure.code in {"session_pending", "missing_init", "cli_start_failed"}:
+                    if can_use_session and (origin / "session.json").is_file() and failure.code in {"session_pending", "missing_init", "cli_start_failed", "invalid_stream", "invalid_json"}:
                         session_directory = origin
                         break
                     if not failure.retryable:
-                        raise failure
+                        # An operator may authorize a new generation after the
+                        # earlier snapshot. Recheck under the stable lock before
+                        # applying a failure belonging to the archived generation.
+                        with lifecycle_lock(origin):
+                            authorization = replay_marker(origin) if can_use_session else None
+                            if authorization and saved.get("replay_generation") != authorization["generation"]:
+                                session_directory = origin
+                                break
+                            raise failure
                     if failure.code != "cli_start_failed":
                         raise AntigravityError("delivery_unconfirmed")
                     break  # proven not sent: safe startup retry
                 raise ValueError("invalid saved response status")
+        try:
+            with lifecycle_lock(session_directory):
+                return self._request_locked(client, prompt, response_schema, explicit_resume, session_directory, metadata, relative)
+        except BlockingIOError:
+            raise AntigravityError("session_busy") from None
+
+    def _request_locked(self, client, prompt, response_schema, explicit_resume, session_directory, metadata, relative):
+        can_use_session = callable(getattr(client, "complete_in_session", None))
         # Fail before starting paid work if the output directory cannot be
         # written. An in-flight record never counts as a completed response.
         attempt = uuid4().hex
         started = time.monotonic()
-        timing = dict(started_at=datetime.now(timezone.utc).isoformat())
+        prepare = getattr(client, "prepare_session", None)
+        if callable(prepare):
+            prepare(prompt, response_schema, session_dir=session_directory)
+        authorization = replay_marker(session_directory) if can_use_session else None
+        timing = dict(started_at=datetime.now(timezone.utc).isoformat(),
+                      replay_generation=authorization["generation"] if authorization else None)
         write_json(self.directory / relative, {**metadata, **timing, "session_directory": str(session_directory.resolve()), "attempt_id": attempt, "status": "in_flight"})
         try:
             result = request_completion(client, prompt, response_schema, session_dir=session_directory, resume=explicit_resume)

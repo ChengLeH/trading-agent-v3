@@ -87,13 +87,15 @@ class Transport(unittest.TestCase):
             self.assertEqual(client.calls, [])
             self.assertEqual(self.sleep.call_count, 2)
 
-    def test_nonempty_invalid_json_does_not_retry(self):
+    def test_nonempty_invalid_json_requests_bounded_same_session_correction(self):
         with patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), \
              patch("v4.cloud.run_session", return_value="not JSON") as run:
             with self.assertRaisesRegex(AntigravityError, "invalid_json") as caught:
                 AntigravityCloudClient("model").complete("prompt")
             self.assertFalse(caught.exception.retryable)
-            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_count, 3)
+            self.assertEqual([item.kwargs['repair_json'] for item in run.call_args_list],[False,True,True])
+            self.assertEqual(len({str(item.kwargs['session_dir']) for item in run.call_args_list}),1)
             self.sleep.assert_not_called()
 
     def test_capability_preflight_keeps_short_deadline(self):

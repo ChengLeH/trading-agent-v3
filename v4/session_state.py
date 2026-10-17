@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 from uuid import uuid4
 from .storage import write_json
+from .session_replay import lifecycle_lock, recover_authorized_replay
 
 
 class SessionState:
@@ -22,51 +23,78 @@ class SessionState:
 
     @contextmanager
     def lock(self):
-        with (self.directory / "request.lock").open("a") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
-                if self.path.exists():
-                    self.data = json.loads(self.path.read_text())
-                    if not isinstance(self.data, dict):
-                        raise ValueError("invalid session state")
-                    if (type(self.data.get("continuations")) is not int or not 0 <= self.data["continuations"] <= 2
-                            or type(self.data.get("request_sent")) is not bool):
-                        raise ValueError("invalid session counters")
-                    for key in ("elapsed_seconds", "budget_seconds"):
-                        value = self.data.get(key, 0)
-                        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
-                            raise ValueError("invalid session budget")
-                    if any(self.data.get(k) != v for k, v in self.binding.items()):
-                        raise ValueError("session binding changed")
-                else:
-                    self.data = dict(**self.binding, agent_name="v4-evidence-only-" + uuid4().hex,
-                                     status="created", request_sent=False, continuations=0)
-                    self.save()
-                yield self
-            finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+        with lifecycle_lock(self.directory):
+            replay = recover_authorized_replay(self.directory, binding=self.binding)
+            self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with (self.directory / "request.lock").open("a") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    if self.path.exists():
+                        self.data = json.loads(self.path.read_text())
+                        if not isinstance(self.data, dict):
+                            raise ValueError("invalid session state")
+                        if (type(self.data.get("continuations")) is not int or not 0 <= self.data["continuations"] <= 2
+                                or type(self.data.get("request_sent")) is not bool):
+                            raise ValueError("invalid session counters")
+                        for key in ("turn_acknowledged", "request_written", "json_required"):
+                            if key in self.data and type(self.data[key]) is not bool:
+                                raise ValueError("invalid session delivery/format flags")
+                        for key in ("elapsed_seconds", "budget_seconds"):
+                            value = self.data.get(key, 0)
+                            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                                raise ValueError("invalid session budget")
+                        if any(self.data.get(k) != v for k, v in self.binding.items()):
+                            raise ValueError("session binding changed")
+                    else:
+                        self.data = dict(**self.binding, replay_generation=replay["generation"] if replay else None, agent_name="v4-evidence-only-" + uuid4().hex,
+                                         status="created", request_sent=False, continuations=0)
+                        self.save()
+                    yield self
+                finally:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
 
     def save(self, **changes):
         self.data.update(changes)
         write_json(self.path, self.data)
 
-    def interrupted_system_step(self):
+    def interrupted_application_step(self):
         # Compatibility for an older reader that stopped on the CLI's typed
         # conversation-restoration notice. Never permit an unknown/tool step.
         if self.data.get("last_error") != "invalid_stream":
             return False
         try:
             rows = [json.loads(line) for line in (self.directory / "events.jsonl").read_text().splitlines() if line.strip()]
+            if any(not isinstance(row, dict) for row in rows):
+                return None
+            rows = [row for row in rows if row.get("v4_attempt_id") == self.data.get("active_attempt_id")]
+            if any(row.get("event") not in ("init", "step_update") for row in rows):
+                return None
+            for row in rows:
+                item = row.get("step_update", {})
+                if (not isinstance(item, dict) or item.get("step_type") in ("tool", "subagent")
+                        or any(k in item for k in ("tool_name", "tool_info", "subagent_info"))):
+                    return None
             last = rows[-1]
             step = last.get("step_update", {})
-            return (last.get("v4_attempt_id") == self.data.get("active_attempt_id")
-                    and step.get("step_type") == "system_message"
-                    and not any(k in step for k in ("tool_name", "tool_info", "subagent_info")))
+            if (last.get("event") == "step_update" and last.get("v4_attempt_id") == self.data.get("active_attempt_id")
+                    and step.get("step_type") in ("system_message", "error_message")
+                    and not any(k in step for k in ("tool_name", "tool_info", "subagent_info"))):
+                return step
+            return None
         except (OSError, ValueError, IndexError, AttributeError):
             return False
 
-    def recover_terminal(self):
-        if self.data.get("last_error") not in (None, "timeout"):
+    def reject_invalid_json(self, response):
+        try:
+            json.loads(response)
+        except (ValueError, TypeError):
+            self.save(status="paused", response=response, last_error="invalid_json",
+                      json_required=True, turn_acknowledged=True)
+            return True
+        return False
+
+    def recover_terminal(self, *, require_json=False):
+        if self.data.get("last_error") not in (None, "timeout", "cli_io_failed"):
             return False
         path = self.directory / "events.jsonl"
         if not path.exists():
@@ -79,12 +107,27 @@ class SessionState:
             raise ValueError("invalid session event")
         rows = [r for r in rows if r.get("v4_attempt_id") == self.data.get("active_attempt_id")]
         terminal = [r for r in rows if r.get("event") == "result"]
-        if len(terminal) != 1 or rows[-1] != terminal[0]:
+        if not terminal:
             return False
+        if len(terminal) != 1 or rows[-1] != terminal[0]:
+            raise ValueError("ambiguous terminal stream")
         result = terminal[0].get("result", {})
+        if not isinstance(result, dict):
+            raise ValueError("invalid terminal envelope")
+        if not (self.data.get("request_written") or self.data.get("turn_acknowledged")
+                or self.data.get("status") == "complete"):
+            raise ValueError("unconfirmed terminal delivery")
+        for row in rows:
+            step = row.get("step_update", {})
+            if (not isinstance(step, dict) or step.get("step_type") in ("tool", "subagent")
+                    or any(k in step for k in ("tool_name", "tool_info", "subagent_info"))):
+                raise ValueError("unsafe terminal stream")
         response = result.get("response")
         if result.get("status") == "SUCCESS" and isinstance(response, str) and response.strip():
-            self.save(status="complete", response=response, last_error=None)
+            if (require_json or self.data.get("json_required")) and self.reject_invalid_json(response):
+                return False
+            self.save(status="complete", response=response, last_error=None, turn_acknowledged=True,
+                      result_received_at=terminal[0].get("v4_received_at", self.data.get("result_received_at")))
             return True
         return False
 
@@ -104,4 +147,4 @@ class SessionState:
                 and not self.data.get("first_response_at")):
             self.save(first_response_at=received_at)
         if value.get("event") == "result":
-            self.save(result_received_at=received_at)
+            self.data["result_received_at"] = received_at  # persisted with the validated terminal state
