@@ -62,9 +62,12 @@ def require_model_identity(identity):
 
 
 class PipelineRunnerV4:
-    def __init__(self, *, max_revisions=3, max_workers=4, review_batch_size=1, review_batch_max_bytes=65536):
-        if not isinstance(max_revisions, int) or not 0 <= max_revisions <= 20:
+    def __init__(self, *, max_revisions=3, max_workers=4, review_batch_size=1, review_batch_max_bytes=65536, max_contract_attempts=3):
+        if type(max_revisions) is not int or max_revisions < 0:
             raise ValueError("invalid max_revisions")
+        if type(max_contract_attempts) is not int or max_contract_attempts < 1:
+            raise ValueError("max_contract_attempts must be a positive integer")
+        self.max_contract_attempts = max_contract_attempts
         if not isinstance(max_workers, int) or not 1 <= max_workers <= 32:
             raise ValueError("invalid max_workers")
         if type(review_batch_size) is not int or not 1 <= review_batch_size <= 16:
@@ -260,7 +263,7 @@ class PipelineRunnerV4:
             key = digest(dict(layer=layer, claim_id=cid, input_hash=digest(tasks[cid].to_dict()), model=model_identity))
             self._contract_attempts[key] = self._contract_attempts.get(key, 0) + 1
             counts[cid] = self._contract_attempts[key]
-        exhausted = [cid for cid in remaining if counts[cid] >= 3]
+        exhausted = [cid for cid in remaining if counts[cid] >= self.max_contract_attempts]
         prompts = []
         if not exhausted:
             for cid in remaining:

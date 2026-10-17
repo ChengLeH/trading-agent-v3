@@ -78,7 +78,7 @@ class RunJournal:
                                                exit_code=saved.get("exit_code"), attempts=saved.get("attempts"),
                                                conversation_id=saved.get("conversation_id"))
                     origin = Path(saved.get("session_directory", directory / "sessions" / digest(metadata)))
-                    if can_use_session and (origin / "session.json").is_file() and failure.code in {"session_pending", "missing_init", "cli_start_failed", "invalid_stream", "invalid_json"}:
+                    if can_use_session and (origin / "session.json").is_file() and failure.code in {"session_pending", "missing_init", "cli_start_failed", "invalid_stream", "invalid_json", "continuation_exhausted"}:
                         session_directory = origin
                         break
                     if not failure.retryable:

@@ -154,7 +154,7 @@ V3 的 Markdown 或舊 Claim 缺欄位時，不能自動用文字猜成 V4；必
 
 深度覆核保留第一層判決及 findings，不重帶第一層逐來源的冗長說明；仍獨立審原始證據。修補同樣使用局部任務。最終全局掃描仍檢查所有 Claim、章節／作者、DAG、交易物件及每次修改前後的完整 Claim；不再附內容重複的 Markdown、整份舊 finding／patch 歷史或 Evidence 的原始摘錄。完整正式狀態與歷史的雜湊仍綁定該次掃描。
 
-`session_pending` 不等於成功，也不允許自動 API 轉接或從頭重送。命令列以相同檢查點 `--resume`；程式庫使用同一 RunJournal，或直接 client 的 `resume_request(prompt, response_schema)`，會帶原本 `--conversation <id>`、相同代理設定與隔離目錄續接，只傳「接續完成原任務」的訊息。普通 `client.complete()` 再呼叫相同任務會回報待續，不開新對話。每個任務最多兩次續接，累計等待預算為初始單次上限的三倍；預算與次數跨程序保存，硬中止會保守扣除當次預留額度。每個任務的跨程序鎖防止同時重複呼叫；若主程序硬中止但舊子程序仍在，會回報 `session_busy`，不另開付費回合，也不擅自殺掉可能重用的程序識別碼。事件檔損壞則封鎖並保留原檔，不猜修、不盲目重算。
+`session_pending` 不等於成功，也不允許自動 API 轉接或從頭重送。命令列以相同檢查點 `--resume`；程式庫使用同一 RunJournal，或直接 client 的 `resume_request(prompt, response_schema)`，會帶原本 `--conversation <id>`、相同代理設定與隔離目錄續接，只傳「接續完成原任務」的訊息。普通 `client.complete()` 預設會在有限額度內自動接續相同對話，不開新對話；可用 `--no-auto-continue` 停用。新任務預設兩次續接、總時間為單回合期限三倍，但這些是可調政策：`--session-max-continuations` 與 `--session-budget-seconds` 可提高既有任務的總上限，保留已用次數與時間；`--request-attempts` 控制單次呼叫的嘗試次數。回覆格式補正與修訂輪數也可用 `--max-contract-attempts`、`--max-revisions` 調整。細節及續跑範例見 [P6 修復驗收](P6_BUGFIX_ACCEPTANCE.md#可調整的重試與續跑政策2026-10-18)。預算與次數跨程序保存，硬中止會保守扣除當次預留額度。每個任務的跨程序鎖防止同時重複呼叫；若主程序硬中止但舊子程序仍在，會回報 `session_busy`，不另開付費回合，也不擅自殺掉可能重用的程序識別碼。事件檔損壞則封鎖並保留原檔，不猜修、不盲目重算。
 
 這是恢復同一雲端對話的上下文，不是供應商保證的逐 token（輸出片段）游標續算；逾時仍會結束本機子程序，部分輸出保存作為進度證據，不能當作合格判決。只有完整成功結果且通過驗收才能交付。舊 run 沒有保存對話 ID，無法事後憑空恢復。
 

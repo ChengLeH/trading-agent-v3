@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import time
 from uuid import uuid4, UUID
-from .session_state import SessionState
+from .session_state import SessionState, validate_limits
 from .storage import write_json
 from .session_replay import abandon_session  # public, explicitly authorized escape hatch
 
@@ -79,7 +79,10 @@ def load_agent_profile():
     return content, hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def run_session(executable, model, prompt, timeout, response_schema=None, *, session_dir=None, resume=False, require_json=False, repair_json=False):
+def run_session(executable, model, prompt, timeout, response_schema=None, *, session_dir=None, resume=False, require_json=False, repair_json=False, max_continuations=None, budget_seconds=None):
+    validate_limits(max_continuations, budget_seconds)
+    if (max_continuations is not None or budget_seconds is not None) and (session_dir is None or prompt is None):
+        raise ValueError("persistent session_dir and prompt required for configurable limits")
     if (require_json or repair_json) and (session_dir is None or prompt is None):
         raise ValueError("persistent session_dir and prompt required for JSON validation or correction")
     if session_dir is None or prompt is None:
@@ -109,6 +112,7 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
                     {"invalid_stream", "tool_policy_unverified", "workspace_unverified", "model_unverified",
                      "unexpected_tool_use", "permission_denied", "unexpected_result", "unexpected_error"}):
                 raise AntigravityError(state["last_error"])
+            store.configure_limits(timeout, max_continuations=max_continuations, budget_seconds=budget_seconds)
             previous_pid = state.get("process_id")
             if previous_pid is not None:
                 if type(previous_pid) is not int or previous_pid <= 0:
@@ -135,14 +139,14 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
                     raise AntigravityError("conversation_unverified", conversation_id=cid)
                 if not cid:
                     raise AntigravityError("conversation_unverified")
-                if state["continuations"] >= 2:
+                if state["continuations"] >= state["max_continuations"]:
                     raise AntigravityError("continuation_exhausted", conversation_id=cid)
-            if "budget_seconds" not in state:
-                store.save(budget_seconds=timeout * 3, elapsed_seconds=0)
             remaining = state["budget_seconds"] - state["elapsed_seconds"]
             if remaining <= 0:
                 raise AntigravityError("continuation_exhausted", conversation_id=state.get("conversation_id"))
             started = time.monotonic()
+            prior_error, prior_status = state.get("last_error"), state["status"]
+            prior_continuations, previously_sent = state["continuations"], state["request_sent"]
             prior_elapsed = state["elapsed_seconds"]
             # Reserve the full allowance before spawn: a hard crash cannot
             # reset the cross-process budget. Normal completion refunds unused time.
@@ -152,6 +156,13 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
                 return _run_session(executable, model, prompt, min(timeout, remaining), response_schema, store=store, require_json=require_json, repair_json=repair_json)
             except AntigravityError as exc:
                 sent = store.data["request_sent"]
+                if (previously_sent and store.data["continuations"] == prior_continuations
+                        and exc.code in {"missing_init", "cli_start_failed"}):
+                    # No continuation input was reserved, so keep the previous
+                    # resumable turn instead of replacing it with a startup error.
+                    store.save(status=prior_status, last_error=prior_error)
+                    raise AntigravityError(exc.code, retryable=True,
+                                           conversation_id=store.data.get("conversation_id")) from None
                 store.save(status="paused" if sent else "failed", last_error=exc.code)
                 if not sent and exc.code == "missing_init":
                     raise AntigravityError("missing_init", retryable=True) from None

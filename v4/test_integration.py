@@ -673,5 +673,32 @@ class Integration(unittest.TestCase):
             r.prepare_phase6_global_sweep()
 
 
+
+class AdjustableRuntimeLimits(unittest.TestCase):
+    def test_cli_resume_forwards_limits_and_preserves_revision_progress(self):
+        from .__main__ import main
+        from .checkpoint import save_checkpoint
+        from unittest.mock import patch
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            runner = seeded(); runner.revision_round = 2
+            checkpoint = Path(temp) / "checkpoint.json"; save_checkpoint(runner, checkpoint)
+            argv = ["--resume", str(checkpoint), "--out", str(Path(temp) / "out"),
+                    "--session-max-continuations", "12", "--session-budget-seconds", "14400",
+                    "--max-revisions", "40", "--max-contract-attempts", "8"]
+            for role in ("author", "verifier", "deep", "global"):
+                argv += [f"--{role}-model", "model"]
+            observed = []
+            def resume(self, *clients):
+                observed.append((self.max_revisions, self.revision_round, self.max_contract_attempts))
+                return dict(blocked=True, status="test_pause")
+            with patch("v4.__main__.AntigravityCloudClient", return_value=CloudDouble()) as client, \
+                 patch.object(PipelineRunnerV4, "resume", autospec=True, side_effect=resume):
+                self.assertEqual(main(argv), 2)
+            self.assertEqual(observed, [(40, 2, 8)])
+            self.assertEqual(client.call_args.kwargs["max_continuations"], 12)
+            self.assertEqual(client.call_args.kwargs["session_budget_seconds"], 14400)
+
 if __name__ == "__main__":
     unittest.main()

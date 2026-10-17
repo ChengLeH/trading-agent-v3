@@ -21,6 +21,7 @@ def save_checkpoint(runner, path):
                           pending_patch=runner.pending_patch,
                           deferred_global_findings=runner.deferred_global_findings,
                           max_revisions=runner.max_revisions, max_workers=runner.max_workers,
+                          max_contract_attempts=runner.max_contract_attempts,
                           review_batch_size=runner.review_batch_size, review_batch_max_bytes=runner.review_batch_max_bytes,
                           audit=dict(atomic=runner.receipts, deep=runner.deep_receipts, global_review=runner.global_receipt)))
 
@@ -32,6 +33,7 @@ def load_checkpoint(path, *, continue_verification=True):
     state = data["state"]
     r = PipelineRunnerV4(max_revisions=data["max_revisions"], max_workers=data["max_workers"],
                          review_batch_size=data.get("review_batch_size", 1),
+                         max_contract_attempts=data.get("max_contract_attempts", 3),
                          review_batch_max_bytes=data.get("review_batch_max_bytes", 65536))
     if continue_verification:
         from uuid import UUID

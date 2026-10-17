@@ -98,6 +98,16 @@ class Transport(unittest.TestCase):
             self.assertEqual(len({str(item.kwargs['session_dir']) for item in run.call_args_list}),1)
             self.sleep.assert_not_called()
 
+    def test_json_correction_attempts_are_configurable_without_new_session(self):
+        with patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), \
+             patch("v4.cloud.run_session", side_effect=["bad", "bad", "bad", '{"ok":true}']) as run:
+            client = AntigravityCloudClient("model", request_attempts=5, max_continuations=6)
+            self.assertEqual(client.complete("prompt"), dict(ok=True))
+            self.assertEqual(run.call_count, 4)
+            self.assertEqual(len({str(call.kwargs["session_dir"]) for call in run.call_args_list}), 1)
+            self.assertEqual(run.call_args.kwargs["max_continuations"], 6)
+            self.sleep.assert_not_called()
+
     def test_capability_preflight_keeps_short_deadline(self):
         with patch("v4.cloud.shutil.which", return_value="/existing/bin/agy"), \
              patch("v4.cloud.run_session", return_value={}) as run:

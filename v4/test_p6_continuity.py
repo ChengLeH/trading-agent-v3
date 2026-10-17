@@ -104,9 +104,10 @@ class P6Continuity(unittest.TestCase):
 
     def test_contract_budget_survives_restart(self):
         with tempfile.TemporaryDirectory() as temp:
-            r = seeded(); r._contract_attempts = {"request": 3}
+            r = seeded(); r._contract_attempts = {"request": 3}; r.max_contract_attempts = 8
             path = Path(temp) / "checkpoint.json"; save_checkpoint(r, path)
             self.assertEqual(load_checkpoint(path)._contract_attempts, {"request": 3})
+            self.assertEqual(load_checkpoint(path).max_contract_attempts, 8)
 
     def test_global_checks_all_claims_once_and_preserves_causal_revision_content(self):
         from .test_integration import review_all

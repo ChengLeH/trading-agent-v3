@@ -335,6 +335,32 @@ time.sleep(10)
             self.assertEqual(r._complete(client, "bull", "original request", reuse_role_output=True), dict(ok=True))
             self.assertEqual(len(client.calls), 1)
 
+    def test_exhausted_journal_resumes_after_explicit_same_session_budget_increase(self):
+        from .cloud import AntigravityCloudClient
+        from .agy_session import AntigravityError
+        from .test_recovery_errors import ERROR_BODY, RESUMED_BODY
+        from .test_cloud import cli_stub
+        with tempfile.TemporaryDirectory() as temp, cli_stub(ERROR_BODY) as failing, cli_stub(RESUMED_BODY) as working:
+            r = seeded(); r.journal = RunJournal(temp)
+            client = AntigravityCloudClient("model", executable=failing, timeout=3, request_attempts=1)
+            with self.assertRaisesRegex(AntigravityError, "session_pending"):
+                r._complete(client, "bull", "original request", reuse_role_output=True)
+            state_path = next((Path(temp) / "sessions").glob("*/session.json"))
+            state = json.loads(state_path.read_text()); state["continuations"] = 2
+            state_path.write_text(json.dumps(state))
+            with self.assertRaisesRegex(AntigravityError, "continuation_exhausted"):
+                r._complete(client, "bull", "original request", reuse_role_output=True)
+            client = AntigravityCloudClient("model", executable=working, timeout=3,
+                                            max_continuations=6, session_budget_seconds=30)
+            self.assertEqual(r._complete(client, "bull", "original request", reuse_role_output=True), dict(done=True))
+            after = json.loads(state_path.read_text())
+            self.assertEqual(after["conversation_id"], state["conversation_id"])
+            self.assertEqual(after["continuations"], 3)
+            self.assertEqual(after["max_continuations"], 6)
+            with patch("v4.agy_session.subprocess.Popen") as start:
+                self.assertEqual(r._complete(client, "bull", "original request", reuse_role_output=True), dict(done=True))
+            start.assert_not_called()
+
     def test_request_identity_changes_prevent_role_output_reuse(self):
         with tempfile.TemporaryDirectory() as temp:
             r = seeded()

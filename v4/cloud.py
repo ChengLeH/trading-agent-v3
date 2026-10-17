@@ -9,7 +9,7 @@ import threading
 from time import sleep
 from .agy_session import AGENT_NAME, AntigravityError, run_session
 from .session_replay import lifecycle_lock
-from .session_state import SessionState
+from .session_state import SessionState, validate_limits
 from .agy_session import load_agent_profile
 
 _STDIN_THRESHOLD = 64 * 1024  # UTF-8 bytes: long-prompt timeout
@@ -39,12 +39,17 @@ def request_completion(client, prompt, response_schema=None, *, session_dir=None
 class AntigravityCloudClient:
     execution = "cloud"
 
-    def __init__(self, model, *, executable=None, timeout=1200, session_root=None):
+    def __init__(self, model, *, executable=None, timeout=1200, session_root=None, max_continuations=None, session_budget_seconds=None, request_attempts=3, continue_pending=True):
         if (not isinstance(model, str) or not model or model.startswith("-")
                 or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:/" for c in model)):
             raise ValueError("explicit Antigravity model ID required")
         if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("positive finite Antigravity timeout required")
+        validate_limits(max_continuations, session_budget_seconds)
+        if type(request_attempts) is not int or request_attempts < 1 or type(continue_pending) is not bool:
+            raise ValueError("positive request_attempts and boolean continue_pending required")
+        self.request_attempts, self.continue_pending = request_attempts, continue_pending
+        self.max_continuations, self.session_budget_seconds = max_continuations, session_budget_seconds
         command = executable or os.environ.get("AGY_EXECUTABLE", "agy")
         self.executable = shutil.which(command)
         if not self.executable:
@@ -63,6 +68,8 @@ class AntigravityCloudClient:
         wire = structured_prompt(prompt, schema)
         store = SessionState(session_dir, self.model, wire, load_agent_profile()[1])
         with store.lock():
+            store.configure_limits(self._effective_timeout(wire), max_continuations=self.max_continuations,
+                                   budget_seconds=self.session_budget_seconds)
             if not store.data.get("json_required"):
                 store.save(json_required=True)
 
@@ -104,9 +111,10 @@ class AntigravityCloudClient:
     def _complete_locked(self, prompt, *, response_schema=None):
         schema = None if response_schema is None else json.dumps(response_schema, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         last_error, repair_json = AntigravityError("empty_response", retryable=True), False
-        for attempt in range(3):
+        continue_session = False
+        for attempt in range(self.request_attempts):
             try:
-                text = self._generate(prompt, response_schema=schema, repair_json=repair_json)
+                text = self._generate(prompt, response_schema=schema, repair_json=repair_json, continue_session=continue_session)
                 if not text or not text.strip():
                     raise AntigravityError("empty_response", retryable=True)
                 try:
@@ -115,6 +123,9 @@ class AntigravityCloudClient:
                     raise AntigravityError("invalid_json", retryable=True) from None
                 break
             except AntigravityError as exc:
+                if exc.code == "session_pending" and self.continue_pending:
+                    last_error, continue_session = exc, True
+                    continue  # same durable CID, never resend the original task
                 if not exc.retryable:
                     raise AntigravityError(exc.code, exit_code=exc.exit_code, attempts=attempt + 1,
                                            conversation_id=exc.conversation_id) from None
@@ -124,26 +135,30 @@ class AntigravityCloudClient:
                     continue
             except Exception:
                 raise AntigravityError("unexpected_error") from None
-            if attempt < 2:
+            if attempt + 1 < self.request_attempts:
                 sleep(15)
         else:
             raise AntigravityError(last_error.code,
                                    retryable=last_error.retryable and last_error.code != "invalid_json",
-                                   exit_code=last_error.exit_code, attempts=3,
+                                   exit_code=last_error.exit_code, attempts=self.request_attempts,
                                    conversation_id=last_error.conversation_id) from None
         with self._lock:
             self.calls.append(dict(transport="antigravity", requested_model=self.identity, served_model=None,
                                    agent_profile=AGENT_NAME, agent_policy_verified=True))
         return parsed
 
-    def _generate(self, prompt, *, response_schema=None, repair_json=False):
+    def _effective_timeout(self, wire_prompt):
+        return max(self.timeout, 1800) if len(wire_prompt.encode("utf-8")) > _STDIN_THRESHOLD else self.timeout
+
+    def _generate(self, prompt, *, response_schema=None, repair_json=False, continue_session=False):
         # Every size uses stdin so init can be checked before sending evidence.
         # agy native --json-schema produced repeated responses/multiple turns
         # without structured_output in the real stdin test. Keep the contract
         # in stdin and let the per-Claim validators reject/repair omissions.
         wire_prompt = structured_prompt(prompt, response_schema)
-        timeout = max(self.timeout, 1800) if len(wire_prompt.encode("utf-8")) > _STDIN_THRESHOLD else self.timeout
+        timeout = self._effective_timeout(wire_prompt)
         context = getattr(self._request_context, "value", None)
         directory, resume = context or (self._session_directory(wire_prompt), False)
         return run_session(self.executable, self.model, wire_prompt, timeout, None,
-                           session_dir=directory, resume=resume or repair_json, require_json=True, repair_json=repair_json)
+                           session_dir=directory, resume=resume or repair_json or continue_session, require_json=True, repair_json=repair_json,
+                           max_continuations=self.max_continuations, budget_seconds=self.session_budget_seconds)

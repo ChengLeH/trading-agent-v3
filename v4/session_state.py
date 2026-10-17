@@ -11,6 +11,14 @@ from .storage import write_json
 from .session_replay import lifecycle_lock, recover_authorized_replay
 
 
+def validate_limits(max_continuations=None, budget_seconds=None):
+    if max_continuations is not None and (type(max_continuations) is not int or max_continuations < 0):
+        raise ValueError("max_continuations must be a nonnegative integer")
+    if budget_seconds is not None and (type(budget_seconds) not in (int, float)
+                                      or not math.isfinite(budget_seconds) or budget_seconds <= 0):
+        raise ValueError("budget_seconds must be positive and finite")
+
+
 class SessionState:
     def __init__(self, directory, model, prompt, template_hash):
         self.directory = Path(directory).resolve()
@@ -33,7 +41,9 @@ class SessionState:
                         self.data = json.loads(self.path.read_text())
                         if not isinstance(self.data, dict):
                             raise ValueError("invalid session state")
-                        if (type(self.data.get("continuations")) is not int or not 0 <= self.data["continuations"] <= 2
+                        maximum = self.data.get("max_continuations", 2)
+                        if (type(maximum) is not int or maximum < 0
+                                or type(self.data.get("continuations")) is not int or not 0 <= self.data["continuations"] <= maximum
                                 or type(self.data.get("request_sent")) is not bool):
                             raise ValueError("invalid session counters")
                         for key in ("turn_acknowledged", "request_written", "json_required"):
@@ -56,6 +66,23 @@ class SessionState:
     def save(self, **changes):
         self.data.update(changes)
         write_json(self.path, self.data)
+
+    def configure_limits(self, timeout, *, max_continuations=None, budget_seconds=None):
+        """Raise durable ceilings without erasing consumed work or identity."""
+        validate_limits(max_continuations, budget_seconds)
+        old_max = self.data.get("max_continuations", 2)
+        old_budget = self.data.get("budget_seconds", timeout * 3)
+        new_max = max(old_max, max_continuations) if max_continuations is not None else old_max
+        new_budget = max(old_budget, budget_seconds) if budget_seconds is not None else old_budget
+        changes = dict(max_continuations=new_max, budget_seconds=new_budget,
+                       elapsed_seconds=self.data.get("elapsed_seconds", 0))
+        if new_max != old_max or new_budget != old_budget:
+            history = list(self.data.get("limit_changes", []))
+            history.append(dict(at=datetime.now(timezone.utc).isoformat(),
+                                previous_max_continuations=old_max, max_continuations=new_max,
+                                previous_budget_seconds=old_budget, budget_seconds=new_budget))
+            changes["limit_changes"] = history
+        self.save(**changes)
 
     def interrupted_application_step(self):
         # Compatibility for an older reader that stopped on the CLI's typed

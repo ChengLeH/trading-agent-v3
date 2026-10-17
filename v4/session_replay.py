@@ -116,7 +116,8 @@ def abandon_session(session_dir, *, reason):
                 if (not isinstance(data, dict) or data.get('format') != 'v4-agy-session/1'
                         or type(data.get('request_sent')) is not bool
                         or type(data.get('turn_acknowledged')) is not bool
-                        or type(data.get('continuations')) is not int or not 0 <= data['continuations'] <= 2
+                        or type(data.get('max_continuations', 2)) is not int or data.get('max_continuations', 2) < 0
+                        or type(data.get('continuations')) is not int or not 0 <= data['continuations'] <= data.get('max_continuations', 2)
                         or any(not isinstance(data.get(k), str) or not data[k] for k in _BINDING_KEYS)):
                     raise ValueError('invalid session state; refuse paid replay')
                 if data['request_sent']:
