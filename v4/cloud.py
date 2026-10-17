@@ -127,6 +127,10 @@ class AntigravityCloudClient:
                 if exc.code == "session_pending" and self.continue_pending:
                     last_error, continue_session = exc, True
                     continue  # same durable CID, never resend the original task
+                if exc.code == "stream_interrupted":
+                    if not self.continue_pending:
+                        raise exc.with_context(attempts=attempt + 1) from None
+                    continue_session = True  # bounded transport retry in the same CID; back off below
                 if not exc.retryable:
                     raise exc.with_context(attempts=attempt + 1) from None
                 last_error = exc

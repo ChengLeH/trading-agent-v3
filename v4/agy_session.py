@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import time
 from uuid import uuid4, UUID
-from .session_state import SessionState, validate_limits
+from .session_state import SessionState, validate_limits, is_stream_interruption
 from .storage import write_json
 from .session_replay import abandon_session  # public, explicitly authorized escape hatch
 
@@ -24,7 +24,7 @@ class AntigravityError(RuntimeError):
     """Safe machine-readable transport failure; never includes raw diagnostics."""
     CODES = frozenset({"cli_start_failed", "cli_exit", "cli_io_failed", "timeout", "empty_response",
                        "invalid_stream", "missing_init", "tool_policy_unverified", "workspace_unverified", "model_unverified",
-                       "unexpected_tool_use", "permission_denied", "result_failed", "unexpected_result",
+                       "unexpected_tool_use", "permission_denied", "result_failed", "stream_interrupted", "unexpected_result",
                        "invalid_json", "unexpected_error", "session_pending", "session_busy",
                        "session_binding_changed", "conversation_unverified", "continuation_exhausted", "delivery_unconfirmed"})
 
@@ -66,7 +66,7 @@ class AntigravityError(RuntimeError):
                       exit_code=self.exit_code, attempts=self.attempts)
         if self.conversation_id is not None:
             result.update(conversation_id=self.conversation_id,
-                          resumable=self.code in {"session_pending", "continuation_exhausted", "invalid_json"})
+                          resumable=self.code in {"session_pending", "continuation_exhausted", "invalid_json", "stream_interrupted"})
         if self.session_budget is not None:
             result["session_budget"] = deepcopy(self.session_budget)
         if self.request_context is not None:
@@ -171,7 +171,7 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
                     raise AntigravityError("delivery_unconfirmed", conversation_id=cid)
                 if not resume:
                     raise AntigravityError("session_pending", conversation_id=cid)
-                if (state.get("last_error") not in {"timeout", "empty_response", "cli_exit", "cli_io_failed", "result_failed", "invalid_json"}
+                if (state.get("last_error") not in {"timeout", "empty_response", "cli_exit", "cli_io_failed", "result_failed", "stream_interrupted", "invalid_json"}
                         and not (state.get("last_error") is None and state.get("status") == "in_flight")
                         and not legacy_step):
                     raise AntigravityError("conversation_unverified", conversation_id=cid)
@@ -179,7 +179,8 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
                     raise AntigravityError("conversation_unverified")
             remaining = state["budget_seconds"] - state["elapsed_seconds"]
             exhausted = []
-            if state["request_sent"] and state["continuations"] >= state["max_continuations"]:
+            if (state["request_sent"] and state.get("last_error") != "stream_interrupted"
+                    and state["continuations"] >= state["max_continuations"]):
                 exhausted.append("continuations")
             if remaining <= 0:
                 exhausted.append("time")
@@ -211,6 +212,9 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
                 store.save(status="paused" if sent else "failed", last_error=exc.code)
                 if not sent and exc.code == "missing_init":
                     raise AntigravityError("missing_init", retryable=True) from None
+                if sent and exc.code == "stream_interrupted":
+                    raise AntigravityError("stream_interrupted", retryable=True,
+                                           conversation_id=store.data.get("conversation_id")) from None
                 if sent and exc.code in {"timeout", "empty_response", "cli_exit", "cli_io_failed", "result_failed"}:
                     raise AntigravityError("session_pending", conversation_id=store.data.get("conversation_id")) from None
                 raise
@@ -325,8 +329,10 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                 if store:
                     # Persist the uncertain delivery boundary before any bytes:
                     # after a crash it is unsafe to assume nothing was sent.
+                    transport_retry = resuming and store.data.get("last_error") == "stream_interrupted"
                     store.save(request_sent=True, request_written=False, turn_acknowledged=False, status="in_flight", last_error=None,
-                               continuations=store.data["continuations"] + int(resuming))
+                               continuations=store.data["continuations"] + int(resuming and not transport_retry),
+                               transport_retries=store.data.get("transport_retries", 0) + int(transport_retry))
                 request = (json.dumps(dict(event="user", message=dict(role="user", content=content)),
                                       ensure_ascii=False) + "\n").encode("utf-8")
                 selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
@@ -360,6 +366,8 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                     raise AntigravityError("invalid_stream")
                 if permission_denied(str(terminal.get("error", "")).encode("utf-8")):
                     raise AntigravityError("permission_denied")
+                if is_stream_interruption(terminal):
+                    raise AntigravityError("stream_interrupted", retryable=True)
                 if terminal.get("status") != "SUCCESS":
                     raise AntigravityError("result_failed", retryable=True)
                 if not isinstance(terminal.get("response"), str) or offset != len(request):

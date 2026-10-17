@@ -12,6 +12,12 @@ from .session_replay import lifecycle_lock, recover_authorized_replay
 from .response_json import normalize_json_response
 
 
+def is_stream_interruption(result):
+    """Recognize one CLI diagnostic, never inspect Claim or response prose."""
+    return (result.get("status") == "ERROR" and result.get("error_code") is None
+            and result.get("error") == "The stream was interrupted. Please continue the task you were working on.")
+
+
 def validate_limits(max_continuations=None, budget_seconds=None):
     if max_continuations is not None and (type(max_continuations) is not int or max_continuations < 0):
         raise ValueError("max_continuations must be a nonnegative integer")
@@ -45,7 +51,9 @@ class SessionState:
                         maximum = self.data.get("max_continuations", 2)
                         if (type(maximum) is not int or maximum < 0
                                 or type(self.data.get("continuations")) is not int or not 0 <= self.data["continuations"] <= maximum
-                                or type(self.data.get("request_sent")) is not bool):
+                                or type(self.data.get("request_sent")) is not bool
+                                or type(self.data.get("transport_retries", 0)) is not int
+                                or self.data.get("transport_retries", 0) < 0):
                             raise ValueError("invalid session counters")
                         for key in ("turn_acknowledged", "request_written", "json_required"):
                             if key in self.data and type(self.data[key]) is not bool:
@@ -121,7 +129,7 @@ class SessionState:
             return None
 
     def recover_terminal(self, *, require_json=False):
-        if self.data.get("last_error") not in (None, "timeout", "cli_io_failed", "invalid_json", "continuation_exhausted"):
+        if self.data.get("last_error") not in (None, "timeout", "cli_io_failed", "invalid_json", "continuation_exhausted", "result_failed", "stream_interrupted"):
             return False
         path = self.directory / "events.jsonl"
         if not path.exists():
@@ -149,6 +157,9 @@ class SessionState:
             if (not isinstance(step, dict) or step.get("step_type") in ("tool", "subagent")
                     or any(k in step for k in ("tool_name", "tool_info", "subagent_info"))):
                 raise ValueError("unsafe terminal stream")
+        if is_stream_interruption(result):
+            self.save(status="paused", last_error="stream_interrupted", turn_acknowledged=True)
+            return False
         response = result.get("response")
         if result.get("status") == "SUCCESS" and isinstance(response, str) and response.strip():
             if require_json or self.data.get("json_required"):

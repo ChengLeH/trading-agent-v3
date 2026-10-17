@@ -80,7 +80,7 @@ class RunJournal:
                                                conversation_id=saved.get("conversation_id"), session_budget=saved.get("session_budget"),
                                                request_context=saved.get("request_context"))
                     origin = Path(saved.get("session_directory", directory / "sessions" / digest(metadata)))
-                    if can_use_session and (origin / "session.json").is_file() and failure.code in {"session_pending", "missing_init", "cli_start_failed", "invalid_stream", "invalid_json", "continuation_exhausted"}:
+                    if can_use_session and (origin / "session.json").is_file() and failure.code in {"session_pending", "stream_interrupted", "missing_init", "cli_start_failed", "invalid_stream", "invalid_json", "continuation_exhausted"}:
                         session_directory = origin
                         break
                     if not failure.retryable:

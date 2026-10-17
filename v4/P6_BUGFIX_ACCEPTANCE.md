@@ -272,3 +272,35 @@ V4 208 項、V3 基準 24 項通過；git diff --check 通過，獨立審查未�
 使用者後續提供 continuations_used=2、max_continuations=2、elapsed_seconds=1220、budget_seconds=2700、exhausted_by=["continuations"]、last_session_error=result_failed。可確認當下是續接次數上限，並非 2700 秒總時間耗盡；不能由此推論先前回合完全沒有逾時。
 
 依 agy_session.py，result_failed 來自 agy 的 error_message 步驟事件，或 terminal result 的 status 不是 SUCCESS；不是原子 Claim 語義驗收失敗的代碼，也不保證已有可解析答案。此次 JSON 外框／續接指令修復不能直接解釋該錯誤。仍需最後失敗事件的 status／error 或 error_message 內容，判斷 agy 底層失敗原因；不為此盲目提高次數或自動放棄原對話。
+
+
+## 已證實的串流中斷與內容續接額度混用
+
+### Problem（問題）
+
+使用者提供末次 result：status=ERROR、error_code=None、error="The stream was interrupted. Please continue the task you were working on."；沒有 error_message 步驟。配合 continuations=2/2、elapsed_seconds=1220/2700，可確認這次停止在內容續接次數上限；不能推定每個早先回合都沒有逾時，或把斷線歸因到某個特定供應商節點。
+
+### Root Cause（因果鏈）
+
+agy_session.py 的 result 分支把所有非 SUCCESS 都歸 result_failed；run_session 再包成 session_pending。下一次接續原 CID（對話 ID）時，_run_session 對所有 resuming 一律增加 continuations。因此已知串流中斷的傳輸恢復與內容補正共用兩次上限，run_session 在還有時間時就以 continuation_exhausted 停住。先前 JSON 外框修復不能解釋這條 ERROR 路徑。
+
+### Fix（修正與影響）
+
+- SessionState 共用精確 CLI 診斷識別；只匹配這個 ERROR／無結構化錯誤碼的已知通知，不從模型答案、Claim 或 finding 判斷。未知／稍異錯誤仍走原路徑。
+- 這類回合回報 stream_interrupted、retryable=true、resumable=true。Cloud 在既有 request_attempts 內，間隔 15 秒沿原 CID 重試；尊重停用自動續接設定。
+- 已知斷線後的傳輸恢復另存 transport_retries，不扣內容 continuations；已執行時間、原 CID、請求雜湊與工作目錄繼續保存，總執行時間上限仍有效。每次 complete 呼叫的次數用完後會返回可恢復錯誤，不在單次呼叫內無限重試。
+- 從舊事件檔重新分類前，仍須當次唯一且最後的 terminal、送達證據與工具政策檢查。可恢復舊版已耗盡內容次數的已知斷線，不清零歷史額度。RunJournal（進度紀錄）同步接受這類保存的失敗，重啟後回到原 session。
+
+### Recommended Tests／Prevention（驗收）
+
+既有 test_session_resume.py 新增六項：連續斷線及呼叫端重建；舊版 result_failed＋內容次數已耗盡；總時間上限禁止新呼叫；未知錯誤／SUCCESS 文字不享斷線例外；原生 RunJournal 重啟同 CID；停用自動續接。先在未修版重現錯誤分類與額度封鎖，再修正通過。
+
+### Confidence／更新與回滾
+
+對上述程式因果鏈及模擬重現信心高；未操作 VM 或呼叫真實模型，不能保證供應商斷線消失或這份真實交易計劃已完成。這是共用傳輸政策修復，不改 Claim 驗收、引用、DAG（依賴圖）、權限或模型，V3／main 不變。
+
+更新後重啟驅動程序，保留完整檢查點、session.json 及 events.jsonl，用一般 --resume 續跑。資料不完整時不猜修。回滾撤回本次提交並重啟；先備份完整輸出。舊版不認得新的錯誤碼，因此新版已記錄 stream_interrupted 的失敗，回滾後需再升級此修正才能原生恢復，勿刪除原始事件或重置額度。
+
+本輪完整驗收：V4 214 項通過（26.483 秒），V3 基準 13＋11 項通過，git diff --check 通過。測試使用本機模擬子程序，沒有載入本地模型或新增雲端模型呼叫。
+
+獨立審查：未發現阻塞缺陷，另重跑六項新回歸測試通過。上限語義明確採「每次 client 呼叫有界＋跨重啟時間有界」；transport_retries 是累計紀錄，不另設跨生命週期固定次數上限。操作者多次 resume 不會重置已用執行時間，也不會新開對話，但仍可能產生額外費用。

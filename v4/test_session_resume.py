@@ -219,3 +219,132 @@ else:
 
 
 if __name__ == '__main__': unittest.main()
+
+class StreamInterruptionRecovery(unittest.TestCase):
+    ERROR = 'The stream was interrupted. Please continue the task you were working on.'
+
+    def test_transport_retry_does_not_spend_content_continuations_and_survives_restart(self):
+        from .cloud import AntigravityCloudClient
+        body = '''
+init()
+request = json.loads(sys.stdin.readline())["message"]["content"]
+emit(dict(event="step_update", step_update=dict(step_type="user_input", state="DONE")))
+marker = Path.cwd()/"transport-count"
+count = int(marker.read_text()) if marker.exists() else 0
+marker.write_text(str(count+1))
+if count < 3:
+    emit(dict(event="result", result=dict(status="ERROR", error="The stream was interrupted. Please continue the task you were working on.", error_code=None)))
+else:
+    assert "--conversation" in sys.argv
+    assert "original request" not in request
+    result('{"done":true}')
+'''
+        with tempfile.TemporaryDirectory() as temp, cli_stub(body) as executable, patch('v4.cloud.sleep') as sleep:
+            client = AntigravityCloudClient('model', executable=executable, session_root=temp, timeout=2, request_attempts=2, max_continuations=0)
+            with self.assertRaises(AntigravityError) as caught:
+                client.complete('original request')
+            self.assertEqual(caught.exception.code, 'stream_interrupted')
+            self.assertTrue(caught.exception.retryable)
+            self.assertTrue(caught.exception.details()['resumable'])
+            # A new client/process starts from the persisted conversation.
+            client = AntigravityCloudClient('model', executable=executable, session_root=temp, timeout=2, request_attempts=3, max_continuations=0)
+            self.assertEqual(client.complete('original request'), {'done': True})
+            state = json.loads(next(Path(temp).glob('*/session.json')).read_text())
+            self.assertEqual(state['continuations'], 0)
+            self.assertEqual(state['transport_retries'], 3)
+            self.assertGreater(state['elapsed_seconds'], 0)
+            self.assertTrue(sleep.called)
+
+    def test_legacy_result_failed_with_exhausted_count_is_reclassified_from_exact_event(self):
+        body = '''
+init()
+sys.stdin.readline()
+emit(dict(event="step_update", step_update=dict(step_type="user_input", state="DONE")))
+if "--conversation" not in sys.argv:
+    emit(dict(event="result", result=dict(status="ERROR", error="The stream was interrupted. Please continue the task you were working on.")))
+else:
+    result('{"done":true}')
+'''
+        with tempfile.TemporaryDirectory() as temp, cli_stub(body) as executable:
+            with self.assertRaises(AntigravityError):
+                run_session(executable,'model','original',2,session_dir=temp)
+            path = Path(temp)/'session.json'
+            state = json.loads(path.read_text())
+            state.update(last_error='result_failed', continuations=2, max_continuations=2)
+            path.write_text(json.dumps(state))
+            self.assertEqual(run_session(executable,'model','original',2,session_dir=temp,resume=True), '{"done":true}')
+            state = json.loads(path.read_text())
+            self.assertEqual(state['continuations'],2)  # never erase historical consumption
+            self.assertEqual(state['transport_retries'],1)
+
+    def test_time_limit_still_blocks_transport_recovery_without_new_call(self):
+        from .session_state import SessionState
+        from .agy_session import load_agent_profile
+        with tempfile.TemporaryDirectory() as temp:
+            store = SessionState(temp,'model','original',load_agent_profile()[1])
+            with store.lock():
+                store.save(status='paused',request_sent=True,turn_acknowledged=True,
+                           conversation_id='11111111-1111-4111-8111-111111111111',
+                           last_error='stream_interrupted',continuations=0,max_continuations=0,
+                           elapsed_seconds=10,budget_seconds=10)
+            with patch('v4.agy_session.subprocess.Popen') as start, self.assertRaises(AntigravityError) as caught:
+                run_session('agy','model','original',2,session_dir=temp,resume=True)
+            start.assert_not_called()
+            self.assertEqual(caught.exception.session_budget['exhausted_by'],['time'])
+
+    def test_unknown_result_errors_and_success_prose_do_not_get_transport_exception(self):
+        for status, error in [('ERROR','unknown failure'), ('SUCCESS',self.ERROR), ('ERROR','Explanation: '+self.ERROR)]:
+            body = 'init()\nsys.stdin.readline()\nemit(dict(event="step_update", step_update=dict(step_type="user_input", state="DONE")))\n'
+            body += f'emit(dict(event="result",result=dict(status={status!r},error={error!r},response="not JSON")))\n'
+            with self.subTest(status=status,error=error), tempfile.TemporaryDirectory() as temp, cli_stub(body) as executable:
+                with self.assertRaises(AntigravityError):
+                    run_session(executable,'model','original',2,session_dir=temp,require_json=True)
+                state=json.loads((Path(temp)/'session.json').read_text())
+                self.assertEqual(state['last_error'],'invalid_json' if status=='SUCCESS' else 'result_failed')
+
+    def test_journal_restart_keeps_same_session_after_stream_failure(self):
+        from .cloud import AntigravityCloudClient
+        from .journal import RunJournal
+        from .test_integration import seeded
+        body = '''
+init()
+sys.stdin.readline()
+emit(dict(event="step_update", step_update=dict(step_type="user_input", state="DONE")))
+if "--conversation" not in sys.argv:
+    emit(dict(event="result", result=dict(status="ERROR", error="The stream was interrupted. Please continue the task you were working on.")))
+else:
+    result('{"done":true}')
+'''
+        with tempfile.TemporaryDirectory() as temp, cli_stub(body) as executable:
+            runner = seeded()
+            runner.journal = RunJournal(temp)
+            client = AntigravityCloudClient('model',executable=executable,timeout=2,request_attempts=1)
+            review = dict(layer='atomic',verification_epoch=runner._verification_epoch,task_hashes={'claim.one':'hash-one'})
+            with self.assertRaises(AntigravityError) as caught:
+                runner._complete(client,'atomic.target','original',review_context=review)
+            self.assertEqual(caught.exception.code,'stream_interrupted')
+            before = json.loads(next((Path(temp)/'sessions').glob('*/session.json')).read_text())
+            runner.journal = RunJournal(temp)
+            self.assertEqual(runner._complete(client,'atomic.target','original',review_context=review),{'done':True})
+            states = list((Path(temp)/'sessions').glob('*/session.json'))
+            self.assertEqual(len(states),1)
+            after = json.loads(states[0].read_text())
+            self.assertEqual(before['conversation_id'],after['conversation_id'])
+            self.assertEqual(after['continuations'],0)
+
+    def test_auto_continue_can_be_disabled_without_losing_resumable_error(self):
+        from .cloud import AntigravityCloudClient
+        body = '''
+init()
+sys.stdin.readline()
+emit(dict(event="step_update", step_update=dict(step_type="user_input", state="DONE")))
+emit(dict(event="result",result=dict(status="ERROR",error="The stream was interrupted. Please continue the task you were working on.")))
+'''
+        with tempfile.TemporaryDirectory() as temp, cli_stub(body) as executable, patch('v4.cloud.sleep') as sleep:
+            client=AntigravityCloudClient('model',executable=executable,session_root=temp,timeout=2,continue_pending=False)
+            with self.assertRaises(AntigravityError) as caught:
+                client.complete('original')
+            self.assertEqual(caught.exception.code,'stream_interrupted')
+            self.assertEqual(caught.exception.attempts,1)
+            self.assertTrue(caught.exception.details()['resumable'])
+            sleep.assert_not_called()

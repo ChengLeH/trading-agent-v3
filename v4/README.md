@@ -193,3 +193,12 @@ python -m v3.test_p6_dedup
 影響只限 `v4/`，不需要重啟 V3 服務。回滾時停用 `python -m v4` 或回到既有 V3 入口；不要將 V4 checkpoint 當作 V3 狀態讀取。
 
 本輪共用流程根因、驗收數據及已知限制：[P6_RECOVERY.md](P6_RECOVERY.md)。
+
+
+### 已知串流中斷的恢復
+
+agy 的結束事件若明確回報 `status=ERROR`、`error_code=null`（或省略），且錯誤為 `The stream was interrupted. Please continue the task you were working on.`，V4 會分類為 `stream_interrupted`。這是 CLI（命令列介面）協定診斷的精確比對，不讀 Claim 自然語言來決定驗收結果，也不把未知錯誤視為可恢復斷線。
+
+自動恢復使用原對話 ID、隔離目錄與既有上下文，每次呼叫仍受 `--request-attempts` 約束，嘗試之間等待 15 秒；`--no-auto-continue` 可停用。斷線恢復記入持久化 `transport_retries`，不占用內容續接的 `continuations`；每回合執行時間仍扣既有 `session-budget-seconds`，重啟不歸零。單次嘗試用完時回 `retryable=true`、`resumable=true`，可從原檢查點再續跑，不自動丟棄 session 或換 API。總時間耗盡仍停止，不承諾恢復一定成功。
+
+舊版保存的 `result_failed`／`continuation_exhausted`，只在當次完整事件檔有唯一、最後且符合上述診斷的結束事件，並通過送達／工具檢查時，才重新分類；已扣的舊內容次數不會被清零。一般 `--resume` 可恢復這條已確認的傳輸路徑，不需要先使用 `--recover-session` 放棄對話。事件缺失、未知錯誤、權限拒絕或工具違規不適用。
