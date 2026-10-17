@@ -135,7 +135,7 @@ class Integration(unittest.TestCase):
             self.assertFalse(json.loads(stdout.getvalue())["result_written"])
             self.assertEqual(json.loads(stdout.getvalue())["status"], "blocked:output")
 
-    def test_manual_collect_requires_models_and_distinct_deep_identity(self):
+    def test_manual_collect_requires_model_identity_but_allows_same_model_deep_review(self):
         r = seeded()
         prepared = r.prepare_phase6_atomic()
         results = {cid: verdict(cid, "FAIL" if cid == "a" else "PASS", ref_ids=reference_ids(next(c for c in r.run.claims if c["claim_id"] == cid))) for cid, _ in prepared["atomic_prompts"]}
@@ -145,11 +145,11 @@ class Integration(unittest.TestCase):
             self.assertEqual(r.receipts, {})
         r.collect_phase6_atomic(results, model_identity="test/first")
         r.prepare_phase6_deep_review()
-        for identity in (None, "", False, " ", "test/first"):
+        for identity in (None, "", False, " "):
             with self.subTest(stage="deep", identity=identity), self.assertRaises(ValueError):
                 r.collect_phase6_deep_review({"a": verdict("a")}, model_identity=identity)
             self.assertEqual(r.deep_receipts, {})
-        r.collect_phase6_deep_review({"a": verdict("a")}, model_identity="test/second")
+        r.collect_phase6_deep_review({"a": verdict("a")}, model_identity="test/first")
         r.prepare_phase6_global_sweep()
         for identity in (None, "", False, " "):
             with self.subTest(stage="global", identity=identity), self.assertRaises(ValueError):
@@ -295,6 +295,77 @@ class Integration(unittest.TestCase):
         self.assertEqual(len(deep.calls), 1)
         self.assertEqual(len(sweep.calls), 1)
         self.assertEqual(result["sidecar"]["revision_history"][0]["affected_claim_ids"], ["a", "b", "c"])
+
+    def test_same_model_runs_separate_deep_request_to_overturn_or_confirm_failure(self):
+        for deep_status in ("PASS", "FAIL"):
+            with self.subTest(deep_status=deep_status):
+                r, atomic_ids, deep_ids = seeded(), [], []
+                def respond(prompt):
+                    if "```json\n" in prompt:
+                        task = json.loads(prompt.split("```json\n")[1].split("\n```\n")[0])
+                        cid = task["claim_id"]
+                        atomic_ids.append(cid)
+                        status = "FAIL" if cid == "b" and task["claim"]["text"] != "修正版" else "PASS"
+                        return verdict(cid, status, ref_ids=reference_ids(task["claim"]))
+                    payload = json.loads(prompt.split("<context-data>\n")[1].split("\n</context-data>")[0])
+                    self.assertEqual(payload["first_review"]["verdict"], "FAIL")
+                    deep_ids.append(payload["task"]["claim_id"])
+                    return verdict("b", deep_status, ref_ids=["a"])
+                shared = CloudDouble("test/shared", respond)
+                patcher = CloudDouble("test/author", lambda _: [dict(claim_id="b", text="修正版")])
+                sweep = CloudDouble("test/global", lambda _: [])
+                result = r.execute_phase6(shared, shared, patcher, sweep)
+                self.assertFalse(result["blocked"], result)
+                self.assertEqual(deep_ids, ["b"])
+                self.assertEqual(set(atomic_ids), {c["claim_id"] for c in r.run.claims})
+                self.assertEqual(len(shared.calls), len(atomic_ids) + 1)
+                self.assertEqual(len(sweep.calls), 1)
+                self.assertTrue(all(x["model"] == "test/shared" for x in r.receipts.values()))
+                if deep_status == "PASS":
+                    self.assertEqual(len(atomic_ids), len(r.run.claims))
+                    self.assertEqual(patcher.calls, [])
+                    self.assertEqual(r.deep_receipts["b"]["model"], "test/shared")
+                else:
+                    self.assertEqual(len(patcher.calls), 1)
+                    self.assertEqual(atomic_ids.count("b"), 2)
+                    self.assertEqual(atomic_ids.count("c"), 2)
+                    self.assertEqual(len(atomic_ids), len(r.run.claims) + 2)
+                    self.assertEqual(r.history[0]["affected_claim_ids"], ["b", "c"])
+
+    def test_cli_resume_accepts_same_model_for_verifier_and_deep(self):
+        from .__main__ import main
+        from .checkpoint import save_checkpoint
+        r = seeded()
+        def respond(prompt):
+            if "```json\n" in prompt:
+                task = json.loads(prompt.split("```json\n")[1].split("\n```\n")[0])
+                return verdict(task["claim_id"], "SUSPICIOUS" if task["claim_id"] == "b" else "PASS",
+                               ref_ids=reference_ids(task["claim"]))
+            return verdict("b", ref_ids=["a"])
+        shared = CloudDouble("test/shared", respond)
+        clients = {"shared": shared, "author": CloudDouble("test/author"),
+                   "global": CloudDouble("test/global", lambda _: [])}
+        with tempfile.TemporaryDirectory() as temp:
+            checkpoint, out = Path(temp) / "checkpoint.json", Path(temp) / "out"
+            save_checkpoint(r, checkpoint)
+            args = ["--resume", str(checkpoint), "--out", str(out), "--author-model", "author",
+                    "--verifier-model", "shared", "--deep-model", "shared", "--global-model", "global"]
+            with patch("v4.__main__.AntigravityCloudClient", side_effect=lambda model: clients[model]), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(args), 0)
+            result = json.loads((out / "result.json").read_text())
+            self.assertFalse(result["blocked"], result)
+            self.assertIn("report_markdown", result)
+            self.assertEqual(len(shared.calls), len(r.run.claims) + 1)
+            saved = json.loads((out / "checkpoint.json").read_text())
+            self.assertEqual(saved["audit"]["deep"]["b"]["model"], "test/shared")
+            archives = [json.loads(path.read_text()) for path in (out / "responses" / "archive").glob("*.json")]
+            reviews = [entry for entry in archives if entry["task_id"] == "b"]
+            self.assertEqual(len(reviews), 2)
+            self.assertEqual({entry["model"] for entry in reviews}, {"test/shared"})
+            self.assertEqual(len({entry["prompt_hash"] for entry in reviews}), 2)
+            self.assertTrue(all(entry["status"] == "received" for entry in reviews))
+            self.assertEqual({entry["response"]["verdict"] for entry in reviews}, {"SUSPICIOUS", "PASS"})
 
     def test_global_finding_uses_semantic_linker_then_requires_new_sweep(self):
         r = seeded()
@@ -473,10 +544,12 @@ class Integration(unittest.TestCase):
                                   for c in r.run.claims}, model_identity="test/first")
         with self.assertRaises(ValueError):
             r.prepare_phase6_deep_review(["independent"])
-        r.prepare_phase6_deep_review()
         with self.assertRaises(ValueError):
-            r.collect_phase6_deep_review({"a": verdict("a")}, model_identity="test/first")
-        r.collect_phase6_deep_review({"a": verdict("a")}, model_identity="test/second")
+            r.prepare_phase6_global_sweep()
+        with self.assertRaises(ValueError):
+            r.finalize()
+        r.prepare_phase6_deep_review()
+        r.collect_phase6_deep_review({"a": verdict("a")}, model_identity="test/first")
         r.prepare_phase6_global_sweep()
         r.collect_phase6_global_sweep(global_verdict(r), model_identity="test/global")
         self.assertFalse(r.finalize()["blocked"])
@@ -511,15 +584,16 @@ class Integration(unittest.TestCase):
         with self.assertRaises(ValueError):
             r.finalize()
 
-    def test_executor_rejects_local_or_same_model(self):
-        r = seeded()
-        first = CloudDouble()
-        first.execution = "local"
-        with self.assertRaises(ValueError):
-            r.execute_phase6(first, CloudDouble("other"), first, first)
-        first.execution = "cloud"
-        with self.assertRaises(ValueError):
-            r.execute_phase6(first, first, first, first)
+    def test_executor_rejects_local_or_unidentified_clients(self):
+        for role in ("verifier", "deep", "patcher", "global", "linker"):
+            for execution, identity in (("local", "test/shared"), ("cloud", None), ("cloud", " ")):
+                with self.subTest(role=role, execution=execution, identity=identity):
+                    clients = {name: CloudDouble("test/shared") for name in
+                               ("verifier", "deep", "patcher", "global", "linker")}
+                    clients[role].execution = execution
+                    clients[role].identity = identity
+                    with self.assertRaises(ValueError):
+                        seeded().execute_phase6(*clients.values())
 
     def test_source_add_remove_update_and_binding_mismatch(self):
         r = seeded()

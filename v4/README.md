@@ -13,7 +13,7 @@ python -m v4
   → 四位分析師並行 → bull／bear 並行 → research_manager → trader → risk_manager
   → 每位角色回傳 V4 Claim schema，角色之間傳遞結構化物件
   → prepare_phase6_atomic：全部 Claim → 獨立、短證據脈絡的 LLM 驗證
-  → SUSPICIOUS／FAIL → 不同模型深度對抗審查；PASS 不進第二層
+  → SUSPICIOUS／FAIL → 第二輪深度對抗覆核（可用同一模型）；PASS 不進第二層
   → 精確 Claim ID 的局部修補
   → 原 Claim + dependency descendants（相依後代）失效、重新原子驗證
   → V4 renderer 從正式物件重新產生報告
@@ -36,7 +36,7 @@ python -m v4 --manifest /path/to/manifest.json \
 ```
 
 全部角色與審查統一透過既有 Antigravity `agy` 命令列連線，沿用其登入狀態及環境代理，不需要 `GEMINI_API_KEY`。
-模型 ID 由執行者從 `agy models` 清單明確選定，verifier 與 deep 必須不同；這是審查角色與模型 ID 的區分，並非兩套接入方式，也不能據此聲稱不同模型家族已驗證。
+模型 ID 由執行者從 `agy models` 清單明確選定，verifier（第一層驗證）與 deep（深度覆核）可使用相同或不同的模型 ID；兩者都是透過 Antigravity 接入。若要同一模型，將 `--verifier-model` 與 `--deep-model` 設為相同值即可。兩層仍分別提出請求、使用不同提示並保存各自的驗證紀錄；同模型兩輪覆核不代表跨模型交叉驗證，也可能重複同一模型的誤判。
 程式由 PATH 尋找 `agy`，或使用執行者設定的 `AGY_EXECUTABLE`。不安裝外掛、不建立／讀取金鑰檔、不啟動本地模型；失敗立即封鎖，不切換 direct API（直接 API）或其他後端。
 短 prompt 沿用 `agy --model ... -p ...`；超過 64 KiB UTF-8 位元組時，改以 stdin（標準輸入）傳送完整 `user` 事件，使用 `--input-format stream-json --output-format stream-json`，不把長文塞進命令列參數。協定依據：[Antigravity 官方 stdin 文件](https://www.antigravity.google/docs/cli/headless/#stream-prompts-from-stdin)。
 長文單次逾時為設定值與 1800 秒的較大者。兩條路徑都保留計畫模式、終端沙箱與停用指令展開，不加入略過權限旗標，也不呼叫 V3 的 API fallback（失敗轉接）。串流須恰有一個成功的完整 `result` 事件，不能把中途片段當成結果。
@@ -68,7 +68,7 @@ python -m v4 --manifest /path/to/manifest.json \
 每筆包含 `ref_id/relation/attributed_assertion/source_evidence/reason`，relation 為 SUPPORTS（支持）、CONTRADICTS（矛盾）或 INSUFFICIENT（證據不足）。
 模型必須以原文實際歸因的命題，對照 assertion、binding 與真實來源內容；不能抄正確來源欄位、卻不檢查原文是否把租金負債說成營收。
 引用反證時，檢查原文對反證內容的歸因是否正確，不要求每個來源獨立支持整個投資結論。
-漏回、重複、未知引用、缺說明都會被拒絕；矛盾必須 FAIL，證據不足不能 PASS。第二模型推翻第一層時，也必須重新交完整逐引用紀錄。
+漏回、重複、未知引用、缺說明都會被拒絕；矛盾必須 FAIL，證據不足不能 PASS。第二輪覆核推翻第一層時，也必須重新交完整逐引用紀錄。
 漏回、錯 ID、重複 ID、非法 verdict、過期回覆，都不能通過。深度審查可以推翻第一層的誤報。
 原子與深度審查的結構化規格明列四個必要欄位，並固定 Claim ID、引用 ID 集合與逐引用紀錄筆數；即使 schema（規格）合格，程式仍檢查重複引用、覆蓋完整性及 verdict／relation 一致性，不把欄位齊全等同語義正確。
 有效 JSON 卻缺欄位或不符合回覆契約時，collector（結果收集器）不再因單筆錯誤丟棄整批：已合格的驗證保存，不合格項不發布驗證紀錄，回傳 `blocked=true`、`needs_retry`、`retry_claim_ids`、`retry_prompts`、逐 Claim 的 `response_schemas` 與 `validation_errors`。

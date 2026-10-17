@@ -78,7 +78,7 @@ class SemanticAcceptance(unittest.TestCase):
             if len(deep_calls) == 1:
                 result.pop("reference_checks")
             return result
-        first, second = StructuredDouble("test/first", atomic), StructuredDouble("test/second", deep)
+        first, second = StructuredDouble("test/shared", atomic), StructuredDouble("test/shared", deep)
         first.assert_schema = second.assert_schema = lambda cid, s: self.assertEqual(
             s, semantic_review_schema(next(c for c in r.run.claims if c["claim_id"] == cid)))
         patcher = CloudDouble("test/author", lambda _: [dict(claim_id="b", text="corrected semantic attribution")])

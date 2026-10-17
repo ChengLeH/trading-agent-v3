@@ -31,8 +31,6 @@ def main(argv=None):
     runner, clients = None, {}
     try:
         clients = {role: AntigravityCloudClient(getattr(args, f"{role}_model")) for role in ("author", "verifier", "deep", "global")}
-        if clients["verifier"].identity == clients["deep"].identity:
-            raise ValueError("--verifier-model and --deep-model must differ")
         if args.resume:
             runner = load_checkpoint(args.resume)
             runner.journal = RunJournal(out, resume_from=args.resume, retry_roles=args.retry_role)
