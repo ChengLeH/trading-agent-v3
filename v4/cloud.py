@@ -127,8 +127,7 @@ class AntigravityCloudClient:
                     last_error, continue_session = exc, True
                     continue  # same durable CID, never resend the original task
                 if not exc.retryable:
-                    raise AntigravityError(exc.code, exit_code=exc.exit_code, attempts=attempt + 1,
-                                           conversation_id=exc.conversation_id) from None
+                    raise exc.with_context(attempts=attempt + 1) from None
                 last_error = exc
                 if exc.code == "invalid_json":
                     repair_json = True  # same-CID correction, never a fresh prompt
@@ -141,7 +140,8 @@ class AntigravityCloudClient:
             raise AntigravityError(last_error.code,
                                    retryable=last_error.retryable and last_error.code != "invalid_json",
                                    exit_code=last_error.exit_code, attempts=self.request_attempts,
-                                   conversation_id=last_error.conversation_id) from None
+                                   conversation_id=last_error.conversation_id, session_budget=last_error.session_budget,
+                                   request_context=last_error.request_context) from None
         with self._lock:
             self.calls.append(dict(transport="antigravity", requested_model=self.identity, served_model=None,
                                    agent_profile=AGENT_NAME, agent_policy_verified=True))

@@ -161,6 +161,12 @@ V3 的 Markdown 或舊 Claim 缺欄位時，不能自動用文字猜成 V4；必
 
 Mac 真實測試已在接收任務後刻意中斷，再用原對話 ID 續接；未重傳原始測試標記，回覆仍正確保留標記及算術答案。這證明上下文續接可用，沒有宣稱 87 條真實分析的總時間或帳單已下降。87 層合成依賴鏈的回歸測試驗證線上資料量小於舊全祖先版本的十分之一，同時遠端祖先修改仍使最後一節點失效。
 
+## 耗盡請求的指定恢復
+
+`blocked:session_exhausted` 的結果會列 `session_budget`（耗盡原因、已用／上限與上一個錯誤）及 `request_context`（精確 task／Claim IDs）。attempts 包含本機檢查與續接，不一定等於實際模型呼叫次數。`resumable=true` 表示可調整額度後續接；`retryable=false` 表示不能無策略地盲目重試。
+
+要保留原對話，先提高 `--session-max-continuations`／`--session-budget-seconds`。若操作者明確選擇重開該請求，在原本 `--resume` 指令加入 `--recover-session <CID> --replay-reason "授權理由"`。它只歸檔同 run／epoch 的指定耗盡對話並授權一個新世代；成功請求仍重播快取，不清資料、不換 API 或模型。結果中的 `session_recovery` 保留定位與歸檔資訊。沒有完整 sessions／responses 時不能單靠錯誤 JSON 恢復。
+
 ## 全局依賴漏審的補審
 
 全局掃描回覆若只涵蓋部分 Claim，原生流程保留已完成列與全局 findings，列出 `missing_dependency_claim_ids`，再以 `dependency_completion` 只要求補審缺漏項。補審仍用完整 DAG 判斷前提；不將漏項視為沒有依賴，也不重做已完成的全文掃描。

@@ -2,6 +2,8 @@
 from contextlib import nullcontext
 import hashlib
 import json
+import math
+from copy import deepcopy
 import os
 from pathlib import Path
 import selectors
@@ -26,7 +28,8 @@ class AntigravityError(RuntimeError):
                        "invalid_json", "unexpected_error", "session_pending", "session_busy",
                        "session_binding_changed", "conversation_unverified", "continuation_exhausted", "delivery_unconfirmed"})
 
-    def __init__(self, code, *, retryable=False, exit_code=None, attempts=1, conversation_id=None):
+    def __init__(self, code, *, retryable=False, exit_code=None, attempts=1, conversation_id=None,
+                 session_budget=None, request_context=None):
         if (not isinstance(code, str) or code not in self.CODES or type(retryable) is not bool
                 or (exit_code is not None and type(exit_code) is not int)
                 or type(attempts) is not int or attempts < 1):
@@ -36,6 +39,23 @@ class AntigravityError(RuntimeError):
                 UUID(conversation_id)
             except (ValueError, TypeError, AttributeError):
                 raise ValueError("invalid conversation ID") from None
+        if session_budget is not None:
+            fields = {"continuations_used", "max_continuations", "elapsed_seconds", "budget_seconds", "last_session_error", "exhausted_by"}
+            if (not isinstance(session_budget, dict) or set(session_budget) != fields
+                    or any(type(session_budget[k]) is not int or session_budget[k] < 0 for k in ("continuations_used", "max_continuations"))
+                    or any(type(session_budget[k]) not in (int, float) or not math.isfinite(session_budget[k]) or session_budget[k] < 0 for k in ("elapsed_seconds", "budget_seconds"))
+                    or session_budget["last_session_error"] not in (None, *self.CODES)
+                    or not isinstance(session_budget["exhausted_by"], list)
+                    or any(k not in ("continuations", "time") for k in session_budget["exhausted_by"])):
+                raise ValueError("invalid session budget diagnostics")
+        if request_context is not None and (not isinstance(request_context, dict)
+                or set(request_context) != {"task_id", "session_directory", "layer", "claim_ids"}
+                or any(not isinstance(request_context[k], str) or not request_context[k] for k in ("task_id", "session_directory", "layer"))
+                or not isinstance(request_context["claim_ids"], list)
+                or any(not isinstance(cid, str) or not cid for cid in request_context["claim_ids"])
+                or len(request_context["claim_ids"]) != len(set(request_context["claim_ids"]))):
+            raise ValueError("invalid request diagnostics")
+        self.session_budget, self.request_context = deepcopy(session_budget), deepcopy(request_context)
         self.conversation_id = conversation_id
         self.code, self.retryable = code, retryable
         self.exit_code, self.attempts = exit_code, attempts
@@ -45,8 +65,21 @@ class AntigravityError(RuntimeError):
         result = dict(error_code=self.code, retryable=self.retryable,
                       exit_code=self.exit_code, attempts=self.attempts)
         if self.conversation_id is not None:
-            result.update(conversation_id=self.conversation_id, resumable=self.code == "session_pending")
+            result.update(conversation_id=self.conversation_id,
+                          resumable=self.code in {"session_pending", "continuation_exhausted", "invalid_json"})
+        if self.session_budget is not None:
+            result["session_budget"] = deepcopy(self.session_budget)
+        if self.request_context is not None:
+            result["request_context"] = deepcopy(self.request_context)
+        if self.code == "continuation_exhausted":
+            result["recovery_options"] = ["raise_same_session_limits", "explicitly_authorize_one_new_session"]
         return result
+
+    def with_context(self, *, attempts=None, request_context=None):
+        return AntigravityError(self.code, retryable=self.retryable, exit_code=self.exit_code,
+                                attempts=self.attempts if attempts is None else attempts,
+                                conversation_id=self.conversation_id, session_budget=self.session_budget,
+                                request_context=self.request_context if request_context is None else request_context)
 
 
     def blocked_status(self, default):
@@ -139,11 +172,18 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
                     raise AntigravityError("conversation_unverified", conversation_id=cid)
                 if not cid:
                     raise AntigravityError("conversation_unverified")
-                if state["continuations"] >= state["max_continuations"]:
-                    raise AntigravityError("continuation_exhausted", conversation_id=cid)
             remaining = state["budget_seconds"] - state["elapsed_seconds"]
+            exhausted = []
+            if state["request_sent"] and state["continuations"] >= state["max_continuations"]:
+                exhausted.append("continuations")
             if remaining <= 0:
-                raise AntigravityError("continuation_exhausted", conversation_id=state.get("conversation_id"))
+                exhausted.append("time")
+            if exhausted:
+                raise AntigravityError("continuation_exhausted", conversation_id=state.get("conversation_id"),
+                                       session_budget=dict(continuations_used=state["continuations"],
+                                           max_continuations=state["max_continuations"], elapsed_seconds=state["elapsed_seconds"],
+                                           budget_seconds=state["budget_seconds"], exhausted_by=exhausted,
+                                           last_session_error=state.get("last_error") if state.get("last_error") in AntigravityError.CODES else None))
             started = time.monotonic()
             prior_error, prior_status = state.get("last_error"), state["status"]
             prior_continuations, previously_sent = state["continuations"], state["request_sent"]

@@ -1,14 +1,15 @@
 """Durable run progress and per-request responses, outside process temp storage."""
 import json
+import hashlib
 import time
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 from pathlib import Path
 from .checkpoint import save_checkpoint, write_json
 from .schema import digest
-from .cloud import request_completion
+from .cloud import request_completion, structured_prompt
 from .agy_session import AntigravityError
-from .session_replay import replay_marker, lifecycle_lock
+from .session_replay import replay_marker, lifecycle_lock, abandon_session
 
 
 class RunJournal:
@@ -76,7 +77,8 @@ class RunJournal:
                 if saved.get("status") == "failed":
                     failure = AntigravityError(saved.get("error_code"), retryable=saved.get("retryable"),
                                                exit_code=saved.get("exit_code"), attempts=saved.get("attempts"),
-                                               conversation_id=saved.get("conversation_id"))
+                                               conversation_id=saved.get("conversation_id"), session_budget=saved.get("session_budget"),
+                                               request_context=saved.get("request_context"))
                     origin = Path(saved.get("session_directory", directory / "sessions" / digest(metadata)))
                     if can_use_session and (origin / "session.json").is_file() and failure.code in {"session_pending", "missing_init", "cli_start_failed", "invalid_stream", "invalid_json", "continuation_exhausted"}:
                         session_directory = origin
@@ -101,6 +103,89 @@ class RunJournal:
         except BlockingIOError:
             raise AntigravityError("session_busy") from None
 
+    def authorize_session_replay(self, runner, conversation_id, *, reason):
+        """Explicitly archive one exhausted request belonging to this run."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("explicit paid-replay reason required")
+        if not isinstance(conversation_id, str):
+            raise ValueError("conversation ID required")
+        conversation_id = str(UUID(conversation_id))
+        allowed_roots = {(root.resolve() / "sessions").resolve() for root in self.read_directories}
+        matches = {}
+        for directory in self.read_directories:
+            for path in (directory / "responses").glob("*.json"):
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                if (saved.get("run_id") != runner.run_id or str(saved.get("conversation_id", "")).lower() != conversation_id
+                        or saved.get("status") != "failed" or saved.get("error_code") != "continuation_exhausted"):
+                    continue
+                review = saved.get("review", {})
+                if review and review.get("verification_epoch") != runner._verification_epoch:
+                    continue
+                if not isinstance(saved.get("session_directory"), str) or not saved["session_directory"]:
+                    raise ValueError("exhausted request lacks a persistent session directory")
+                target = Path(saved["session_directory"]).resolve()
+                if target.parent not in allowed_roots:
+                    raise ValueError("session directory is outside this run's allowed sessions roots")
+                keys = ("format", "run_id", "model", "task_id", "prompt_hash", "review", "agent_policy_sha256", "response_schema_hash")
+                metadata = {k: saved[k] for k in keys if k in saved}
+                attempt = saved.get("attempt_id")
+                if (saved.get("format") != "v4-response/1" or path.name != digest(metadata) + ".json"
+                        or not isinstance(attempt, str) or UUID(attempt).hex != attempt):
+                    raise ValueError("invalid exhausted request identity")
+                matches[target] = saved
+        if len(matches) != 1:
+            raise ValueError("expected exactly one exhausted request for this run and conversation")
+        directory, saved = next(iter(matches.items()))
+        with lifecycle_lock(directory):
+            state_path = directory / "session.json"
+            if not state_path.exists():
+                marker = replay_marker(directory)
+                if marker is None:
+                    raise ValueError("exhausted session state is missing")
+                state_path = Path(marker["archive_directory"]) / "session.json"
+            if state_path.exists():
+                state = json.loads(state_path.read_text())
+                self._validate_replay_binding(saved, state, state_path.parent)
+                if str(state.get("conversation_id", "")).lower() != conversation_id:
+                    raise ValueError("session generation changed; refuse a second replay")
+                if saved["model"] != "antigravity/" + str(state.get("model")):
+                    raise ValueError("exhausted session model differs from saved request")
+                used, maximum = state.get("continuations"), state.get("max_continuations", 2)
+                elapsed, budget = state.get("elapsed_seconds"), state.get("budget_seconds")
+                count_exhausted = type(used) is int and type(maximum) is int and used >= maximum
+                time_exhausted = (type(elapsed) in (int, float) and type(budget) in (int, float)
+                                  and elapsed >= budget)
+                if not count_exhausted and not time_exhausted:
+                    raise ValueError("session limits are no longer exhausted; continue the existing conversation")
+            archive = abandon_session(directory, reason=reason)
+            authorization = replay_marker(directory)
+        return dict(conversation_id=conversation_id, task_id=saved["task_id"], model=saved["model"],
+                    session_directory=str(directory), archive_directory=str(archive),
+                    generation=authorization["generation"], reason=authorization["reason"])
+
+    def _validate_replay_binding(self, saved, state, directory):
+        request = json.loads((directory / "request.json").read_text())
+        wire = request.get("prompt")
+        if (not isinstance(wire, str) or request.get("model") != state.get("model")
+                or hashlib.sha256(wire.encode()).hexdigest() != state.get("prompt_sha256")
+                or (saved.get("agent_policy_sha256") is not None
+                    and saved["agent_policy_sha256"] != state.get("agent_template_sha256"))):
+            raise ValueError("exhausted session request binding differs from saved request")
+        # A schema footer changes the wire hash, but not the journal's original
+        # prompt hash. Validate the exact framework footer, never infer prose.
+        if digest(wire) == saved.get("prompt_hash"):
+            return
+        if saved.get("response_schema_hash") and wire.endswith("\n</response-schema>"):
+            _, separator, encoded = wire.rpartition("\n<response-schema>\n")
+            if separator:
+                encoded = encoded.removesuffix("\n</response-schema>")
+                schema = json.loads(encoded)
+                footer = structured_prompt("", encoded)
+                if (wire.endswith(footer) and digest(schema) == saved["response_schema_hash"]
+                        and digest(wire[:-len(footer)]) == saved.get("prompt_hash")):
+                    return
+        raise ValueError("exhausted session prompt differs from saved request")
+
     def _request_locked(self, client, prompt, response_schema, explicit_resume, session_directory, metadata, relative):
         can_use_session = callable(getattr(client, "complete_in_session", None))
         # Fail before starting paid work if the output directory cannot be
@@ -117,11 +202,14 @@ class RunJournal:
         try:
             result = request_completion(client, prompt, response_schema, session_dir=session_directory, resume=explicit_resume)
         except AntigravityError as exc:
+            exc = exc.with_context(request_context=dict(task_id=metadata["task_id"],
+                session_directory=str(session_directory.resolve()), layer=metadata.get("review", {}).get("layer", "role"),
+                claim_ids=list(metadata.get("review", {}).get("task_hashes", {}))))
             failed = {**metadata, **timing, "session_directory": str(session_directory.resolve()), "elapsed_seconds": round(time.monotonic() - started, 3),
                       "attempt_id": attempt, "status": "failed", **exc.details()}
             write_json(self.directory / "responses" / "archive" / (attempt + ".json"), failed)
             write_json(self.directory / relative, failed)
-            raise
+            raise exc from None
         received = {**metadata, **timing, "session_directory": str(session_directory.resolve()), "elapsed_seconds": round(time.monotonic() - started, 3),
                     "attempt_id": attempt, "status": "received", "response": result}
         # Keep previous attempts for audit, including explicitly retried roles.

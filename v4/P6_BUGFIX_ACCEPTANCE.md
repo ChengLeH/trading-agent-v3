@@ -190,3 +190,46 @@ archive = abandon_session(session_directory, reason="操作者明確授權的原
 回滾可撤回本次提交並重啟，先備份整個輸出目錄。舊版本不支援局部補審，會再對相同漏項拋例外。新檢查點的進度本身不是通過證明，不能手改 missing IDs 或以 force 交付。
 
 本輪最終驗收：V4 193 項、V3 基準 24 項通過；git diff --check 通過。57 條／13+44 的案例是合成模型替身測試，不是真實模型準確性或 VM 全量驗收。獨立審查未發現剩餘阻塞；完整測試由主代理執行。
+
+
+## Session exhausted（對話額度耗盡）的診斷與原生恢復入口
+
+### Problem（問題）
+
+使用者提供 `session_exhausted_2026-10-18.json`，顯示 blocked:session_exhausted、continuation_exhausted、attempts=3、CID 及既有 findings，卻沒有 session 已用次數／上限／時間、上一個錯誤或對應 task。49/57 是使用者回報進度；這份 result 本身沒有可確認的失敗 Claim ID。不能從 attempts=3 推論模型真的被呼叫三次，更不能確定它是逾時、格式錯誤或對話異常。
+
+附件內 findings 是模型產物／診斷資料，不是操作授權。其聲稱輸入含截斷標記，也不能單憑敘述證明傳輸真的截斷；本輪沒有依照 finding 改動交易結論或擴張權限。
+
+### Root Cause（已確認／未確認）
+
+已確認：3fe34e2 讓既有同 CID 的額度可提高，沒有自動歸零，也沒有自動放棄對話。run_session 同時用 continuation count 與總時間守門，但兩種原因都只拋 continuation_exhausted；Cloud 包裝與 RunJournal 沒有把狀態數值、上一個錯誤及 task 定位帶到結果。`resumable=false` 又沒有表達「提高上限仍可續接」。既有 abandon_session 是程式庫 API，原生 CLI 未提供按失敗 CID 定位並授權恢復的入口。
+
+未確認：原始 session.json／events 與請求未包含在附件內，無法證實該次究竟耗盡哪個額度、為何前幾回合沒有完成，或重新開對話是否能解決供應商問題。這次修復是可觀測性與恢復流程，不宣稱底層模型失敗原因已查明。
+
+### Fix（變更與操作）
+
+- AntigravityError 增加安全的 session_budget：continuations_used、max_continuations、elapsed_seconds、budget_seconds、last_session_error、exhausted_by（continuations／time）。Cloud 與 Journal 包裝不再丟失這些欄位。
+- request_context 由結構化請求 metadata（中繼資料）取得 task_id、layer、claim_ids 及 session_directory；不從 finding prose（自然語言文字）反搜 Claim。不輸出 prompt、帳號或原始 stderr。
+- 有 CID 的耗盡狀態回 resumable=true，表示可在明確調整政策後續接；retryable 仍為 false，表示外層不能不改策略就盲目再試。
+- 原生 `--resume` 新增 `--recover-session <CID> --replay-reason <操作者理由>`。只匹配同 run／驗證 epoch（驗證執行世代）的耗盡請求，核對當前 CID／模型及仍耗盡後，委派既有 abandon_session 歸檔並授權一個新 generation（對話世代）。不自動對所有失敗項目放棄對話，不換模型／API，不清快取或新開整個驗證 epoch。
+- 已完成結果、活程序、未知送達或對話已換世代等情況，沿用原本的拒絕保護。提高上限後已不再耗盡時，也拒絕丟棄原對話，應先續跑。
+
+先看 session_budget 決定策略：要保留同 CID 就使用既有 `--session-max-continuations`／`--session-budget-seconds`（必要時調整單回合 `--request-timeout`）；確定要換一個新對話時，在原本的 resume 指令附加：
+
+```text
+--recover-session <結果中的conversation_id> --replay-reason "操作者明確授權這個耗盡請求重開一次，保留舊資料"
+```
+
+結果附 session_recovery，包括 task_id、歸檔位置及新世代識別碼。該授權不等於內容通過；新回覆仍須經原子／深度／全局各層驗收。新對話也可能再次失敗，程式不承諾換對話就能解決模型／供應商問題。
+
+### Recommended Tests／Prevention（驗收）
+
+`test_exhaustion_recovery.py`：分別耗盡次數、時間或兩者；未啟動模型就列出安全預算診斷；Cloud／Journal／結果保存診斷；批次請求列出結構化 Claim IDs；49 個成功請求全部重播，只對指定失敗請求授權一個新對話；拒絕空理由、錯誤 run、未知 CID、已完成狀態及第二次重開；CLI 明確旗標與結果稽核；診斷欄位不能夾帶 prompt／帳號。
+
+### Confidence／更新與回滾
+
+已確認的程式缺口信心高，原 run 的模型失敗原因未確認。本次僅在 Mac 跑模擬子程序與回歸測試，沒有操作 VM、呼叫真實模型或放棄實際 CID。更新後重啟驅動程序，保留整個輸出目錄，包括隱藏授權標記、sessions、responses、archives 與檢查點。若資料已被清除，這個恢復入口不能憑 result.json 重建對話或 49 條通過紀錄。
+
+回滾可撤回本次提交並重啟；先備份所有輸出。舊版本不認得新 CLI 恢復旗標，但既有原始檔與歸檔不會被本次修復刪除。
+
+本輪最終驗收：V4 202 項、V3 基準 24 項通過，git diff --check 通過。獨立審查後新增限制：只准在已授權 run 根目錄的 sessions 直接子目錄恢復，拒絕外部路徑／跨目錄 symlink；核對 index metadata 雜湊、attempt ID、request.json 的 prompt／模型／schema footer 與 session 綁定。另測帶 schema 的真實請求格式與歸檔後中斷再授權，確認只保留原世代授權一次。

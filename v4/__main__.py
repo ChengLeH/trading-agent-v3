@@ -41,9 +41,22 @@ def main(argv=None):
                         help="Response-contract attempts per claim/input; default 3, resume can raise the saved ceiling")
     parser.add_argument("--retry-role", action="append", choices=ROLES, default=[],
                         help="Re-request an uncommitted role output instead of replaying its saved response")
+    parser.add_argument("--recover-session",
+                        help="Explicitly authorize one new generation for this exhausted conversation ID; requires --resume")
+    parser.add_argument("--replay-reason", help="Required operator reason for --recover-session; old session is archived")
     parser.add_argument("--fresh-verification", action="store_true",
                         help="Explicitly start a new verification epoch instead of continuing saved requests")
     args = parser.parse_args(argv)
+    if bool(args.recover_session) != bool(args.replay_reason):
+        parser.error("--recover-session and --replay-reason must be provided together")
+    if args.recover_session and (not args.resume or args.fresh_verification):
+        parser.error("--recover-session requires --resume and cannot combine with --fresh-verification")
+    if args.recover_session:
+        from uuid import UUID
+        try:
+            UUID(args.recover_session)
+        except ValueError:
+            parser.error("--recover-session must be a conversation UUID")
     if args.review_batch_max_bytes is not None and args.review_batch_max_bytes < 1024:
         parser.error("--review-batch-max-bytes must be >=1024")
     out = Path(args.out)
@@ -53,7 +66,7 @@ def main(argv=None):
         print(json.dumps(dict(status="blocked:output", blocked=True, result_written=False,
                               reason=f"{type(exc).__name__}: {exc}"), ensure_ascii=False))
         return 2
-    runner, clients = None, {}
+    runner, clients, recovery = None, {}, None
     try:
         clients = {role: AntigravityCloudClient(getattr(args, f"{role}_model"), timeout=args.request_timeout, session_root=out / "sessions",
                                                          max_continuations=args.session_max_continuations,
@@ -81,6 +94,8 @@ def main(argv=None):
                 runner.review_batch_max_bytes = args.review_batch_max_bytes
             runner.journal = RunJournal(out, resume_from=args.resume, retry_roles=args.retry_role,
                                         continue_verification=not args.fresh_verification)
+            if args.recover_session:
+                recovery = runner.journal.authorize_session_replay(runner, args.recover_session, reason=args.replay_reason)
             result = runner.resume(clients["author"], clients["verifier"], clients["deep"], clients["global"])
         else:
             manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
@@ -94,6 +109,8 @@ def main(argv=None):
         details = exc.details() if isinstance(exc, AntigravityError) else {}
         result = dict(blocked=True, status=exc.blocked_status("blocked:input") if isinstance(exc, AntigravityError) else "blocked:input",
                       reason=f"{type(exc).__name__}: {exc}", **details)
+    if recovery is not None:
+        result["session_recovery"] = recovery
     if args.check_transport:
         result.update(capability_check=True, user_prompt_sent=False)
     if runner is not None and runner.run_id:
