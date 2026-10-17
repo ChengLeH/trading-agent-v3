@@ -345,6 +345,28 @@ result(json.dumps(dict(size=len(data), sha256=hashlib.sha256(data).hexdigest(), 
                 self.assertTrue(state["result_received_at"])
                 self.assertLess(state["result_to_completion_seconds"], 1)
 
+    def test_slow_generation_and_fragmented_result_do_not_use_teardown_deadline(self):
+        # Simulate a slow provider without loading a model: token gaps and a
+        # partial terminal frame both exceed the post-result drain interval.
+        body = r'''
+init()
+sys.stdin.readline()
+for delta in ('slow ', 'answer'):
+    emit(dict(event="step_update", step_update=dict(step_type="agent_response", text_delta=delta)))
+    time.sleep(.4)
+frame=json.dumps(dict(event="result", result=dict(status="SUCCESS", response='{"done":true}')))
+cut=len(frame)//2
+sys.stdout.write(frame[:cut]);sys.stdout.flush()
+time.sleep(.4)
+sys.stdout.write(frame[cut:]+"\n");sys.stdout.flush()
+time.sleep(10)
+'''
+        with tempfile.TemporaryDirectory() as temp, cli_stub(body) as executable:
+            self.assertEqual(run_session(executable, "model", "request", 5, session_dir=temp), '{"done":true}')
+            state = json.loads((Path(temp) / "session.json").read_text())
+            self.assertEqual(state["status"], "complete")
+            self.assertLess(state["result_to_completion_seconds"], 1)
+
     def test_trailing_duplicate_after_terminal_result_is_still_rejected(self):
         body = 'init()\nsys.stdin.readline()\nresult()\ntime.sleep(.05)\nresult()\n'
         with cli_stub(body) as executable, self.assertRaisesRegex(AntigravityError, "invalid_stream"):
