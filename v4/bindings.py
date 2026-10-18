@@ -74,20 +74,18 @@ def validate_claim_bindings(
     for claim in claims:
         cid = claim.get("claim_id", "?")
         bindings = claim.get("bindings") or []
-        grounded = claim.get("claim_type") in {
-            "source_fact", "derived_fact", "semantic_fact"
-        }
-        if grounded and not bindings:
+        source_refs = set(claim.get("refs", [])).intersection(canonical)
+        bound_refs = {b.get("ref_id") for b in bindings if isinstance(b, dict)}
+        for ref_id in sorted(source_refs - bound_refs):
             out.append(BindingFinding(
                 claim_id=cid,
-                ref_id="",
+                ref_id=ref_id,
                 status="FAIL" if require_bindings else "WARN",
                 dimension="bindings",
-                expected="at least one explicit binding",
+                expected="one explicit binding for this source reference",
                 actual="missing",
-                reason="grounded claim has no typed source binding",
+                reason="referenced source has no typed binding",
             ))
-            continue
 
         for raw in bindings:
             if not isinstance(raw, dict):

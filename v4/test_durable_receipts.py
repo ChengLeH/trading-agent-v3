@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from .checkpoint import load_checkpoint
 from .journal import RunJournal
@@ -10,6 +11,39 @@ from .test_integration import CloudDouble, seeded, verdict, reference_ids, globa
 
 
 class DurableReviewReceipts(unittest.TestCase):
+    def test_previous_semantic_contract_cannot_restore_completed_reviews(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch("v4.runner.SEMANTIC_REVIEW_CONTRACT", "v4-semantic-review/2"):
+                runner, _, checkpoint = self._review_and_save(temp)
+            self.assertTrue(runner.receipts)
+            resumed = load_checkpoint(checkpoint)
+            self.assertEqual(resumed.receipts, {})
+            self.assertEqual(resumed.prepare_phase6_atomic()["claim_count"], len(runner.run.claims))
+
+    def test_catalog_scope_change_invalidates_reviews_after_restart(self):
+        from v3.facts import Fact
+        from .checkpoint import save_checkpoint
+        with tempfile.TemporaryDirectory() as temp:
+            runner, _, checkpoint = self._review_and_save(temp)
+            runner.run.fact_store.add(Fact(fact_id="new.metric", value=1, unit="USD", period="2026-Q2",
+                                          concept="CapitalExpenditure", source_id="fixture"))
+            save_checkpoint(runner, checkpoint)
+            resumed = load_checkpoint(checkpoint)
+            self.assertEqual(resumed.receipts, {})
+            tasks = resumed._tasks()
+            self.assertIn("CapitalExpenditure", tasks["a"].context["evidence_scope"]["fact_concepts"])
+
+    def test_source_record_change_alone_invalidates_catalog_review_receipts(self):
+        from v3.sources import SourceRecord
+        from .checkpoint import save_checkpoint
+        with tempfile.TemporaryDirectory() as temp:
+            runner, _, checkpoint = self._review_and_save(temp)
+            runner.run.records.append(SourceRecord(id="new.source", type="generic_text", subject_ticker="TEST",
+                                                    subject_cik=None, payload="new text", source_hash="new hash"))
+            save_checkpoint(runner, checkpoint)
+            resumed = load_checkpoint(checkpoint)
+            self.assertEqual(resumed.receipts, {})
+
     def _review_and_save(self, directory):
         runner = seeded()
         runner.journal = RunJournal(directory)

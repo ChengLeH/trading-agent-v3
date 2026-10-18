@@ -200,8 +200,9 @@ class OrchestratorV4(Orchestrator):
             # Claim refs already resolve through claim_index and must be DAG
             # dependencies. Optional bindings preserve the model's attribution;
             # they are not canonical source records or a reason to skip NLI.
-            if c["claim_type"] in {"source_fact", "derived_fact", "semantic_fact"} and not expected:
-                raise ClaimSourceError(c)
+            # A model-authored label cannot establish the evidence obligation.
+            # All admitted objects remain unverified until the mandatory LLM
+            # review checks their substance, including zero-source assertions.
         run.claims = deepcopy(candidate)
         for role in claims_by_role:
             run.analyses[role] = {}

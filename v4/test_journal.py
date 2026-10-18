@@ -36,40 +36,39 @@ class Journal(unittest.TestCase):
         self.assertEqual(result['next_action'], 'inspect_claim_input')
         self.assertEqual(result['role_validation']['claim_id'], 'bad.patch')
 
-    def test_invalid_grounded_role_output_identifies_claim_and_plain_resume_replays_it(self):
+    def test_role_notes_reach_atomic_and_completed_reviews_survive_restart(self):
         r = seeded(); r.run.claims = []; r.run.analyses = {}
-        def invalid_author(prompt):
+        def author_with_notes(prompt):
             output = author_response(prompt)
-            if output['claims'][0]['author_role'] == 'market_analyst':
-                output['claims'][0]['claim_type'] = 'source_fact'
+            c = output['claims'][0]
+            if c['author_role'] == 'fundamentals_analyst':
+                c.update(claim_id='fundamentals_analyst.data_limitations_and_risks',
+                         claim_type='semantic_fact', text='本次輸入資料的充分性仍需確認。')
+            elif c['author_role'] == 'research_manager':
+                c.update(claim_id='research_manager.001', claim_type='semantic_fact',
+                         text='目前無法確認是否有傳輸截斷，不能把猜測當成原因。',
+                         refs=['market_analyst.restart'], dependencies=['market_analyst.restart'])
             return output
         with tempfile.TemporaryDirectory() as temp:
             r.journal = RunJournal(temp)
-            author = CloudDouble('test/author', invalid_author)
-            clients = [CloudDouble(), CloudDouble('test/deep'),
-                       CloudDouble('test/global', lambda _: global_verdict(r))]
-            first = r.resume(author, *clients)
-            self.assertEqual(first['status'], 'blocked:roles')
-            self.assertEqual(first['role_validation']['claim_id'], 'market_analyst.restart')
-            self.assertEqual(first['role_validation']['author_role'], 'market_analyst')
-            self.assertEqual(first['role_validation']['refs'], [])
-            self.assertEqual(first['role_validation']['code'], 'grounded_source_required')
-            self.assertEqual(first['retry_role'], 'market_analyst')
-            self.assertEqual(first['pending_stage'], 'roles')
-            self.assertEqual(r.run.claims, [])
-            self.assertEqual(len(author.calls), 4)
-            second = r.resume(author, *clients)
-            self.assertEqual(second['role_validation'], first['role_validation'])
-            self.assertEqual(len(author.calls), 4)  # no new generation in plain resume
-            self.assertTrue(all(not c.calls for c in clients))
-            author.responder = author_response
-            r.journal.retry_roles.add('market_analyst')
-            recovered = r.resume(author, *clients)
-            self.assertFalse(recovered['blocked'], recovered)
-            requested_roles = [json.loads(p.split('<context-data>\n')[1].split('\n</context-data>')[0])['role']
-                               for p in author.calls[4:]]
-            self.assertEqual(requested_roles.count('market_analyst'), 1)
-            self.assertFalse(set(requested_roles).intersection({'news_analyst', 'social_analyst', 'fundamentals_analyst'}))
+            author = CloudDouble('test/author', author_with_notes)
+            verifier = CloudDouble()
+            deep = CloudDouble('test/deep')
+            sweep = CloudDouble('test/global', lambda _: global_verdict(r))
+            result = r.resume(author, verifier, deep, sweep)
+            self.assertFalse(result['blocked'], result)
+            self.assertEqual(len(author.calls), 9)
+            self.assertEqual(len(verifier.calls), len(r.run.claims))
+            self.assertEqual(deep.calls, [])
+            notes = {'fundamentals_analyst.data_limitations_and_risks', 'research_manager.001'}
+            self.assertTrue(notes <= r.receipts.keys())
+            self.assertTrue(r.global_receipt)
+            resumed = load_checkpoint(Path(temp) / 'checkpoint.json')
+            resumed.journal = RunJournal(temp)
+            sweep.responder = lambda _: global_verdict(resumed)
+            self.assertFalse(resumed.resume(author, verifier, deep, sweep)['blocked'])
+            self.assertEqual(len(author.calls), 9)
+            self.assertEqual(len(verifier.calls), len(r.run.claims))
 
     def test_policy_failure_is_durable_and_resume_never_replays_failed_response(self):
         from .agy_session import AntigravityError

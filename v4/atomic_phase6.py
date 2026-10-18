@@ -15,9 +15,11 @@ from copy import deepcopy
 from uuid import uuid4
 from .cloud import structured_prompt
 from .schema import claim_index, digest
-from .semantic_contracts import (REFERENCE_INSTRUCTIONS, MissingReferenceChecks,
+from .semantic_contracts import (REFERENCE_INSTRUCTIONS, EVIDENCE_INSTRUCTIONS, MissingReferenceChecks,
                                  normalize_reference_checks, SEMANTIC_REVIEW_CONTRACT,
                                  semantic_review_schema, review_ref_ids, require_text)
+
+CATALOG_DETAIL_MAX_BYTES = 4096
 
 
 @dataclass
@@ -76,6 +78,27 @@ def _evidence_dict(store) -> Dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _evidence_scope(run, facts, calcs, evidence, events):
+    """Small metadata inventory, never a prose classifier or absence proof.
+
+    Exclude generated trade resources so a trade patch does not invalidate
+    unrelated analysts merely by changing the inventory counts.
+    """
+    trade_facts, trade_calcs = getattr(run, "trade_generated", ([], []))
+    inputs = [f for fid, f in facts.items() if fid not in trade_facts]
+    calculations = [c for cid, c in calcs.items() if cid not in trade_calcs]
+    records = [dict(id=r.id, type=r.type, source_hash=r.source_hash)
+               for r in getattr(run, "records", []) if hasattr(r, "source_hash")]
+    concepts = sorted({f["concept"] for f in inputs if f.get("concept")})
+    include_concepts = len(json.dumps(concepts, ensure_ascii=False).encode("utf-8")) <= CATALOG_DETAIL_MAX_BYTES
+    return dict(scope="current_ingested_catalog_metadata", includes_source_contents=False,
+                counts=dict(facts=len(inputs), calcs=len(calculations), evidence=len(evidence), events=len(events)),
+                fact_concepts=concepts if include_concepts else None,
+                fact_concept_count=len(concepts), fact_concepts_hash=digest(concepts),
+                source_record_count=len(records), source_types=sorted({r["type"] for r in records}),
+                source_records_hash=digest(sorted(records, key=lambda r: r["id"])))
+
+
 def build_atomic_tasks(run) -> List[AtomicTask]:
     """Create one small review task per claim from explicit refs only."""
 
@@ -83,6 +106,7 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
     calcs = run.calc_store.to_dict()
     evidence = _evidence_dict(run.evidence_store)
     events = getattr(run, "events", {})
+    evidence_scope = _evidence_scope(run, facts, calcs, evidence, events)
     claims = claim_index(run.claims)
     tasks: List[AtomicTask] = []
 
@@ -145,6 +169,7 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
             dependency_claims=deps,
             unresolved_refs=unresolved,
             context={"as_of": getattr(run, "manifest", {}).get("as_of"),
+                     "evidence_scope": deepcopy(evidence_scope),
                      "trade": deepcopy(getattr(run, "trade", {}))
                      if claim.get("author_role") in {"trader", "risk_manager"} else {}},
         ))
@@ -228,6 +253,7 @@ def build_reference_supplement_prompt(task: AtomicTask, prior_result, missing_re
     )
     instructions = (
         role_instructions
+        + EVIDENCE_INSTRUCTIONS
         + "只補 expected_reference_ids 所列的缺漏引用；reference_checks 必須只含這些 ID。"
         + "逐項比對原文歸因與 context 內實際證據，不相關的真實摘錄不構成支持。"
         + "relation 只能是 SUPPORTS、CONTRADICTS、INSUFFICIENT；矛盾必須判 FAIL，"
@@ -261,6 +287,7 @@ def build_reference_verdict_repair_prompt(task: AtomicTask, accepted_reference_c
             "你是 V4 的原子化語義驗證員。重新判斷 Claim 的整體語義與 verdict。")
     instructions = (
         role
+        + EVIDENCE_INSTRUCTIONS
         + "accepted_reference_checks 是已完成且保存的來源審查；使用它們判斷主張，但不要重審、改寫或重複回傳。"
         + "只修正 validation_error 指出的 verdict/findings/結構契約問題。"
         + "所有 Claim 仍須由你作語義判斷；來源支持不足、矛盾或不確定時，不可判 PASS。"

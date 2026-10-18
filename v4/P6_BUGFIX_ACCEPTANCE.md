@@ -433,3 +433,32 @@ test_semantic_acceptance.py 新增五項回歸：只改 b.dependencies 能使 b 
 回滾程式可撤回本輪提交並重啟；資料回滾使用已保留的原始快照。若 `--out` 指向原 run 目錄，正常保存會更新該處 Checkpoint，需保留原快照時先備份或使用另一輸出目錄。
 
 最終驗收：V4 252 項通過（54.885 秒），V3 基準 13＋11 項通過，`git diff --check` 與本輪 Python 語法檢查通過。獨立審查找到的混合 no-op 歷史問題已加入回歸並修正；另套用一項重用簡化及一項消除重複線性搜尋的改善。未抽換整段 CLI 控制流程，以保持本次修改範圍。套件使用模擬 client，不代表實際模型已驗過已修 Checkpoint。
+
+
+## Claim 類型與證據義務修正（2026-10-19）
+
+**Problem**：資料限制與流程說明被作者標為 semantic_fact，只有 Claim 前提或沒有直接引用，整個角色在語義審查前就遭退件。
+
+**Root Cause**：ad0398c 的 pipeline.py:203 依 claim_type 要求直接來源；即使移除這道閘門，bindings.py:77 的同類型判斷仍會產生缺 binding 的 FAIL。角色提示只列類型名稱，缺少證據義務說明。模型分類因此同時控制兩道程式閘門，已存在的逐條 LLM 驗證根本沒有機會判斷這些內容。
+
+**Fix**：角色提交不再依類型標籤要求直接來源，binding 改按實際來源引用檢查，保留 ID、DAG、數值、事件與 typed binding 驗證。共用語義指令涵蓋單條、批次、深度、引用補審與判決補正；依實質內容判斷證據需求，後設說明不得豁免，缺資料不等於零，流程截斷須有實際紀錄。所有 Claim 仍須原子語義驗證，非 PASS 進深度覆核，修補後重驗後代，最後全局掃描維持必做。
+
+新增 evidence_scope 輔助目錄，只含計數、概念與來源紀錄指紋，參與任務雜湊。概念細節超過 4 KiB 時整份明細不附並明示 null，保留數量及指紋；不裁切任何明確引用的來源。排除交易產生的 Fact／Calc，避免交易修補造成無關分析師重驗。語義契約升為 v4-semantic-review/3，不新增必填回覆欄位或分類模型。
+
+**Recommended Tests／Prevention**：六種類型皆能提交只有 Claim 前提的待驗內容；兩個實際角色模式完成生成、逐條驗證、全局掃描及重啟續用；無證據財務主張、把缺資料當零、無紀錄截斷自述的負向模型判決仍阻擋；換標籤會失效舊收據；來源綁定不受類型影響；v2 收據拒用；只新增來源紀錄或資料目錄改變會失效；交易生成資源不使無關分析師失效；1,000 筆來源與概念的輔助目錄小於 1 KiB，原始 stores 完整保留。
+
+**Validation**：V4 全套 281 項通過；V3 test_invariants 13 項與 test_p6_dedup 11 項通過；git diff --check 通過。另試跑既有 V3 test_prototype_a，因缺 /tmp/amzn_v3.json 未能執行，未修改 V3 或捏造該輸入。
+
+用原始 NVDA checkpoint 與快取回覆重放，32 條 Phase 2 Claim 全部可提交並建立 32 個待語義審查任務。原 fundamentals_analyst.data_limitations_and_risks 內容、類型、空 refs 及 dependencies 均未修改，原檢查點 SHA256 不變；967 bytes 的目錄脈絡，最大原子提示 40,464 UTF-8 bytes。模型呼叫 0、驗證收據 0：這證明原結構退件已修，不能當作該份報告語義已通過。
+
+**更新／回滾**：重新啟動 V4 驅動程序，保留 checkpoint、responses、sessions 後續跑；舊 Claim 與資料保留，舊 v2 審查須依 v3 契約重驗，未提交角色可能因提示更新而重生。回滾撤回本次提交，並使用升級前檢查點；勿讓舊驗證邏輯將新版待驗物件當成已驗內容。V3 無需更新或重啟。
+
+**Confidence**：共用閘門修正、持久化與流程行為高；真實模型遵守新版語義要求及完整 NVDA 執行結果未驗證。
+
+### Post-Fix Quality
+
+- Scope：base ad0398c，僅本次 V4 差異，原工作區乾淨。
+- Simplify：共用證據義務指令供各審查路徑使用；其餘採定向人工檢查，未擴大重構或削減回歸測試。
+- Review：GPT-6 Luna High 獨立唯讀審查與主代理逐行檢查；已處理來源目錄膨脹的 P2，最終無阻擋發現。未提供專用本機差異審查工具，未把 CI 診斷工具當作程式審查。
+- Residuals：沒有已知阻擋缺陷；實際模型準確性及真實全量成本仍待雲端驗收。
+- Re-verification：修正審查發現及測試 fixture binding 後，重跑 V4 全套與 V3 可執行基準。

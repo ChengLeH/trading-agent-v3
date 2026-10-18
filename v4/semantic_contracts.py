@@ -6,7 +6,7 @@ infers meaning from prose, invents edges or decides source entailment itself.
 from copy import deepcopy
 from .schema import Claim, claim_index, id_list
 
-SEMANTIC_REVIEW_CONTRACT = "v4-semantic-review/2"
+SEMANTIC_REVIEW_CONTRACT = "v4-semantic-review/3"
 SEMANTIC_REVIEW_SCHEMA = {
     "type": "object",
     "required": ["claim_id", "verdict", "reference_checks", "findings"],
@@ -35,7 +35,22 @@ SEMANTIC_REVIEW_SCHEMA = {
     },
 }
 
-REFERENCE_INSTRUCTIONS = """逐引用語義驗收：每個 refs/fact_refs/dependencies 聯集 ID 恰有一筆 reference_checks，
+EVIDENCE_INSTRUCTIONS = """證據義務按主張的實際語義判斷，不由 claim_type 或 assertion.kind 標籤決定。
+標籤只是作者的描述，不能讓任何 Claim 跳過語義審查，也不能因標錯類型而單獨判錯。
+refs 為空不等於主張錯誤，也不等於無須證據；有引用也不等於證據足夠。
+外部可驗證事實需要能支持它的來源；不得用常識、模型記憶或改貼 interpretation/forecast 等標籤代替證據。
+只有上游 Claim 的推論可以由該前提支持，不必為每個結論重貼原始來源；上游仍須獨立驗證，
+不得將上游的猜測、資料不足或流程自述變成已證實的外部事實。
+資料限制須限定到實際可見的資料範圍；缺資料不等於數值為零、事件未發生或公司未揭露。
+context.evidence_scope 是本次已匯入資料的精簡目錄中繼資料，不含來源全文、原始角色輸入或傳輸紀錄。
+目錄只能支持其明示範圍內的結構化資料觀察，不能證明來源全文缺資料、原始文件未提供或傳輸曾截斷。
+fact_concepts=null 表示目錄細節因大小未附上，只有數量與指紋，不能把未列出的概念當成不存在。
+若聲稱流程中斷、內容遺失或截斷，須有實際流程／傳輸紀錄支持；其他 Claim 的相同自述不是獨立證明。
+缺少判斷所需依據時回 SUSPICIOUS，已知與證據矛盾回 FAIL，不能因它是後設說明而免驗或猜 PASS。
+將問題寫入既有 findings，點名哪個命題、缺什麼依據或與什麼矛盾；不另造來源或替作者改寫後判通過。
+"""
+
+REFERENCE_INSTRUCTIONS = EVIDENCE_INSTRUCTIONS + """逐引用語義驗收：每個 refs/fact_refs/dependencies 聯集 ID 恰有一筆 reference_checks，
 欄位為 ref_id/relation(SUPPORTS|CONTRADICTS|INSUFFICIENT)/attributed_assertion/source_evidence/reason。
 逐一理解 text 對該來源實際聲稱的內容，再與 assertion/binding 及實際來源比對。
 attributed_assertion 必須反映原文歸因，不能偷偷把錯誤原文改成正確說法再判 SUPPORTS。

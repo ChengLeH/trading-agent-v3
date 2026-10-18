@@ -30,6 +30,106 @@ def global_review(r, findings=None, required=None, unresolved=()):
 
 
 class SemanticAcceptance(unittest.TestCase):
+    def test_claim_labels_do_not_block_notes_before_semantic_review(self):
+        from .test_contracts import claim
+        from .schema import CLAIM_TYPES
+        for label in sorted(CLAIM_TYPES):
+            with self.subTest(label=label):
+                r = seeded()
+                c = claim("reviewer.note", ["a"])
+                c.update(author_role="reviewer", claim_type=label, refs=["a"],
+                         text="本次提供的資料沒有資本支出欄位，不能據此推定資本支出為零。")
+                r.orch.submit_batch(r.run_id, {"reviewer": [c]})
+                findings, blocked = r.orch.validate_stage(r.run_id, "phase6")
+                self.assertFalse(blocked, findings)
+                prepared = r.prepare_phase6_atomic()
+                self.assertIn(c["claim_id"], dict(prepared["atomic_prompts"]))
+                self.assertEqual(next(t for t in build_atomic_tasks(r.run) if t.claim_id == c["claim_id"])
+                                 .review_dict()["dependency_claims"][0]["claim_id"], "a")
+                with self.assertRaisesRegex(ValueError, "semantic verification"):
+                    r.prepare_phase6_global_sweep()
+
+    def test_binding_coverage_uses_actual_sources_even_for_interpretations(self):
+        from .bindings import validate_claim_bindings
+        from .test_atomic_phase6 import make_run
+        from .test_contracts import claim
+        c = claim()
+        c["refs"] = ["fact.dram_supply.2029"]
+        run = make_run([c])
+        findings = validate_claim_bindings([c], run.fact_store, require_bindings=True)
+        self.assertTrue(any(f.status == "FAIL" and f.ref_id == c["refs"][0] for f in findings))
+
+    def test_unsupported_content_stays_blocked_regardless_of_claim_label(self):
+        from .test_contracts import claim
+        cases = [("semantic_fact", "本次資料沒有資本支出，所以公司資本支出為零。"),
+                 ("interpretation", "上游資料遭截斷，因此我未收到完整論述。"),
+                 ("forecast", "公司已公布本季營收一千億元。")]
+        for label, text in cases:
+            with self.subTest(label=label):
+                r = seeded()
+                c = claim("reviewer.unsupported")
+                c.update(author_role="reviewer", claim_type=label, text=text)
+                r.orch.submit_batch(r.run_id, {"reviewer": [c]})
+                prepared = r.prepare_phase6_atomic()
+                index = {c["claim_id"]: c for c in r.run.claims}
+                results = {cid: verdict(cid, ref_ids=claim_reference_ids(index[cid]))
+                           for cid, _ in prepared["atomic_prompts"]}
+                # Scripted LLM judgments exercise routing, not model accuracy.
+                results[c["claim_id"]] = verdict(c["claim_id"], "SUSPICIOUS")
+                summary = r.collect_phase6_atomic(results, model_identity="test/first")
+                self.assertEqual(summary["deep_review_claim_ids"], [c["claim_id"]])
+                r.prepare_phase6_deep_review()
+                r.collect_phase6_deep_review({c["claim_id"]: verdict(c["claim_id"], "FAIL")},
+                                            model_identity="test/deep")
+                with self.assertRaisesRegex(ValueError, "semantic findings"):
+                    r.prepare_phase6_global_sweep()
+                r.orch.patch(r.run_id, [{"claim_id": c["claim_id"], "claim_type": "trade_assumption"}],
+                             allowed_ids={c["claim_id"]})
+                self.assertIn(c["claim_id"], dict(r.prepare_phase6_atomic()["atomic_prompts"]))
+                self.assertNotIn(c["claim_id"], r.deep_receipts)
+
+    def test_review_context_describes_catalog_scope_without_fabricating_transport_evidence(self):
+        from .test_atomic_phase6 import make_run
+        from .test_contracts import claim
+        run = make_run([claim()])
+        task = build_atomic_tasks(run)[0]
+        scope = task.context["evidence_scope"]
+        self.assertEqual(scope["fact_concepts"], ["DRAMWaferSupply"])
+        self.assertEqual(scope["counts"]["facts"], 1)
+        self.assertFalse(scope["includes_source_contents"])
+        self.assertNotIn("transport_verified", scope)
+        self.assertEqual(task.review_dict()["context"]["evidence_scope"], scope)
+
+    def test_generated_trade_resources_do_not_invalidate_unrelated_catalog_scope(self):
+        from .schema import digest
+        r = seeded()
+        before = {t.claim_id: t for t in build_atomic_tasks(r.run)}
+        r.orch.register_trade(r.run_id, dict(direction="SHORT", entry=173.16, stop=184,
+                                            target=148, position_pct=5))
+        after = {t.claim_id: t for t in build_atomic_tasks(r.run)}
+        self.assertTrue(r.run.trade_generated[0])
+        self.assertEqual(digest(before["a"].to_dict()), digest(after["a"].to_dict()))
+        self.assertNotEqual(digest(before["role.trader"].to_dict()), digest(after["role.trader"].to_dict()))
+
+    def test_large_catalog_keeps_review_bounded_without_truncating_source_evidence(self):
+        from v3.sources import SourceRecord
+        r = seeded()
+        for i in range(1000):
+            r.run.fact_store.add(Fact(fact_id=f"metric.{i}", value=i, unit="USD", period="2026-Q2",
+                                      concept=f"DistinctStructuredMetric_{i}", source_id=f"source.{i}"))
+            r.run.records.append(SourceRecord(id=f"source.{i}", type="generic_text", subject_ticker="TEST",
+                                               subject_cik=None, payload={"original": i}, source_hash=f"hash.{i}"))
+        prepared = r.prepare_phase6_atomic()
+        task = next(t for t in build_atomic_tasks(r.run) if t.claim_id == "a")
+        scope = task.context["evidence_scope"]
+        self.assertIsNone(scope["fact_concepts"])
+        self.assertEqual(scope["fact_concept_count"], 1000)
+        self.assertEqual(scope["source_record_count"], 1000)
+        self.assertLess(len(json.dumps(scope).encode()), 1024)
+        self.assertEqual(len(r.run.fact_store.to_dict()), 1000)
+        self.assertEqual(len(r.run.records), 1000)
+        self.assertEqual(prepared["claim_count"], len(r.run.claims))
+
     @staticmethod
     def add_evidence_reference(runner, claim_id, evidence_id):
         runner.run.evidence_store.add(EvidencePacket(
@@ -37,6 +137,8 @@ class SemanticAcceptance(unittest.TestCase):
             source_type="generic_text", source_span="p.1"))
         claim = next(c for c in runner.run.claims if c["claim_id"] == claim_id)
         claim["refs"].append(evidence_id)
+        claim["bindings"].append(dict(ref_id=evidence_id, entity="unknown", concept="unknown",
+                                      period="unknown", scope="unknown", unit="unknown", basis="unknown"))
 
     def test_new_execution_uses_fresh_atomic_and_deep_requests_with_exact_schema(self):
         from .checkpoint import save_checkpoint, load_checkpoint
