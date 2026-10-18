@@ -13,7 +13,7 @@ from .checkpoint import save_checkpoint, load_checkpoint
 
 
 class EmptyRevision(unittest.TestCase):
-    def run_patch_cli(self, runner, patch_text, directory, *, verifier=None, patch_dependents=False):
+    def run_patch_cli(self, runner, patch_text, directory, *, verifier=None, patch_dependents=False, global_findings=None):
         from .__main__ import main
 
         root = Path(directory)
@@ -27,7 +27,7 @@ class EmptyRevision(unittest.TestCase):
             return restored[-1]
         clients = dict(author=CloudDouble("test/author", lambda _: self.fail("supplied patches must not invoke author")),
                        verifier=verifier or CloudDouble("test/verifier"), deep=CloudDouble("test/deep"),
-                       global_reviewer=CloudDouble("test/global", lambda _: global_verdict(restored[-1])))
+                       global_reviewer=CloudDouble("test/global", lambda _: global_verdict(restored[-1], global_findings)))
         args = ["--resume", str(checkpoint), "--apply-patches", str(patch_file), "--out", str(out),
                 "--author-model", "author", "--verifier-model", "verifier", "--deep-model", "deep",
                 "--global-model", "global_reviewer"]
@@ -217,6 +217,91 @@ class EmptyRevision(unittest.TestCase):
             restored = load_checkpoint(path)
             self.assertEqual(restored.pending_patch, runner.pending_patch)
             self.assertEqual(restored.status, "blocked:pending_revision")
+
+    def test_revision_limit_preserves_manual_repair_without_resetting_budget(self):
+        runner = seeded()
+        runner.max_revisions = runner.revision_round = 5
+        review_all(runner)
+        findings = [dict(claim_id="a", issue="Correct the premise")]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "limited.json"
+            with patch.object(runner, "_persist", side_effect=lambda: save_checkpoint(runner, path)):
+                result = runner.prepare_phase6_revision_v4(findings)
+            self.assertEqual(result["status"], "blocked:revision_limit")
+            restored = load_checkpoint(path)
+            self.assertEqual(restored.pending_patch["findings"], findings)
+            self.assertEqual(restored.pending_patch["ids"], ["a"])
+            self.assertEqual((restored.revision_round, restored.max_revisions), (5, 5))
+            clients = [CloudDouble() for _ in range(4)]
+            paused = restored.execute_phase6(*clients)
+            self.assertTrue(paused["blocked"])
+            self.assertTrue(all(not c.calls for c in clients))
+            rc, result, repaired, clients = self.run_patch_cli(
+                restored, json.dumps([dict(claim_id="a", text="Corrected premise")]), Path(temp) / "cli")
+        self.assertEqual(rc, 0, result)
+        self.assertEqual((repaired.revision_round, repaired.max_revisions), (6, 5))
+        self.assertEqual(len(clients["global_reviewer"].calls), 1)
+        self.assertFalse(clients["author"].calls)
+
+    def test_manual_repair_at_limit_does_not_bypass_new_global_findings(self):
+        runner, _ = self.prepared()
+        runner.revision_round = runner.max_revisions
+        with tempfile.TemporaryDirectory() as temp:
+            rc, result, restored, clients = self.run_patch_cli(
+                runner, json.dumps([dict(claim_id="a", text="Corrected premise")]), temp,
+                global_findings=[dict(claim_id="b", issue="Still uses an unsupported premise")])
+        self.assertEqual(rc, 2)
+        self.assertEqual(result["status"], "blocked:revision_limit")
+        self.assertEqual(restored.pending_patch["ids"], ["b"])
+        self.assertEqual(restored.revision_round, runner.max_revisions + 1)
+        self.assertEqual(restored.max_revisions, runner.max_revisions)
+        self.assertEqual(len(clients["global_reviewer"].calls), 1)
+        self.assertFalse(clients["author"].calls)
+
+    def test_legacy_revision_limit_recovers_only_current_mapped_global_findings(self):
+        runner = seeded()
+        review_all(runner)
+        runner.prepare_phase6_global_sweep()
+        runner.collect_phase6_global_sweep(global_verdict(runner, [dict(claim_id="a", issue="Repair premise")]),
+                                           model_identity="test/global")
+        runner.status = "blocked:revision_limit"
+        runner.revision_round = runner.max_revisions
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "legacy.json"
+            save_checkpoint(runner, path)
+            data = json.loads(path.read_text())
+            restored = load_checkpoint(path)
+            self.assertEqual(restored.pending_patch["ids"], ["a"])
+            self.assertIsNone(restored.global_receipt)  # diagnostics never become verification
+            self.assertEqual(restored.receipts, {})
+            for field in ("input_hash", "history_hash"):
+                stale = deepcopy(data)
+                stale["audit"]["global_review"][field] = "0" * 64
+                path.write_text(json.dumps(stale))
+                self.assertIsNone(load_checkpoint(path).pending_patch)
+            for finding in (dict(issue="Unmapped"), dict(claim_id="a", issue="External", resolution_route="human_decision")):
+                excluded = deepcopy(data)
+                excluded["audit"]["global_review"]["findings"] = [finding]
+                path.write_text(json.dumps(excluded))
+                self.assertIsNone(load_checkpoint(path).pending_patch)
+
+    def test_global_dependency_edges_apply_together_without_content_patcher(self):
+        runner = seeded()
+        targets = [c["claim_id"] for c in runner.run.claims if c["claim_id"].startswith("role.")][:5]
+        def sweep(_):
+            response = global_verdict(runner)
+            for row in response["dependency_reviews"]:
+                if row["claim_id"] in targets:
+                    row["required_dependencies"] = ["a", "b"]
+            return response
+        patcher = CloudDouble("test/author", lambda _: self.fail("structured edges need no content patcher"))
+        reviewer = CloudDouble("test/global", sweep)
+        result = runner.execute_phase6(CloudDouble(), CloudDouble("test/deep"), patcher, reviewer)
+        self.assertFalse(result["blocked"], result)
+        self.assertEqual(runner.revision_round, 1)
+        self.assertEqual({p["claim_id"] for p in runner.history[0]["patches"]}, set(targets))
+        self.assertEqual(len(reviewer.calls), 2)
+        self.assertFalse(patcher.calls)
 
     def test_cli_applies_pending_patches_then_revalidates_and_runs_global_sweep(self):
         runner, _ = self.prepared()

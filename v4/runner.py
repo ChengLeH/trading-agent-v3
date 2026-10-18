@@ -778,9 +778,6 @@ class PipelineRunnerV4:
         wanted = list(dict.fromkeys(cid for f in findings for cid in self._finding_claim_ids(f)))
         if set(wanted) - index.keys():
             raise ValueError("finding references unknown claim IDs")
-        if self.revision_round >= self.max_revisions:
-            self.status = "blocked:revision_limit"
-            return dict(blocked=True, status=self.status, reason="revision limit reached", findings=self._diagnostic_findings(findings))
         trade_plans = {cid for cid in wanted if index[cid]["assertion"]["kind"] == "trade_plan"}
         if trade_plans:
             # Cancelling/replacing a plan can remove its derived resources.
@@ -802,6 +799,13 @@ class PipelineRunnerV4:
                                   generated_source_refs=sorted(refs)),
                     suggested_fix="只在新交易狀態使原內容或引用失效時修改；保留仍成立的內容與真正依賴"))
         self.pending_patch = dict(input_hash=self._hash(), ids=wanted, findings=deepcopy(findings))
+        if self.revision_round >= self.max_revisions:
+            # Stop automatic model spending, but retain a state-bound repair
+            # request for explicit operator patches. Never reset used rounds.
+            self.status = "blocked:revision_limit"
+            self._persist()
+            return dict(blocked=True, status=self.status, reason="revision limit reached; explicit patches may be supplied",
+                        findings=self._diagnostic_findings(findings), allowed_claim_ids=list(wanted))
         tasks = self._tasks()
         prompt = json_prompt(
             '只修改所列 Claim 物件，不得重寫 Markdown、擴大範圍或更改作者與 ID。'
@@ -970,6 +974,8 @@ class PipelineRunnerV4:
             '只列真正因果前提，不能因主題相似就連線，不能反向依賴後續結論；不確定時 unresolved=true。'
             '小幅措辭不夠精確，但在合理解讀下不改變事實、因果、條件、範圍或決策，不阻擋交付；'
             '可列 clarity_only finding 並說明 materiality_reason。若不同合理解讀會改變前述內容，必須視為 material。'
+            '指標或概念名稱、計算口徑、單位、期間或主體與來源不符，是 material；'
+            '即使數值接近或不改變交易方向，也不能降為單純措辭問題。'
             '每個 material finding 必須由你判斷處理路徑：claim_patch（只改 Claim 可修）、evidence_needed（缺來源資料）、'
             'transport_recovery（結構化紀錄證實傳輸故障）、role_redeliberation（需原角色重新裁決）、'
             'human_decision（需要使用者的風險偏好或政策）、uncertain（無法可靠分類）。'

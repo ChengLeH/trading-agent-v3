@@ -311,6 +311,20 @@ def load_checkpoint(path, *, continue_verification=True):
         # archives through collectors, never trust serialized review receipts.
         r.global_review_progress = progress
     pending = data.get("pending_patch")
+    if pending is None and data.get("status") == "blocked:revision_limit":
+        # Older runners stopped before saving a repair request. A matching
+        # global snapshot can restore diagnostic targets, never review receipts.
+        audit = data.get("audit")
+        review = audit.get("global_review") if isinstance(audit, dict) else None
+        if (isinstance(review, dict) and review.get("input_hash") == r._hash()
+                and review.get("history_hash") == digest(r.history)
+                and isinstance(review.get("findings"), list)):
+            findings = [deepcopy(f) for f in review["findings"] if isinstance(f, dict)
+                        and f.get("resolution_route", "claim_patch") == "claim_patch"
+                        and f.get("materiality", "material") != "clarity_only"]
+            if findings and all(r._finding_claim_ids(f) for f in findings):
+                pending = dict(input_hash=r._hash(), ids=list(dict.fromkeys(
+                    cid for f in findings for cid in r._finding_claim_ids(f))), findings=findings)
     if pending is not None:
         from .schema import id_list
         try:
