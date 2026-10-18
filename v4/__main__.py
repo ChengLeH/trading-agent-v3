@@ -66,6 +66,8 @@ def main(argv=None):
                         help="Total revision ceiling; default 3, resume preserves checkpoint unless overridden")
     parser.add_argument("--max-contract-attempts", type=int,
                         help="Response-contract attempts per claim/input; default 3, resume can raise the saved ceiling")
+    parser.add_argument("--global-dependency-batch-size", type=int, choices=range(1, 65),
+                        help="Dependency audit rows per global request; default 12, resume preserves saved setting")
     parser.add_argument("--retry-role", action="append", choices=ROLES, default=[],
                         help="Re-request an uncommitted role output instead of replaying its saved response")
     parser.add_argument("--apply-patches", metavar="PATH",
@@ -119,6 +121,8 @@ def main(argv=None):
                 runner.max_contract_attempts = max(runner.max_contract_attempts, args.max_contract_attempts)
             if args.max_workers is not None:
                 runner.max_workers = args.max_workers
+            if args.global_dependency_batch_size is not None:
+                runner.global_dependency_batch_size = args.global_dependency_batch_size
             if args.review_batch_size is not None:
                 runner.review_batch_size = args.review_batch_size
             if args.review_batch_max_bytes is not None:
@@ -142,6 +146,7 @@ def main(argv=None):
         else:
             manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
             runner = PipelineRunnerV4(max_workers=args.max_workers or 4, max_revisions=args.max_revisions if args.max_revisions is not None else 3,
+                                      global_dependency_batch_size=args.global_dependency_batch_size or 12,
                                       max_contract_attempts=args.max_contract_attempts if args.max_contract_attempts is not None else 3,
                                       review_batch_size=args.review_batch_size or 1,
                                       review_batch_max_bytes=args.review_batch_max_bytes or 65536)

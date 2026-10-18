@@ -63,7 +63,7 @@ class P6Continuity(unittest.TestCase):
             before = (len(verifier.calls), len(sweep.calls))
             restored = load_checkpoint(Path(temp) / "checkpoint.json")
             self.assertEqual(restored._verification_epoch, r._verification_epoch)
-            self.assertFalse(restored.receipts)  # checkpoint audit is never trusted
+            self.assertEqual(restored.receipts, r.receipts)  # rebuilt from exact raw archives, not audit alone
             restored.journal = RunJournal(temp)
             resumed = restored.execute_phase6(verifier, CloudDouble("test/deep"), CloudDouble("test/author"), sweep)
             self.assertFalse(resumed["blocked"], resumed)

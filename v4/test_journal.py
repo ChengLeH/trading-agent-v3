@@ -243,7 +243,7 @@ r.resume(CloudDouble("test/author", author), CloudDouble(), CloudDouble("test/de
             self.assertEqual(roles_called, ["bear", "research_manager", "trader", "risk_manager"])
             self.assertEqual(len(verifier.calls), len(r.run.claims))
             self.assertTrue((resumed / "checkpoint.json").exists())
-            self.assertEqual(load_checkpoint(resumed / "checkpoint.json").receipts, {})
+            self.assertEqual(load_checkpoint(resumed / "checkpoint.json").receipts, r.receipts)
 
     def test_failed_parallel_sibling_keeps_each_received_response(self):
         with tempfile.TemporaryDirectory() as temp:

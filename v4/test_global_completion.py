@@ -11,6 +11,79 @@ from .checkpoint import load_checkpoint
 
 
 class GlobalCompletion(unittest.TestCase):
+    def payload(self, prompt):
+        return json.loads(prompt.split('<context-data>\n')[1].split('\n</context-data>')[0])
+
+    def test_planned_dependency_batches_do_not_exhaust_missing_response_retries(self):
+        r = seeded()
+        r.global_dependency_batch_size = 2
+        calls = []
+        def reviewer(prompt):
+            payload = self.payload(prompt)
+            calls.append(payload)
+            return self.partial(r, payload['target_claim_ids'])
+        result = r.execute_phase6(CloudDouble(), CloudDouble('test/deep'), CloudDouble('test/patch'),
+                                 CloudDouble('test/global', reviewer))
+        self.assertFalse(result['blocked'], result)
+        self.assertGreater(len(calls), r.max_contract_attempts)
+        self.assertTrue(all(len(p['target_claim_ids']) <= 2 for p in calls))
+        requested = [cid for p in calls for cid in p['target_claim_ids']]
+        self.assertEqual(requested, [c['claim_id'] for c in r.run.claims])
+        self.assertEqual(calls[0]['review_scope'], 'global_consistency')
+        self.assertEqual({c['claim_id'] for c in calls[0]['state']['claims']}, set(requested))
+
+    def test_global_history_sends_changed_fields_without_repeating_unchanged_claim_data(self):
+        r = seeded(); review_all(r)
+        r.prepare_phase6_revision_v4([dict(claim_id='a', issue='Correct premise')])
+        r.collect_phase6_revision([dict(claim_id='a', text='Corrected premise')])
+        review_all(r)
+        _, prompt = r.prepare_phase6_global_sweep()
+        change = self.payload(prompt)['history'][0]['claim_changes'][0]
+        self.assertEqual(change['before'], {'text': '任意論述'})
+        self.assertEqual(change['after'], {'text': 'Corrected premise'})
+        self.assertEqual(change['claim_id'], 'a')
+
+    def test_valid_extra_dependency_rows_are_preserved_instead_of_paid_retries(self):
+        r = seeded(); r.global_dependency_batch_size = 2
+        reviewer = CloudDouble('test/global', lambda _: global_verdict(r))
+        result = r.execute_phase6(CloudDouble(), CloudDouble('test/deep'), CloudDouble('test/patch'), reviewer)
+        self.assertFalse(result['blocked'], result)
+        self.assertEqual(len(reviewer.calls), 1)
+        self.assertEqual(len(r.global_receipt['dependency_reviews']), len(r.run.claims))
+
+    def test_interrupted_global_does_not_reactivate_pre_patch_finding(self):
+        from .agy_session import AntigravityError
+        r = seeded(); review_all(r)
+        finding = dict(finding_id='old.a', claim_ids=['a'], issue='Old premise is wrong')
+        r.deferred_global_findings = [finding]
+        r.prepare_phase6_revision_v4([finding])
+        r.collect_phase6_revision([dict(claim_id='a', text='Corrected premise')])
+        review_all(r)
+        def interrupted(_):
+            raise AntigravityError('session_pending')
+        author = CloudDouble('test/author')
+        result = r.execute_phase6(CloudDouble(), CloudDouble('test/deep'), author,
+                                 CloudDouble('test/global', interrupted))
+        self.assertTrue(result['blocked'])
+        self.assertEqual(result['block_category'], 'infrastructure')
+        self.assertEqual(result['pending_stage'], 'global')
+        self.assertEqual(r.deferred_global_findings, [])
+        self.assertEqual(r.history[-1]['invalidated_global_findings'], [finding])
+        self.assertFalse(author.calls)
+        with self.assertRaises(ValueError): r.finalize()
+
+    def test_legacy_duplicate_is_retired_by_object_history_without_text_matching(self):
+        r = seeded(); review_all(r)
+        finding = dict(finding_id='old.a', claim_ids=['a'], issue='Old premise is wrong')
+        r.prepare_phase6_revision_v4([finding])
+        r.collect_phase6_revision([dict(claim_id='a', text='Corrected premise')])
+        r.deferred_global_findings = [copy.deepcopy(finding)]  # legacy duplicate
+        review_all(r)
+        _, prompt = r.prepare_phase6_global_sweep()
+        self.assertEqual(r.deferred_global_findings, [])
+        self.assertIn(finding, self.payload(prompt)['history'][-1]['findings_to_recheck'])
+        with self.assertRaises(ValueError): r.finalize()
+
     def partial(self, runner, ids, findings=None):
         response = global_verdict(runner, findings)
         response['dependency_reviews'] = [r for r in response['dependency_reviews'] if r['claim_id'] in ids]

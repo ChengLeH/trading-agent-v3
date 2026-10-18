@@ -700,7 +700,7 @@ class SemanticAcceptance(unittest.TestCase):
         after = next(c for c in r.run.claims if c["claim_id"]=="b")
         self.assertEqual({k for k in original if original[k]!=after[k]}, {"dependencies"})
         self.assertEqual({f["finding_id"] for f in r.deferred_global_findings},
-                         {target["finding_id"], untouched["finding_id"], unmapped["finding_id"]})
+                         {untouched["finding_id"], unmapped["finding_id"]})
         self.assertEqual(set(result["revalidate_claim_ids"]),{"b","c"})
         self.assertFalse({"b","c"}.intersection(r.receipts))
         self.assertEqual(r.receipts["independent"],retained)
@@ -711,7 +711,7 @@ class SemanticAcceptance(unittest.TestCase):
             path=Path(temp)/"patched.json"; save_checkpoint(r,path)
             restored=load_checkpoint(path)
             self.assertEqual({f["finding_id"] for f in restored.deferred_global_findings},
-                             {target["finding_id"], untouched["finding_id"], unmapped["finding_id"]})
+                             {untouched["finding_id"], unmapped["finding_id"]})
             self.assertIn(target,restored.history[-1]["findings"])
             self.assertEqual(restored.history[-1]["invalidated_global_findings"],[target])
             with self.assertRaises(ValueError): restored.finalize()
@@ -730,7 +730,7 @@ class SemanticAcceptance(unittest.TestCase):
         r.deferred_global_findings=[finding]
         r.prepare_phase6_revision_v4([finding])
         r.collect_phase6_revision([dict(claim_id="b",dependencies=["a","independent"])])
-        self.assertEqual(r.deferred_global_findings,[finding])
+        self.assertEqual(r.deferred_global_findings,[])
         with self.assertRaises(ValueError): r.finalize()
         review_all(r)
         with self.assertRaises(ValueError): r.finalize()

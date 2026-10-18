@@ -167,9 +167,9 @@ class ReviewBatches(unittest.TestCase):
             self.assertEqual(len(r.receipts), 8)
             # Same-process retry schedules only the four failed Claims.
             self.assertEqual(r.prepare_phase6_atomic()["claim_count"], 4)
-            # Reload deliberately starts a fresh verification epoch; audit
-            # receipts cannot silently substitute for a new execution.
-            self.assertEqual(load_checkpoint(Path(temp) / "checkpoint.json").receipts, {})
+            # Same-epoch restart keeps only archive-verified successful rows.
+            self.assertEqual(load_checkpoint(Path(temp) / "checkpoint.json").receipts, r.receipts)
+            self.assertEqual(load_checkpoint(Path(temp) / "checkpoint.json", continue_verification=False).receipts, {})
 
     def test_deep_batches_never_include_atomic_pass_or_skip_global(self):
         r = seeded(); r.review_batch_size = 4

@@ -15,7 +15,10 @@ from .schema import digest
 from .storage import write_json
 
 
-def _load_review_row(run_dir, source, *, run_id, model, layer, claim_id, task_hash):
+def _load_review_row(run_dir, source, *, run_id, model, layer, claim_id, task_hash,
+                     verification_epoch=None, allowed_agent_policies=None,
+                     first_review_hash=None):
+    from .semantic_contracts import SEMANTIC_REVIEW_CONTRACT
     if (not isinstance(source, dict)
             or set(source) != {"attempt_id", "metadata_hash", "response_hash", "claim_id", "layer"}
             or source.get("claim_id") != claim_id or source.get("layer") != layer):
@@ -39,15 +42,25 @@ def _load_review_row(run_dir, source, *, run_id, model, layer, claim_id, task_ha
         response_hash = digest(record.get("response"))
     except (TypeError, ValueError):
         return None
-    if (record.get("status") != "received" or record.get("attempt_id") != attempt_id
+    if (record.get("format") != "v4-response/1"
+            or record.get("status") != "received" or record.get("attempt_id") != attempt_id
             or record.get("run_id") != run_id or record.get("model") != model
             or not isinstance(task_hashes, dict)
             or metadata_hash != source.get("metadata_hash")
             or response_hash != source.get("response_hash")
             or not isinstance(review, dict) or review.get("layer") != layer
-            or review.get("contract") != "v4-semantic-review/2"
+            or review.get("contract") != SEMANTIC_REVIEW_CONTRACT
+            or (verification_epoch is not None
+                and review.get("verification_epoch") != verification_epoch)
+            or (allowed_agent_policies is not None
+                and record.get("agent_policy_sha256") not in allowed_agent_policies)
             or task_hashes.get(claim_id) != task_hash):
         return None
+    if first_review_hash is not None:
+        first_review_hashes = review.get("first_review_hashes")
+        if (not isinstance(first_review_hashes, dict)
+                or first_review_hashes.get(claim_id) != first_review_hash):
+            return None
     response = record.get("response")
     try:
         if isinstance(response, str):
@@ -129,7 +142,76 @@ def save_checkpoint(runner, path):
                           max_revisions=runner.max_revisions, max_workers=runner.max_workers,
                           max_contract_attempts=runner.max_contract_attempts,
                           review_batch_size=runner.review_batch_size, review_batch_max_bytes=runner.review_batch_max_bytes,
+                          global_dependency_batch_size=runner.global_dependency_batch_size,
+                          review_sources=runner._latest_review_sources,
                           audit=dict(atomic=runner.receipts, deep=runner.deep_receipts, global_review=runner.global_receipt)))
+
+
+def _current_agent_policies():
+    """Return only policy identities that this process can currently verify."""
+    policies = {"external"}
+    try:
+        from .agy_session import load_agent_profile
+        _, policy_hash, *_ = load_agent_profile()
+    except Exception:
+        return policies
+    if isinstance(policy_hash, str) and len(policy_hash) == 64:
+        policies.add(policy_hash)
+    return policies
+
+
+def _restore_review_receipts(runner, data, run_dir, tasks):
+    """Rebuild accepted receipts exclusively from hash-verified response archives."""
+    audit = data.get("audit")
+    sources = data.get("review_sources")
+    if (not isinstance(audit, dict) or not isinstance(sources, dict)
+            or set(sources) != {"atomic", "deep"}):
+        return
+    allowed_policies = _current_agent_policies()
+    from .atomic_phase6 import normalize_atomic_result
+    from .semantic_contracts import review_ref_ids
+    for layer, target, audit_key in (("atomic", runner.receipts, "atomic"),
+                                     ("deep", runner.deep_receipts, "deep")):
+        layer_sources = sources.get(layer)
+        saved_receipts = audit.get(audit_key)
+        if not isinstance(layer_sources, dict) or not isinstance(saved_receipts, dict):
+            continue
+        for cid, saved in saved_receipts.items():
+            task = tasks.get(cid)
+            source = layer_sources.get(cid)
+            try:
+                if (task is None or not isinstance(saved, dict)
+                        or set(saved) != {"input_hash", "result", "model"}
+                        or saved.get("input_hash") != digest(task.to_dict())):
+                    continue
+                model = saved.get("model")
+                from .runner import require_model_identity
+                require_model_identity(model)
+                first_hash = None
+                if layer == "deep":
+                    atomic_receipt = runner.receipts.get(cid)
+                    if (not isinstance(atomic_receipt, dict)
+                            or atomic_receipt.get("result", {}).get("verdict") not in {"FAIL", "SUSPICIOUS"}):
+                        continue
+                    first_hash = digest(atomic_receipt["result"])
+                row = _load_review_row(
+                    run_dir, source, run_id=runner.run_id, model=model, layer=layer,
+                    claim_id=cid, task_hash=digest(task.to_dict()),
+                    verification_epoch=runner._verification_epoch,
+                    allowed_agent_policies=allowed_policies, first_review_hash=first_hash)
+                if row is None:
+                    continue
+                normalized = normalize_atomic_result(
+                    cid, row, expected_ref_ids=review_ref_ids(task.claim))
+                if normalized != saved.get("result"):
+                    continue
+                target[cid] = dict(input_hash=digest(task.to_dict()),
+                                   result=normalized, model=model)
+                runner._latest_review_sources[layer][cid] = deepcopy(source)
+                runner._restored_receipt_ids[layer].add(cid)
+            except (ValueError, TypeError, KeyError, AttributeError):
+                # A stale or malformed archive disables reuse for this row only.
+                continue
 
 
 def load_checkpoint(path, *, continue_verification=True):
@@ -140,7 +222,8 @@ def load_checkpoint(path, *, continue_verification=True):
     r = PipelineRunnerV4(max_revisions=data["max_revisions"], max_workers=data["max_workers"],
                          review_batch_size=data.get("review_batch_size", 1),
                          max_contract_attempts=data.get("max_contract_attempts", 3),
-                         review_batch_max_bytes=data.get("review_batch_max_bytes", 65536))
+                         review_batch_max_bytes=data.get("review_batch_max_bytes", 65536),
+                         global_dependency_batch_size=data.get("global_dependency_batch_size", 12))
     if continue_verification:
         from uuid import UUID
         epoch = data.get("verification_epoch")
@@ -179,6 +262,7 @@ def load_checkpoint(path, *, continue_verification=True):
         from .atomic_phase6 import build_atomic_tasks, normalize_atomic_result
         from .semantic_contracts import review_ref_ids, normalize_reference_checks
         tasks = {task.claim_id: task for task in build_atomic_tasks(run)}
+        _restore_review_receipts(r, data, Path(path).parent, tasks)
         for layer in ("atomic", "deep"):
             rows = supplements[layer]
             if not isinstance(rows, dict):
@@ -356,9 +440,8 @@ def load_checkpoint(path, *, continue_verification=True):
         r.pending_patch = pending
     elif data.get("status") in {"blocked:revision_no_changes", "blocked:pending_revision"}:
         raise ValueError("missing pending claim repair for blocked revision")
-    # Never restore serialized receipts. Same-execution continuation replays
-    # exact request archives through all semantic-contract validators. A changed
-    # canonical ancestor, source, schema, model or policy gets a different key.
+    # Review receipts above are reconstructed from exact response archives;
+    # other audit snapshots remain diagnostic and are not accepted as proof.
     r.status = run.stage = (data["status"] if r.pending_patch and data.get("status") == "blocked:revision_no_changes"
                            else "blocked:pending_revision" if r.pending_patch else "resumed:requires_verification")
     return r

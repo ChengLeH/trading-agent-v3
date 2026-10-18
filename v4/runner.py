@@ -57,8 +57,9 @@ trader 建立交易方案；risk_manager 評估與否決風險並用 Claim 說�
 """
 
 
-def json_prompt(instructions, payload):
-    return instructions + "\n\n<context-data>\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n</context-data>"
+def json_prompt(instructions, payload, *, compact=False):
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) if compact else json.dumps(payload, ensure_ascii=False, indent=2)
+    return instructions + "\n\n<context-data>\n" + encoded + "\n</context-data>"
 
 
 def decode_response(result):
@@ -72,12 +73,16 @@ def require_model_identity(identity):
 
 
 class PipelineRunnerV4:
-    def __init__(self, *, max_revisions=3, max_workers=4, review_batch_size=1, review_batch_max_bytes=65536, max_contract_attempts=3):
+    def __init__(self, *, max_revisions=3, max_workers=4, review_batch_size=1, review_batch_max_bytes=65536, max_contract_attempts=3,
+                 global_dependency_batch_size=12):
         if type(max_revisions) is not int or max_revisions < 0:
             raise ValueError("invalid max_revisions")
         if type(max_contract_attempts) is not int or max_contract_attempts < 1:
             raise ValueError("max_contract_attempts must be a positive integer")
         self.max_contract_attempts = max_contract_attempts
+        if type(global_dependency_batch_size) is not int or not 1 <= global_dependency_batch_size <= 64:
+            raise ValueError("global_dependency_batch_size must be 1..64")
+        self.global_dependency_batch_size = global_dependency_batch_size
         if not isinstance(max_workers, int) or not 1 <= max_workers <= 32:
             raise ValueError("invalid max_workers")
         if type(review_batch_size) is not int or not 1 <= review_batch_size <= 16:
@@ -102,6 +107,7 @@ class PipelineRunnerV4:
         self.revision_round = 0
         self.reference_supplements = {"atomic": {}, "deep": {}}
         self._latest_review_sources = {"atomic": {}, "deep": {}}
+        self._restored_receipt_ids = {"atomic": set(), "deep": set()}
         self.status = "created"
         self.journal = None
         self._contract_attempts = {}
@@ -128,13 +134,16 @@ class PipelineRunnerV4:
         return decoded, provenance
 
     def _blocked(self, exc, status):
+        pending_stage = self.status
         details = exc.details() if isinstance(exc, AntigravityError) else {}
         self.status = exc.blocked_status(status) if isinstance(exc, AntigravityError) else status
         pending_findings = self._diagnostic_findings(self.pending_patch["findings"] if self.pending_patch else [])
         diagnostics = dict(findings=pending_findings) if pending_findings else {}
         if self.global_review_progress:
             diagnostics["global_review_progress"] = deepcopy(self.global_review_progress)
-        return dict(blocked=True, reason=f"{type(exc).__name__}: {exc}", status=self.status, **details, **diagnostics)
+        return dict(blocked=True, reason=f"{type(exc).__name__}: {exc}", status=self.status,
+                    block_category="infrastructure" if isinstance(exc, AntigravityError) else "pipeline_error",
+                    pending_stage=pending_stage, **details, **diagnostics)
 
     def _diagnostic_findings(self, findings):
         # Preserve independent occurrences. Only explicit finding identities
@@ -869,11 +878,15 @@ class PipelineRunnerV4:
                            if review_changed.intersection(self._finding_claim_ids(f)))
         invalidated = list({f["finding_id"]: deepcopy(f) for f in invalidated}.values())
         remaining_deferred = [f for f in self.deferred_global_findings
-                              if not review_changed.intersection(self._finding_claim_ids(f))]
-        # A patcher may fix only some of the findings it received. Keep every
-        # global finding pending until the mandatory fresh sweep confirms its
-        # current status; a nonempty patch must not silently discard siblings.
-        by_finding_id = {f["finding_id"]: deepcopy(f) for f in remaining_deferred + pending_global}
+                              if f.get("resolution_route", "claim_patch") != "claim_patch"
+                              or not review_changed.intersection(self._finding_claim_ids(f))]
+        # A partial patch must preserve unchanged siblings as active findings.
+        # Changed Claim judgments become historical recheck tasks, not active
+        # failures against the new object. External actions still need proof.
+        active_global = [f for f in remaining_deferred + pending_global
+                         if f.get("resolution_route", "claim_patch") != "claim_patch"
+                         or not review_changed.intersection(self._finding_claim_ids(f))]
+        by_finding_id = {f["finding_id"]: deepcopy(f) for f in active_global}
         self.deferred_global_findings = list(by_finding_id.values())
         for cid in affected:
             self.receipts.pop(cid, None)
@@ -919,8 +932,19 @@ class PipelineRunnerV4:
     def prepare_phase6_global_sweep(self):
         self._ready_for_global()
         validate_revision_history(self.run.claims, self.history)
+        if (self.history and self.history[-1].get("after_hash") == self._hash()
+                and self.global_receipt is None and self.pending_global is None):
+            # Migrate an old checkpoint's duplicate pre-patch judgments to the
+            # existing historical recheck queue. Object history, not prose
+            # matching, proves which version the judgment belonged to.
+            retired = self.history[-1].get("invalidated_global_findings", [])
+            self.deferred_global_findings = [f for f in self.deferred_global_findings
+                if f.get("resolution_route", "claim_patch") != "claim_patch" or f not in retired]
         rendered = render_report(self.orch.snapshot(self.run_id))
-        history = [{"claim_changes": row.get("claim_changes", [])} for row in self.history]
+        history = [{"claim_changes": [dict(claim_id=change["claim_id"],
+                    before={k: v for k, v in change["before"].items() if v != change["after"].get(k)},
+                    after={k: v for k, v in change["after"].items() if v != change["before"].get(k)})
+                    for change in row.get("claim_changes", [])]} for row in self.history]
         for item, row in zip(history, self.history):
             if row.get("invalidated_global_findings"):
                 item["findings_to_recheck"] = row["invalidated_global_findings"]
@@ -938,17 +962,20 @@ class PipelineRunnerV4:
             status = self._global_coverage_status()
             if not status["needs_retry"]:
                 return status
+            target_ids = status["missing_dependency_claim_ids"][:self.global_dependency_batch_size]
+            self.pending_global["target_claim_ids"] = target_ids
             self.status = "global_dependency_completion"
             return ("global_dependency_completion", json_prompt(
-                '先前全局掃描已完成，但 dependency_reviews 漏列部分 Claim。只補審 target_claim_ids，'
+                '先前全局跨章掃描已完成，本次只處理 dependency_reviews 的 target_claim_ids 批次，'
                 '保留既有 findings，不重做全文掃描、不重回已審列、不把漏審視為無依賴。'
                 'original_resolved_external_findings 會由系統與本次結果合併；本次 resolved_external_findings 只列新項，'
                 '不要重複舊項。若本次發現新的外部問題已由目前證據解決，才按 route 列 typed resolution_refs 與 claim_ids。'
                 '以完整 Claim DAG 與來源理解真正因果依賴，不以字詞猜連線。'
                 '回傳 JSON object：findings（本次新發現的問題，無則 []）及 dependency_reviews。'
-                '對 target_claim_ids 每個恰回 {claim_id,required_dependencies:[精確ID],unresolved:boolean,reason:語義理由}。'
+                '對 target_claim_ids 每個恰回 {claim_id,required_dependencies:[精確ID],unresolved:boolean,reason:簡短語義理由}。'
+                '只列本批，不回傳其他 Claim 的審查列；理由限於必要因果，勿複述整段原文。'
                 'required_dependencies 可指向 state.claims 的任何合法前提，不能指自己或後續結論。',
-                dict(review_scope="dependency_completion", target_claim_ids=status["missing_dependency_claim_ids"],
+                dict(review_scope="dependency_completion", target_claim_ids=target_ids,
                      coverage_round=self.pending_global["coverage_round"] + 1,
                      verification_epoch=self._verification_epoch, state=self._global_review_state(),
                      transport_recovery_records=self._transport_recovery_candidates(self.deferred_global_findings),
@@ -957,10 +984,11 @@ class PipelineRunnerV4:
                      original_resolved_external_findings=self.pending_global["review"]["response"].get(
                          "resolved_external_findings", []),
                      canonical_state_hash=self._hash(), history_hash=digest(self.history),
-                     history=history)))
+                     history=history), compact=True))
         self.global_receipt = None  # a fresh sweep cannot inherit an earlier clean receipt
         self.pending_global = dict(input_hash=self._hash(), report_hash=rendered["sidecar"]["report_hash"],
-                                   history_hash=digest(self.history), coverage_round=0)
+                                   history_hash=digest(self.history), coverage_round=0, completed_batches=0,
+                                   target_claim_ids=[c["claim_id"] for c in self.run.claims][:self.global_dependency_batch_size])
         self.status = "global"
         return ("global_consistency_reviewer", json_prompt(
             '執行最終全局 LLM 一致性掃描：跨章矛盾、stale state、修正未傳遞、互斥交易規則。'
@@ -969,7 +997,8 @@ class PipelineRunnerV4:
             '只有同一標的、期間、條件與決策層級下，彼此排斥的事實或最終可執行指令，才列為矛盾；'
             '條件式交易計畫可與 WAIT 或風險核准並存，除非條件、權責或最終狀態互相衝突。'
             '逐條審查相依完整性：找出論述實際依賴但未宣告的上游 Claim，不以字詞或數字比對猜連線。'
-            'history.claim_changes 有修改前後原物件；即使上游新文字已不同，也須追查下游是否沿用舊前提。'
+            'history.claim_changes 保留修改欄位的前後值，未改欄位見 state.claims；'
+            '即使上游新文字已不同，也須追查下游是否沿用舊前提。'
             + recheck_instruction +
             '只列真正因果前提，不能因主題相似就連線，不能反向依賴後續結論；不確定時 unresolved=true。'
             '小幅措辭不夠精確，但在合理解讀下不改變事實、因果、條件、範圍或決策，不阻擋交付；'
@@ -990,15 +1019,17 @@ class PipelineRunnerV4:
             'transport_recovery 只能引用 transport_recovery_records 中 finding 之後新收到、且對應相關 Claim 的 attempt_id。'
             'human_decision 與 uncertain 不得由模型自行標為已解決，必須保留為阻擋。'
             '不得因無關 Claim 修改或單純重新掃描就列為已解決；不確定時保留阻擋，不列入此陣列。'
-            '另有 dependency_reviews，必須對每個 Claim 恰一項：'
-            '{claim_id,required_dependencies:[精確Claim ID],unresolved:false,reason:語義理由}。無依賴也要回空陣列及理由。'
+            '本次仍須檢查全體 Claim 的跨章一致性；dependency_reviews 的輸出只對 target_claim_ids 每個恰一項，'
+            '其他 Claim 的依賴審查由後續批次完成，不需在本次輸出重複。'
+            '{claim_id,required_dependencies:[精確Claim ID],unresolved:false,reason:簡短語義理由}。無依賴也要回空陣列及理由，勿複述原文。'
             '無法對應時 claim_ids=[] 且 unresolved=true；若處理路徑是 Claim 修補才交 semantic linker 定位。',
             dict(review_scope="global_consistency", verification_epoch=self._verification_epoch, state=self._global_review_state(),
+                 target_claim_ids=self.pending_global["target_claim_ids"],
                  transport_recovery_records=self._transport_recovery_candidates(self.deferred_global_findings),
                  external_resolution_candidates=self._external_resolution_candidates(self.deferred_global_findings),
                  report_hash=rendered["sidecar"]["report_hash"], canonical_state_hash=self._hash(),
                  history=history, deferred_global_findings=self._prompt_deferred_findings(),
-                 history_hash=digest(self.history))))
+                 history_hash=digest(self.history)), compact=True))
 
     def _global_review_state(self):
         # Every Claim appears once. Atomic/deep reviewers already inspect source
@@ -1013,7 +1044,8 @@ class PipelineRunnerV4:
     def _global_coverage_status(self):
         response = self.pending_global["review"]["response"]
         audit = normalize_dependency_review(self.run.claims, response, allow_partial=True)
-        retry = self.pending_global["coverage_round"] < self.max_contract_attempts
+        retry = (self.pending_global["coverage_round"] - self.pending_global.get("completed_batches", 0)
+                 < self.max_contract_attempts)
         self.status = "blocked:global_dependency_coverage"
         return dict(blocked=True, status=self.status, needs_dependency_completion=True, needs_retry=retry,
                     reason="global dependency review omitted claims; explicit LLM completion required",
@@ -1135,6 +1167,9 @@ class PipelineRunnerV4:
                 or self.pending_global["history_hash"] != digest(self.history)):
             raise ValueError("stale or unprepared global sweep")
         prior = self.pending_global.get("review")
+        requested = self.pending_global.get("target_claim_ids", list(claim_index(self.run.claims)))
+        returned_ids = {row.get("claim_id") for row in findings.get("dependency_reviews", []) if isinstance(row, dict)} if isinstance(findings, dict) else set()
+        completed_batches = self.pending_global.get("completed_batches", 0) + int(set(requested) <= returned_ids)
         prior_deferred = deepcopy(self.deferred_global_findings)
         if prior:
             if prior["model"] != model_identity:
@@ -1159,7 +1194,8 @@ class PipelineRunnerV4:
             resolved_external = [row for row in resolved_external if row["finding_id"] not in conflicts]
         coverage_round = self.pending_global["coverage_round"] + 1
         if audit["missing_dependency_claim_ids"]:
-            self.pending_global.update(review=dict(model=model_identity, response=deepcopy(findings)), coverage_round=coverage_round)
+            self.pending_global.update(review=dict(model=model_identity, response=deepcopy(findings)), coverage_round=coverage_round,
+                                       completed_batches=completed_batches)
             result = self._global_coverage_status()
             self.global_review_progress = dict(format="v4-global-progress/1", verification_epoch=self._verification_epoch,
                                               **{**deepcopy(self.pending_global), **deepcopy(result)})
@@ -1272,6 +1308,8 @@ class PipelineRunnerV4:
         target = self.receipts if layer == "atomic" else self.deep_receipts
         for cid, row in received.items():
             source = (response_sources or {}).get(cid)
+            if source and isinstance(row, dict):
+                self._latest_review_sources[layer][cid] = deepcopy(source)
             if source and isinstance(row, dict) and row.get("reference_checks"):
                 try:
                     checks = normalize_reference_checks(review_ref_ids(tasks[cid].claim),
@@ -1312,16 +1350,19 @@ class PipelineRunnerV4:
                 for cid, prompt in single_prompts]
             results, errors = {}, []
             def one(request):
+                review_context = dict(layer=layer, verification_epoch=self._verification_epoch, contract=SEMANTIC_REVIEW_CONTRACT,
+                                      task_hashes={cid: digest(tasks[cid].to_dict()) for cid in request["claim_ids"]})
+                if layer == "deep":
+                    review_context["first_review_hashes"] = {cid: digest(self.receipts[cid]["result"]) for cid in request["claim_ids"]}
                 raw, provenance = self._complete(client, request["request_id"], request["prompt"], response_schema=request["response_schema"],
-                    review_context=dict(layer=layer, verification_epoch=self._verification_epoch, contract=SEMANTIC_REVIEW_CONTRACT,
-                                        task_hashes={cid: digest(tasks[cid].to_dict()) for cid in request["claim_ids"]}),
+                    review_context=review_context,
                     with_provenance=True)
                 received = (unpack_review_result(raw, request["claim_ids"])
                             if request.get("_batched") else {request["claim_ids"][0]: raw})
                 sources = {}
                 if provenance:
                     for cid, row in received.items():
-                        if isinstance(row, dict) and row.get("reference_checks"):
+                        if isinstance(row, dict):
                             sources[cid] = {**provenance, "claim_id": cid, "layer": layer}
                 return received, sources
             with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
@@ -1359,6 +1400,13 @@ class PipelineRunnerV4:
             if pending_revision:
                 return pending_revision
             self._require_complete_roles()
+            for cid, receipt in list(self.receipts.items()):
+                if cid in self._restored_receipt_ids["atomic"] and receipt["model"] != verifier.identity:
+                    self.receipts.pop(cid, None)
+                    self.deep_receipts.pop(cid, None)
+            for cid, receipt in list(self.deep_receipts.items()):
+                if cid in self._restored_receipt_ids["deep"] and receipt["model"] != deep_reviewer.identity:
+                    self.deep_receipts.pop(cid, None)
             while True:
                 prepared = self.prepare_phase6_atomic()
                 summary = self._execute_review_batch(verifier, prepared["atomic_prompts"], self.collect_phase6_atomic)

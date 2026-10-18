@@ -118,7 +118,7 @@ class EmptyRevision(unittest.TestCase):
         self.assertEqual(runner.revision_round, 1)
         self.assertEqual(result["revalidate_claim_ids"], ["a", "b", "c"])
         self.assertEqual({f["finding_id"] for f in runner.deferred_global_findings},
-                         {"global.a", "global.b"})
+                         {"global.b"})
         self.assertEqual([f["finding_id"] for f in runner.history[-1]["invalidated_global_findings"]],
                          ["global.a"])
         with tempfile.TemporaryDirectory() as temp:
@@ -126,7 +126,7 @@ class EmptyRevision(unittest.TestCase):
             save_checkpoint(runner, path)
             restored = load_checkpoint(path)
             self.assertEqual({f["finding_id"] for f in restored.deferred_global_findings},
-                             {"global.a", "global.b"})
+                             {"global.b"})
 
     def test_pipeline_nonempty_patch_contract_is_preserved(self):
         runner, _ = self.prepared()
