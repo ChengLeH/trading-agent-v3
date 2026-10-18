@@ -338,3 +338,43 @@ test_response_json.py 新增六項回歸測試（以模擬 CLI 子程序執行�
 獨立審查未發現阻塞問題；依建議重用即時解析結果，避免重複解析。保留的限制：如果 CLI 程序另有已確認的非零退出，仍依既有 cli_exit 政策拒收，不能將其視為這次已涵蓋的正常程序退出案例；原始 24 筆未附，無法確認是否含此情況。
 
 最終重新驗收：V4 220 項通過（29.206 秒），V3 基準 24 項通過；git diff --check 通過。以上均無新增模型呼叫；工作範圍限本輪修復檔案。
+
+
+## dependencies 單獨變更遺漏 deferred finding 狀態失效
+
+### Problem（問題）
+
+使用者回報三輪修補用完、blocked:revision_limit 剩八項，其中兩項依賴已補上卻留在 deferred_global_findings。VM 的 checkpoint.json 與八項原文未提供到本機；本輪確認並重現共用程式缺陷，不宣稱實際八項已變成六項。
+
+### Root Cause（因果鏈）
+
+runner.py collect_phase6_revision 的 content_changed 只比較 text／assertion／bindings／refs／fact_refs，漏列 dependencies。因此只補 DAG（依賴圖）邊時，Claim 與後代收據雖已作廢，對應舊 deferred finding 卻仍保留；重新原子驗證後 _review_findings 又把舊問題推回修補路徑，最後撞到輪數上限，無法進入應有的全局重驗。
+
+原本的 pruning（舊判定移除）不代表 LLM 已判定問題修好；即使補上欄位，也不能省略依賴重驗與最後 Global LLM Consistency Sweep（全局一致性掃描）。把任何依賴變動直接當成問題已解決，會誤刪仍成立的內容問題。
+
+### Fix（修正）
+
+- 完整比較修改前後的 canonical Claim 物件，含 dependencies 及未來正式欄位，不再手寫部分欄位清單。只對真正改動的明確 Claim ID 使舊判定失效；不讀 finding prose（自然語言文字）猜問題種類。
+- 失效問題完整寫入 history.invalidated_global_findings；相同輪次仍保留原 findings、before／after Claim、affected_claim_ids。未改 Claim、未定位問題及 no-op（無實際變化）修補不會被清除。
+- 既有局部／後代驗證與 global 收據作廢規則不變。必要的全局掃描透過 history.findings_to_recheck 明確重驗這些舊問題，仍成立就回 findings。不加新 LLM 階段，不調高修補輪數，無失效問題時不改原有全局提示內容。
+
+### Recommended Tests／Prevention（驗收）
+
+test_semantic_acceptance.py 新增五項回歸：只改 b.dependencies 能使 b 的舊問題失效且重驗 b／c、保留其他／未定位問題與歷史並可重載；no-op 依賴 patch 保留問題；原子重驗後仍需新的全局判決，問題仍在可再次失敗；最後允許修訂輪只補依賴後能以 b／c 兩項重驗及一次必要全局掃描完成，patcher 不再呼叫。另驗證新版本歷史缺少待重驗欄位、錯誤型別／目標、重複 ID 均拒絕，完整新紀錄與舊格式可載入。先在未修碼重現兩個失敗斷言，再修正通過。
+
+### Confidence／邊界
+
+共用漏列欄位的因果鏈及模擬重現信心高；未取得實際 VM 檢查點、沒有呼叫真實模型或操作 VM，無法驗證使用者列出的 A／B／C／D 全部分類及數量。尤其既有 patch 合約實際允許 assertion／dependencies 等欄位，pipeline.patch 也會重建結構化交易狀態，不能僅憑這段程式認定「只能改文字、完全無權修改立場」。本次不自動改判 SHORT／WAIT／APPROVE、不添加 waiver（豁免）、不編造缺少資料，也不把 finding 聲稱的傳輸截斷直接當成已證實的管線故障。
+
+### 更新與回滾
+
+只改 V4 共用修補／全局提示與測試文件，main／V3 不變。更新後重啟驅動程序並保留完整輸出。舊檢查點已完成的第三輪不會被此 collector 修正追溯重播；沒有可靠 finding 來源狀態時，不依任意過往 graph patch 自動刪當前問題。舊 run 仍需實際檢查點判斷如何重驗，不能保證零模型呼叫或只換版本就自動解除上限。
+
+回滾可撤回本次提交並重啟，先備份完整輸出；既有歷史與原始問題仍保留。舊版忽略新增的歷史診斷欄位，原本的 Claim before／after 歷史驗證格式不變，但再次只補 dependencies 時會重現舊判定未失效的問題。
+
+
+獨立審查補強：新修訂歷史標記 format=v4-revision/2；validate_revision_history 對該版本要求 invalidated_global_findings 陣列，驗證 finding_id／issue／目標 ID 與唯一性，防止保存欄位遺失後重啟忘記問題。真正的舊格式仍可讀取，不憑空遷移或宣告已解。這是資料保存契約，不是新語義硬篩。
+
+收尾獨立複查：已修正明確 format:null 被誤當成舊列的相容缺口；只有格式欄位完全缺席才是 legacy（舊格式），欄位存在但空值／錯型別／未知版本均拒絕。對應組合負例與舊格式可讀測試通過，審查確認阻塞解除。簡化限本輪完整物件比較與共用掃描歷史投影，未做無關重構。
+
+最終主代理完整驗收：V4 225 項通過（32.097 秒），V3 基準 13＋11 項通過；git diff --check 通過。均為本機測試／模擬模型，沒有新增真實模型呼叫、VM 操作或自動 waiver。

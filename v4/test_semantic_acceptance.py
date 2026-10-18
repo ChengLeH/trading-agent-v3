@@ -234,6 +234,112 @@ class SemanticAcceptance(unittest.TestCase):
             self.assertEqual(restored.deferred_global_findings, [])
             self.assertEqual(len(linker.calls), 1)
 
+    def test_dependencies_only_patch_invalidates_target_finding_and_revalidates_descendants(self):
+        from .checkpoint import save_checkpoint, load_checkpoint
+        r = seeded(); review_all(r)
+        target = dict(finding_id="fixture.dependency",issue="declared causal premise missing",claim_ids=["b"])
+        untouched = dict(finding_id="fixture.other",issue="separate issue",claim_ids=["independent"])
+        unmapped = dict(finding_id="fixture.unmapped",issue="needs semantic linking",claim_ids=[],unresolved=True)
+        r.deferred_global_findings = [target,untouched,unmapped]
+        original = copy.deepcopy(next(c for c in r.run.claims if c["claim_id"]=="b"))
+        retained = copy.deepcopy(r.receipts["independent"])
+        r.prepare_phase6_revision_v4([target])
+        result = r.collect_phase6_revision([dict(claim_id="b",dependencies=["a","independent"])])
+        after = next(c for c in r.run.claims if c["claim_id"]=="b")
+        self.assertEqual({k for k in original if original[k]!=after[k]}, {"dependencies"})
+        self.assertEqual(r.deferred_global_findings,[untouched,unmapped])
+        self.assertEqual(set(result["revalidate_claim_ids"]),{"b","c"})
+        self.assertFalse({"b","c"}.intersection(r.receipts))
+        self.assertEqual(r.receipts["independent"],retained)
+        self.assertIsNone(r.global_receipt)
+        self.assertIn(target,r.history[-1]["findings"])
+        self.assertEqual(r.history[-1]["invalidated_global_findings"],[target])
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/"patched.json"; save_checkpoint(r,path)
+            restored=load_checkpoint(path)
+            self.assertEqual(restored.deferred_global_findings,[untouched,unmapped])
+            self.assertIn(target,restored.history[-1]["findings"])
+            self.assertEqual(restored.history[-1]["invalidated_global_findings"],[target])
+            with self.assertRaises(ValueError): restored.finalize()
+
+    def test_noop_dependency_patch_does_not_invalidate_unresolved_finding(self):
+        r=seeded(); review_all(r)
+        finding=dict(finding_id="fixture.noop",issue="still unresolved",claim_ids=["b"])
+        r.deferred_global_findings=[finding]
+        r.prepare_phase6_revision_v4([finding])
+        r.collect_phase6_revision([dict(claim_id="b",dependencies=["a"])])
+        self.assertEqual(r.deferred_global_findings,[finding])
+
+    def test_dependency_patch_requires_new_global_verdict_and_can_still_fail(self):
+        r=seeded(); review_all(r)
+        finding=dict(finding_id="fixture.graph",issue="unresolved causal inconsistency",claim_ids=["b"])
+        r.deferred_global_findings=[finding]
+        r.prepare_phase6_revision_v4([finding])
+        r.collect_phase6_revision([dict(claim_id="b",dependencies=["a","independent"])])
+        self.assertEqual(r.deferred_global_findings,[])
+        with self.assertRaises(ValueError): r.finalize()
+        review_all(r)
+        with self.assertRaises(ValueError): r.finalize()
+        _,prompt=r.prepare_phase6_global_sweep()
+        self.assertIn("findings_to_recheck",prompt)
+        self.assertIn(finding["finding_id"],prompt)
+        result=r.collect_phase6_global_sweep(global_review(r,findings=[dict(issue="still inconsistent",claim_ids=["b"])]),model_identity="test/global")
+        self.assertTrue(result["needs_revision"])
+        self.assertEqual(result["findings"][0]["issue"],"still inconsistent")
+        with self.assertRaises(ValueError): r.finalize()
+
+    def test_graph_only_last_revision_can_finish_after_revalidation_without_another_patch(self):
+        r=seeded(); r.max_revisions=1; review_all(r)
+        finding=dict(finding_id="fixture.last",issue="missing causal edge",claim_ids=["b"])
+        r.deferred_global_findings=[finding]
+        r.prepare_phase6_revision_v4([finding])
+        r.collect_phase6_revision([dict(claim_id="b",dependencies=["a","independent"])])
+        author=CloudDouble("test/author",lambda _: self.fail("must not spend another patch round"))
+        first=CloudDouble()
+        sweep=CloudDouble("test/global",lambda _: global_review(r))
+        result=r.execute_phase6(first,CloudDouble("test/deep"),author,sweep)
+        self.assertFalse(result["blocked"],result)
+        self.assertEqual(result["status"],"complete")
+        self.assertEqual(r.revision_round,1)
+        self.assertEqual(author.calls,[])
+        self.assertEqual(len(first.calls),2)  # only b and its descendant c
+        self.assertEqual(len(sweep.calls),1)
+
+    def test_new_finding_invalidation_audit_cannot_disappear_or_change_shape_on_reload(self):
+        from .checkpoint import save_checkpoint, load_checkpoint
+        r=seeded(); review_all(r)
+        finding=dict(finding_id="fixture.audit",issue="missing causal edge",claim_ids=["b"])
+        r.deferred_global_findings=[finding]
+        r.prepare_phase6_revision_v4([finding])
+        r.collect_phase6_revision([dict(claim_id="b",dependencies=["a","independent"])])
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/"audit.json"; save_checkpoint(r,path)
+            original=json.loads(path.read_text())
+            for bad in ('missing',None,{},[finding,finding],[dict(finding_id="bad",issue="issue",claim_ids=["unknown"])],
+                        [dict(finding_id="bad",issue="issue",claim_ids=["independent"])],
+                        [dict(finding_id="bad",issue="",claim_ids=["b"]) ]):
+                damaged=copy.deepcopy(original)
+                row=damaged["history"][-1]
+                if bad == 'missing': row.pop("invalidated_global_findings")
+                else: row["invalidated_global_findings"]=bad
+                path.write_text(json.dumps(damaged))
+                with self.subTest(bad=bad),self.assertRaises(ValueError): load_checkpoint(path)
+            for bad_format in (None,0,False,{},[],"unknown"):
+                damaged=copy.deepcopy(original)
+                damaged["history"][-1]["format"]=bad_format
+                damaged["history"][-1].pop("invalidated_global_findings")
+                path.write_text(json.dumps(damaged))
+                with self.subTest(format=bad_format),self.assertRaises(ValueError): load_checkpoint(path)
+            path.write_text(json.dumps(original))
+            restored=load_checkpoint(path)
+            self.assertEqual(restored.history[-1]["invalidated_global_findings"],[finding])
+            # Legacy histories genuinely lack the new audit contract; preserve compatibility.
+            legacy=copy.deepcopy(original)
+            legacy["history"][-1].pop("format")
+            legacy["history"][-1].pop("invalidated_global_findings")
+            path.write_text(json.dumps(legacy))
+            self.assertEqual(len(load_checkpoint(path).history),1)
+
     def test_returned_dependency_rows_cannot_mutate_saved_audit(self):
         r = seeded()
         review_all(r)

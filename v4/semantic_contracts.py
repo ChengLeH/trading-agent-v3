@@ -153,6 +153,27 @@ def validate_revision_history(claims, history):
         if len(patch_ids) != len(entry["patches"]):
             raise ValueError("invalid historical patch")
         patch_by_id = {p["claim_id"]: p for p in entry["patches"]}
+        if "format" in entry and entry["format"] != "v4-revision/2":
+            raise ValueError("unsupported revision history format")
+        if entry.get("format") == "v4-revision/2" or "invalidated_global_findings" in entry:
+            invalidated = entry.get("invalidated_global_findings")
+            if not isinstance(invalidated, list):
+                raise ValueError("revision history requires invalidated_global_findings array")
+            finding_ids = set()
+            for finding in invalidated:
+                if not isinstance(finding, dict):
+                    raise ValueError("invalid historical global finding")
+                require_text(finding.get("finding_id"), "historical finding_id")
+                require_text(finding.get("issue"), "historical finding issue")
+                if finding["finding_id"] in finding_ids:
+                    raise ValueError("duplicate historical finding_id")
+                finding_ids.add(finding["finding_id"])
+                ids = id_list(finding.get("claim_ids", []), "historical finding claim IDs")
+                if "claim_id" in finding:
+                    require_text(finding["claim_id"], "historical finding claim_id")
+                    ids = list(dict.fromkeys([finding["claim_id"]] + ids))
+                if not ids or set(ids) - current.keys() or not set(ids).intersection(patch_ids):
+                    raise ValueError("historical finding must target a patched Claim")
         changes = entry.get("claim_changes")
         if not isinstance(changes, list) or len(changes) != len(patch_ids):
             raise ValueError("history lacks original Claim objects; regenerate roles from manifest")

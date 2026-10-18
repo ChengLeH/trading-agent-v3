@@ -153,7 +153,7 @@ V3 的 Markdown 或舊 Claim 缺欄位時，不能自動用文字猜成 V4；必
 
 每條 Claim 的線上任務只包含自己的完整物件、直接父 Claim 及兩者引用的完整來源；Calc／Event 的明確來源連結仍遞迴展開。每個父 Claim 本身另有必做的 LLM 驗證，不在每個子節點重新審整串祖先。收據與提示仍綁定全部祖先及來源的 canonical（正式狀態）雜湊，祖先或來源改變就使下游結果失效。這是結構化依賴投影，沒有以文字猜測重要性、截斷證據或漏驗 Claim。
 
-深度覆核保留第一層判決及 findings，不重帶第一層逐來源的冗長說明；仍獨立審原始證據。修補同樣使用局部任務。最終全局掃描仍檢查所有 Claim、章節／作者、DAG、交易物件及每次修改前後的完整 Claim；不再附內容重複的 Markdown、整份舊 finding／patch 歷史或 Evidence 的原始摘錄。完整正式狀態與歷史的雜湊仍綁定該次掃描。
+深度覆核保留第一層判決及 findings，不重帶第一層逐來源的冗長說明；仍獨立審原始證據。修補同樣使用局部任務。最終全局掃描仍檢查所有 Claim、章節／作者、DAG、交易物件及每次修改前後的完整 Claim；不再附內容重複的 Markdown、整份舊 patch 歷史或 Evidence 的原始摘錄；只把因 Claim 變更而待重驗的舊 global findings 加入必要掃描。完整正式狀態與歷史的雜湊仍綁定該次掃描。
 
 `session_pending` 不等於成功，也不允許自動 API 轉接或從頭重送。命令列以相同檢查點 `--resume`；程式庫使用同一 RunJournal，或直接 client 的 `resume_request(prompt, response_schema)`，會帶原本 `--conversation <id>`、相同代理設定與隔離目錄續接，只傳「接續完成原任務」的訊息，要求重新交付完整原始物件／陣列及所有批次 Claim，不拼接跨回合片段。普通 `client.complete()` 預設會在有限額度內自動接續相同對話，不開新對話；可用 `--no-auto-continue` 停用。新任務預設兩次續接、總時間為單回合期限三倍，但這些是可調政策：`--session-max-continuations` 與 `--session-budget-seconds` 可提高既有任務的總上限，保留已用次數與時間；`--request-attempts` 控制單次呼叫的嘗試次數。回覆格式補正與修訂輪數也可用 `--max-contract-attempts`、`--max-revisions` 調整。細節及續跑範例見 [P6 修復驗收](P6_BUGFIX_ACCEPTANCE.md#可調整的重試與續跑政策2026-10-18)。預算與次數跨程序保存，硬中止會保守扣除當次預留額度。每個任務的跨程序鎖防止同時重複呼叫；若主程序硬中止但舊子程序仍在，會回報 `session_busy`，不另開付費回合，也不擅自殺掉可能重用的程序識別碼。事件檔損壞則封鎖並保留原檔，不猜修、不盲目重算。
 
@@ -211,3 +211,12 @@ agy 的結束事件若明確回報 `status=ERROR`、`error_code=null`（或省�
 原始 events.jsonl 保留 ERROR 和原答案，session.json 保存正規化結果及 `transport_anomaly="stream_interrupted"`。恢復僅使用目前 attempt（呼叫輪次）的唯一最後結束事件；完整答案可在次數／時間已耗盡時零模型呼叫取回。已有完整答案時，放棄 session 的操作會拒絕並要求先恢復。
 
 空白、截斷或無法解析的答案仍走既有同對話重試。未知 ERROR、權限／工具違規、重複結束事件、送達不明及異常 CLI 程序退出檢查不因這個例外放寬。回收到 JSON 只代表傳輸完成；缺少必要語義驗收欄位仍會在 collector（結果收集器）被拒絕。
+
+
+### 僅修改依賴也必須更新舊 finding 狀態
+
+局部修補以完整 canonical Claim（正式論述物件）前後比較判斷驗證輸入是否改動，包含 dependencies，不再維護容易漏欄位的文字欄位清單。針對真正改動 Claim 的 deferred global findings（延後全局問題）移出舊狀態的待修佇列，寫入該輪 history.invalidated_global_findings（新歷史格式 v4-revision/2，重載會檢查該欄位完整性）；未改的 Claim、尚未定位的問題與無實際變化的 patch 都保留原狀。
+
+這是舊判定失效，不是 Python 判定問題已解決。受影響 Claim 與 dependency descendants（依賴後代）仍需重驗，舊 global 收據作廢；既有必要的全局掃描會讀 history.findings_to_recheck，重新檢查舊問題，仍成立就回 findings。沒有新增額外的覆核階段，也不提高 max_revisions。有問題的最終報告仍不能交付。
+
+更新後重啟驅動程序。這項狀態更新發生於 collect_phase6_revision；更新程式不會追溯重寫舊檢查點已完成輪次，也不會無證據刪除其 deferred findings。已卡在 revision_limit 的舊 run 不能保證只換版本就解除；需檢查其當前物件、修訂歷史及 findings，再決定如何重驗，不能直接把上限或歷史次數歸零。
