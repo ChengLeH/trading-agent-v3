@@ -11,7 +11,7 @@ from .atomic_phase6 import (build_atomic_tasks, build_atomic_prompt, build_refer
                             build_reference_verdict_repair_prompt,
                             summarize_atomic_results)
 from .review_batches import pack_review_requests, unpack_review_result
-from .pipeline import OrchestratorV4
+from .pipeline import OrchestratorV4, ClaimSourceError
 from .reporting import render_report
 from .schema import Claim, claim_index, descendants, digest, id_list
 from .semantic_contracts import (REFERENCE_INSTRUCTIONS, review_ref_ids, normalize_reference_checks,
@@ -135,7 +135,11 @@ class PipelineRunnerV4:
 
     def _blocked(self, exc, status):
         pending_stage = self.status
-        details = exc.details() if isinstance(exc, AntigravityError) else {}
+        details = exc.details() if isinstance(exc, (AntigravityError, ClaimSourceError)) else {}
+        if isinstance(exc, ClaimSourceError):
+            details["next_action"] = "inspect_claim_input"
+            if status == "blocked:roles":
+                details.update(retry_role=exc.claim["author_role"], next_action="inspect_role_output_before_retry")
         self.status = exc.blocked_status(status) if isinstance(exc, AntigravityError) else status
         pending_findings = self._diagnostic_findings(self.pending_patch["findings"] if self.pending_patch else [])
         diagnostics = dict(findings=pending_findings) if pending_findings else {}
@@ -1519,6 +1523,7 @@ class PipelineRunnerV4:
                 later = {role for group in groups[pos + 1:] for role in group}
                 if completed.intersection(set(roles) | later):
                     raise ValueError("incomplete or out-of-order role batch; restart from a valid checkpoint")
+                self.status = "roles"
                 self._persist()
                 outputs = self._parallel(author, self._role_prompts(roles), reuse_role_output=True)
                 if roles == PHASE_2_ROLES:

@@ -27,6 +27,50 @@ def author_response(prompt):
 
 
 class Journal(unittest.TestCase):
+    def test_grounding_error_outside_role_generation_does_not_suggest_regenerating_committed_role(self):
+        from .pipeline import ClaimSourceError
+        r = seeded()
+        c = claim('bad.patch'); c['claim_type'] = 'source_fact'
+        result = r._blocked(ClaimSourceError(c), 'blocked:revision_patch')
+        self.assertNotIn('retry_role', result)
+        self.assertEqual(result['next_action'], 'inspect_claim_input')
+        self.assertEqual(result['role_validation']['claim_id'], 'bad.patch')
+
+    def test_invalid_grounded_role_output_identifies_claim_and_plain_resume_replays_it(self):
+        r = seeded(); r.run.claims = []; r.run.analyses = {}
+        def invalid_author(prompt):
+            output = author_response(prompt)
+            if output['claims'][0]['author_role'] == 'market_analyst':
+                output['claims'][0]['claim_type'] = 'source_fact'
+            return output
+        with tempfile.TemporaryDirectory() as temp:
+            r.journal = RunJournal(temp)
+            author = CloudDouble('test/author', invalid_author)
+            clients = [CloudDouble(), CloudDouble('test/deep'),
+                       CloudDouble('test/global', lambda _: global_verdict(r))]
+            first = r.resume(author, *clients)
+            self.assertEqual(first['status'], 'blocked:roles')
+            self.assertEqual(first['role_validation']['claim_id'], 'market_analyst.restart')
+            self.assertEqual(first['role_validation']['author_role'], 'market_analyst')
+            self.assertEqual(first['role_validation']['refs'], [])
+            self.assertEqual(first['role_validation']['code'], 'grounded_source_required')
+            self.assertEqual(first['retry_role'], 'market_analyst')
+            self.assertEqual(first['pending_stage'], 'roles')
+            self.assertEqual(r.run.claims, [])
+            self.assertEqual(len(author.calls), 4)
+            second = r.resume(author, *clients)
+            self.assertEqual(second['role_validation'], first['role_validation'])
+            self.assertEqual(len(author.calls), 4)  # no new generation in plain resume
+            self.assertTrue(all(not c.calls for c in clients))
+            author.responder = author_response
+            r.journal.retry_roles.add('market_analyst')
+            recovered = r.resume(author, *clients)
+            self.assertFalse(recovered['blocked'], recovered)
+            requested_roles = [json.loads(p.split('<context-data>\n')[1].split('\n</context-data>')[0])['role']
+                               for p in author.calls[4:]]
+            self.assertEqual(requested_roles.count('market_analyst'), 1)
+            self.assertFalse(set(requested_roles).intersection({'news_analyst', 'social_analyst', 'fundamentals_analyst'}))
+
     def test_policy_failure_is_durable_and_resume_never_replays_failed_response(self):
         from .agy_session import AntigravityError
         r = seeded()

@@ -11,6 +11,18 @@ from .atomic_phase6 import build_atomic_tasks
 from datetime import date
 
 
+class ClaimSourceError(ValueError):
+    """Structural grounding failure with exact object routing, never prose matching."""
+    def __init__(self, claim):
+        self.claim = {key: deepcopy(claim[key]) for key in
+                      ("author_role", "claim_id", "claim_type", "refs", "fact_refs", "dependencies")}
+        super().__init__(f"grounded claim needs a source reference; author_role={claim['author_role']}; "
+                         f"claim_id={claim['claim_id']}; claim_type={claim['claim_type']}")
+
+    def details(self):
+        return dict(role_validation=dict(code="grounded_source_required", **deepcopy(self.claim)))
+
+
 def source_catalog(run):
     sources = {}
     for kind, store in (("fact", run.fact_store), ("calc", run.calc_store),
@@ -189,7 +201,7 @@ class OrchestratorV4(Orchestrator):
             # dependencies. Optional bindings preserve the model's attribution;
             # they are not canonical source records or a reason to skip NLI.
             if c["claim_type"] in {"source_fact", "derived_fact", "semantic_fact"} and not expected:
-                raise ValueError("grounded claim needs a source reference")
+                raise ClaimSourceError(c)
         run.claims = deepcopy(candidate)
         for role in claims_by_role:
             run.analyses[role] = {}

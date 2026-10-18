@@ -151,6 +151,10 @@ V3 的 Markdown 或舊 Claim 缺欄位時，不能自動用文字猜成 V4；必
 
 ## 將明確修補送入待修檢查點
 
+角色生成若出現 `grounded claim needs a source reference`，錯誤會附上 `role_validation`：角色、Claim ID、類型與 refs／fact_refs／dependencies；`retry_role` 提供精確定位，`next_action` 要求先檢查該角色原始輸出。這是結構驗收未過，不能據此推定資料集一定錯誤，也不會自動猜來源或降低 Claim 類型。
+
+一般 `--resume` 會重播已完成的角色回覆；相同壞回覆會再次失敗，不表示模型已重新生成。確認角色與原因後，可在原續跑指令加 `--retry-role <精確角色名稱>`，只重生未提交的該角色，保留同批其他角色的回覆。原始檔仍需保留；同批輸出全部驗收前不發布部分 Claim，也不進入 P6。這個選項不是重做已提交角色或讓後代保留舊前提的捷徑。
+
 `blocked:pending_revision` 表示修補要求已保存，單純 `--resume` 不會自動重複支付 patcher（修補模型）的費用。可在續跑指令加入 `--apply-patches /path/to/patches.json`，把明確的 JSON 陣列交給既有 Claim collector（結果驗收器），成功後接回原子、必要深度覆核及最後全局掃描。這個選項只能與 `--resume` 一起使用；不會直接交付未驗證報告。
 
 `blocked:revision_limit` 也會先保存同樣的待修清單，停止自動修補花費但允許明確的 `--apply-patches` 人工接手。人工修改仍累計實際輪次，不提高上限或歸零；若重驗又發現新問題，仍在原上限停下，不能跳過檢查。舊版沒有 `pending_patch` 的上限檢查點，只有 `audit.global_review` 的物件雜湊與歷史雜湊皆吻合，且問題有精確 Claim ID 時，才能恢復其可用 Claim 修補目標；外部處理路徑與未定位問題不會變成文字修補許可，診斷不會變成驗證收據。
