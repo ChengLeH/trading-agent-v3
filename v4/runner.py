@@ -13,7 +13,7 @@ from .atomic_phase6 import (build_atomic_tasks, build_atomic_prompt, build_refer
 from .review_batches import pack_review_requests, unpack_review_result
 from .pipeline import OrchestratorV4
 from .reporting import render_report
-from .schema import Claim, claim_index, digest, id_list
+from .schema import Claim, claim_index, descendants, digest, id_list
 from .semantic_contracts import (REFERENCE_INSTRUCTIONS, review_ref_ids, normalize_reference_checks,
                                  normalize_dependency_review,
                                  require_text, validate_revision_history, SEMANTIC_REVIEW_CONTRACT,
@@ -781,11 +781,32 @@ class PipelineRunnerV4:
         if self.revision_round >= self.max_revisions:
             self.status = "blocked:revision_limit"
             return dict(blocked=True, status=self.status, reason="revision limit reached", findings=self._diagnostic_findings(findings))
+        trade_plans = {cid for cid in wanted if index[cid]["assertion"]["kind"] == "trade_plan"}
+        if trade_plans:
+            # Cancelling/replacing a plan can remove its derived resources.
+            # Include only explicit direct dependents and resource consumers,
+            # so the LLM can repair them in the same valid transaction.
+            generated = set().union(*getattr(self.run, "trade_generated", ([], [])))
+            findings = deepcopy(findings)
+            for cid, claim in index.items():
+                if cid in wanted:
+                    continue
+                parents = trade_plans.intersection(claim["dependencies"])
+                refs = generated.intersection(claim["refs"])
+                if not parents and not refs:
+                    continue
+                wanted.append(cid)
+                findings.append(dict(claim_id=cid, category="dependent_state_review",
+                    issue="交易方案修訂涉及此直接依賴或衍生來源，須核對是否需要同步修補；不是預判語義錯誤",
+                    evidence=dict(trade_plan_claim_ids=sorted(trade_plans), direct_dependencies=sorted(parents),
+                                  generated_source_refs=sorted(refs)),
+                    suggested_fix="只在新交易狀態使原內容或引用失效時修改；保留仍成立的內容與真正依賴"))
         self.pending_patch = dict(input_hash=self._hash(), ids=wanted, findings=deepcopy(findings))
         tasks = self._tasks()
         prompt = json_prompt(
             '只修改所列 Claim 物件，不得重寫 Markdown、擴大範圍或更改作者與 ID。'
             '回傳 JSON array，每項至少 claim_id 加必要更改的欄位。所有未改欄位保留。'
+            '相依檢查任務不是已確認錯誤；不需修改的物件不要回傳。不得藉刪除真正的因果依賴掩蓋決策衝突。'
             '修正內容必須符合 V4 Claim schema，並更新 assertion/bindings/dependencies。',
             dict(findings=findings, tasks=[tasks[cid].review_dict() for cid in wanted]))
         self._persist()
@@ -803,7 +824,9 @@ class PipelineRunnerV4:
                     findings=deepcopy(self.pending_patch["findings"]),
                     allowed_claim_ids=list(self.pending_patch["ids"]))
 
-    def collect_phase6_revision(self, patches):
+    def collect_phase6_revision(self, patches, *, include_dependents=False):
+        if type(include_dependents) is not bool:
+            raise ValueError("include_dependents must be boolean")
         pending = self.pending_patch
         if not pending or pending["input_hash"] != self._hash():
             raise ValueError("stale or unprepared claim patch")
@@ -816,10 +839,11 @@ class PipelineRunnerV4:
             return dict(blocked=True, status=self.status, reason="claim patcher returned no changes",
                         findings=deepcopy(pending["findings"]),
                         allowed_claim_ids=list(pending["ids"]))
-        before = {c["claim_id"]: deepcopy(c) for c in self.run.claims if c["claim_id"] in pending["ids"]}
-        affected = self.orch.patch(self.run_id, patches, pending["ids"])
-        changed_ids = {cid for cid, old in before.items()
-                       if next(c for c in self.run.claims if c["claim_id"] == cid) != old}
+        allowed_ids = descendants(self.run.claims, pending["ids"]) if include_dependents else pending["ids"]
+        before = {c["claim_id"]: deepcopy(c) for c in self.run.claims if c["claim_id"] in allowed_ids}
+        affected = self.orch.patch(self.run_id, patches, allowed_ids)
+        after = {c["claim_id"]: c for c in self.run.claims}
+        changed_ids = {cid for cid, old in before.items() if after[cid] != old}
         if not changed_ids:
             # A nonempty response can still be a no-op after schema
             # normalization. Keep findings and receipts, and do not spend a
@@ -852,13 +876,19 @@ class PipelineRunnerV4:
             self.deep_receipts.pop(cid, None)
         self.global_receipt = None
         self.revision_round += 1
-        self.history.append(dict(format="v4-revision/2", round=self.revision_round, patches=deepcopy(patches),
+        effective_patches = [p for p in patches if p["claim_id"] in changed_ids]
+        self.history.append(dict(format="v4-revision/2", round=self.revision_round, patches=deepcopy(effective_patches),
                                  findings=pending["findings"], invalidated_global_findings=deepcopy(invalidated),
                                  claim_changes=[dict(claim_id=c["claim_id"], before=before[c["claim_id"]], after=deepcopy(c))
                                                 for c in self.run.claims if c["claim_id"] in changed_ids],
                                  affected_claim_ids=affected, before_hash=pending["input_hash"], after_hash=self._hash()))
+        if len(effective_patches) != len(patches):
+            self.history[-1]["submitted_patches"] = deepcopy(patches)
+        if include_dependents:
+            self.history[-1]["repair_scope"] = dict(requested_claim_ids=list(pending["ids"]),
+                                                   include_dependents=True, allowed_claim_ids=list(allowed_ids))
         self.pending_patch = None
-        self.status = "atomic"
+        self.status = self.run.stage = "atomic"
         self._persist()
         return dict(revalidate_claim_ids=affected, **self.prepare_phase6_atomic())
 

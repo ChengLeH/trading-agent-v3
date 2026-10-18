@@ -404,3 +404,32 @@ test_semantic_acceptance.py 新增五項回歸：只改 b.dependencies 能使 b 
 - 新增 journal 回覆來源驗收：checkpoint 內的部分引用檢查只有在能從原始收到的模型回覆封存重建時才可續用；測試竄改 checkpoint 內的引用證據後，載入會放棄補審收據並對該 Claim 全量重審。
 - 新增外部處理路徑驗收：純文字不得解除缺證據問題；新增且實際綁定到 Claim 的證據可經新全局語義掃描確認後解除；手動改字或錯角色回覆不能冒充重新裁決，模型也不能代替使用者做風險決策；舊檢查點缺少可信基準時繼續阻擋。實際原角色新回覆與目前 Claim 完全一致，才可供全局模型確認是否解決。
 - 補審、verdict 修復與一般 review 共用 schema／提示建構邏輯；重試模型身分不符在發送請求前拒絕；單一 Claim 的引用補審不再關閉其餘 Claim 的批次處理。完整套件：V4 242 項、V3 基準 24 項通過，`git diff --check` 及 V4 Python 語法檢查通過。測試使用本機模擬 client，沒有呼叫真實模型或 VM。
+
+## 待修檢查點的明確修補入口與交易取消傳播（2026-10-18）
+
+### Problem／Root Cause（問題與因果鏈）
+
+`resume()` 與 `execute_phase6()` 會先由 `_pending_revision_block()` 保護已保存的修補要求，避免重新啟動就自動重付修補費；但原生命令列沒有將明確修補交給 `collect_phase6_revision()` 的入口，待修狀態因此只能透過另寫 Python 才能解除。另以實際提供的 Checkpoint 重現：只將交易計畫改成 WAIT，會刪除舊交易產生的 Fact／Calc，下游風控卻仍引用這些資源，`pipeline.patch()` 因 unknown refs 拒絕整組候選。結構驗證本身正確，缺口是修補範圍沒有包含已知的直接依賴與資源消費者。
+
+獨立審查也確認另一個持久化缺陷：同批輸入混合有效修改與 no-op（無實際變更）時，history.patches 包含全部輸入，claim_changes 卻只有有效修改，違反既有歷史驗證規格，會使修補後的 Checkpoint 無法重載。
+
+### Fix（修正）
+
+- 新增 `--resume --apply-patches PATH`，完整 JSON 陣列經同一 collector 套用後，先持久保存，再接回原有語義驗證及全局掃描。空／無效／無變更輸入不會啟動雲端 client，也不會因重啟自動呼叫 patcher。非法輸入回 `blocked:revision_patch`，保留待修問題及原因。
+- 新準備的 trade_plan 修補只按結構化 dependencies 與 trade_generated 資源引用，納入直接相依 Claim 與資源消費者；補充的是待核對範圍，不是程式已判定的語義錯誤，也不開放全文任意修改。舊待修範圍可由操作者明確用 `--patch-dependents` 授權其 DAG 後代，仍拒絕無關 Claim，並記錄實際授權範圍。
+- 交易、衍生來源及相關 Claim 仍在副本完整驗證後一次提交；沒有保留失效交易數值假裝它們仍是現況。history.patches 只記有效修改，混合輸入另保存 submitted_patches；原有修訂歷史規格與版本不變。套用後同步更新 runner 與正式 run 的階段為 atomic，避免內嵌 stage 還標成 pending_revision。
+- 重用既有交易重建、DAG、collector、journal 及 renderer，沒有新增模型層、來源猜測、ticker 特例、regex 語義路由或權限放寬。
+
+### Recommended Tests／Prevention（驗收）
+
+`test_empty_revision.py` 增補原生 CLI 端到端測試：明確修補後完整原子驗證與全局掃描；空／no-op／壞 JSON、重複欄位、非法數值、重複或未授權 Claim 均不產生模型呼叫；舊範圍需明確授權後代；SHORT 改 WAIT 與風控引用在同筆交易更新，舊 Fact／Calc 移除、依賴仍保留；新的交易修補涵蓋直接子節點及沒有 Claim dependency 但有明確資源引用的消費者；混合 no-op 修補可重載；修補保存後，後續 verifier 中斷仍能載入已修狀態。
+
+實際提供的 Checkpoint 已另存備份，經 collector 修改 13 個必要 Claim，依賴圖列出 32 個受影響節點，57 個 Claim 全部保留；交易改為 WAIT 並清除舊交易的 4 筆 Fact、2 筆 Calc，其他來源保持原樣，重新載入及確定性檢查通過。這是資料修補與結構驗收；沒有新增真實模型呼叫，也沒有將修好的 Checkpoint 標成報告完成。實際研究資料與修補檔留在工作區／交付目錄，不加入 Git。
+
+### Confidence／更新與回滾
+
+共用缺口、實際失敗重現及修補後重載信心高；真實模型後續的語義判決、耗時與最終報告尚待續跑。更新 V4 程式並重啟 driver；已套用的 Checkpoint 用一般 `--resume`，不要再次套用同一修補檔。保留原 run 的 responses／sessions，不能只憑下載的單一 Checkpoint 假造原模型驗收收據。舊全局問題有的移至歷史待重驗、有的仍 deferred，不直接宣告解決。
+
+回滾程式可撤回本輪提交並重啟；資料回滾使用已保留的原始快照。若 `--out` 指向原 run 目錄，正常保存會更新該處 Checkpoint，需保留原快照時先備份或使用另一輸出目錄。
+
+最終驗收：V4 252 項通過（54.885 秒），V3 基準 13＋11 項通過，`git diff --check` 與本輪 Python 語法檢查通過。獨立審查找到的混合 no-op 歷史問題已加入回歸並修正；另套用一項重用簡化及一項消除重複線性搜尋的改善。未抽換整段 CLI 控制流程，以保持本次修改範圍。套件使用模擬 client，不代表實際模型已驗過已修 Checkpoint。

@@ -9,6 +9,33 @@ from .journal import RunJournal
 from .agy_session import AntigravityError
 
 
+def _cloud_clients(args, out):
+    return {role: AntigravityCloudClient(
+        getattr(args, f"{role}_model"), timeout=args.request_timeout, session_root=out / "sessions",
+        max_continuations=args.session_max_continuations, session_budget_seconds=args.session_budget_seconds,
+        request_attempts=args.request_attempts, continue_pending=not args.no_auto_continue)
+        for role in ("author", "verifier", "deep", "global")}
+
+
+def _read_claim_patches(path):
+    def unique_fields(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate patch field: {key}")
+            value[key] = item
+        return value
+
+    def reject_constant(value):
+        raise ValueError(f"non-finite patch number: {value}")
+
+    patches = json.loads(Path(path).read_text(encoding="utf-8"),
+                        object_pairs_hook=unique_fields, parse_constant=reject_constant)
+    if not isinstance(patches, list):
+        raise ValueError("patch file must contain a JSON array")
+    return patches
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Trading Agent V4 cloud-only pipeline")
     source = parser.add_mutually_exclusive_group(required=True)
@@ -41,12 +68,20 @@ def main(argv=None):
                         help="Response-contract attempts per claim/input; default 3, resume can raise the saved ceiling")
     parser.add_argument("--retry-role", action="append", choices=ROLES, default=[],
                         help="Re-request an uncommitted role output instead of replaying its saved response")
+    parser.add_argument("--apply-patches", metavar="PATH",
+                        help="Apply an explicit JSON Claim patch array to pending repairs before resuming")
+    parser.add_argument("--patch-dependents", action="store_true",
+                        help="Also permit explicit patches to pending Claims' dependency descendants")
     parser.add_argument("--recover-session",
                         help="Explicitly authorize one new generation for this exhausted conversation ID; requires --resume")
     parser.add_argument("--replay-reason", help="Required operator reason for --recover-session; old session is archived")
     parser.add_argument("--fresh-verification", action="store_true",
                         help="Explicitly start a new verification epoch instead of continuing saved requests")
     args = parser.parse_args(argv)
+    if args.apply_patches and not args.resume:
+        parser.error("--apply-patches requires --resume")
+    if args.patch_dependents and not args.apply_patches:
+        parser.error("--patch-dependents requires --apply-patches")
     if bool(args.recover_session) != bool(args.replay_reason):
         parser.error("--recover-session and --replay-reason must be provided together")
     if args.recover_session and (not args.resume or args.fresh_verification):
@@ -68,12 +103,8 @@ def main(argv=None):
         return 2
     runner, clients, recovery = None, {}, None
     try:
-        clients = {role: AntigravityCloudClient(getattr(args, f"{role}_model"), timeout=args.request_timeout, session_root=out / "sessions",
-                                                         max_continuations=args.session_max_continuations,
-                                                         session_budget_seconds=args.session_budget_seconds,
-                                                         request_attempts=args.request_attempts,
-                                                         continue_pending=not args.no_auto_continue) for role in ("author", "verifier", "deep", "global")}
         if args.check_transport:
+            clients = _cloud_clients(args, out)
             capabilities = {role: client.check_capabilities() for role, client in clients.items()}
             result = dict(blocked=False, status="transport_ready", capabilities=capabilities)
         elif args.resume:
@@ -94,9 +125,20 @@ def main(argv=None):
                 runner.review_batch_max_bytes = args.review_batch_max_bytes
             runner.journal = RunJournal(out, resume_from=args.resume, retry_roles=args.retry_role,
                                         continue_verification=not args.fresh_verification)
-            if args.recover_session:
-                recovery = runner.journal.authorize_session_replay(runner, args.recover_session, reason=args.replay_reason)
-            result = runner.resume(clients["author"], clients["verifier"], clients["deep"], clients["global"])
+            patch_result = None
+            if args.apply_patches:
+                try:
+                    patches = _read_claim_patches(args.apply_patches)
+                    patch_result = runner.collect_phase6_revision(patches, include_dependents=args.patch_dependents)
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    patch_result = runner._blocked(exc, "blocked:revision_patch")
+            if patch_result is not None and patch_result.get("blocked"):
+                result = patch_result
+            else:
+                if args.recover_session:
+                    recovery = runner.journal.authorize_session_replay(runner, args.recover_session, reason=args.replay_reason)
+                clients = _cloud_clients(args, out)
+                result = runner.resume(clients["author"], clients["verifier"], clients["deep"], clients["global"])
         else:
             manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
             runner = PipelineRunnerV4(max_workers=args.max_workers or 4, max_revisions=args.max_revisions if args.max_revisions is not None else 3,
@@ -104,6 +146,7 @@ def main(argv=None):
                                       review_batch_size=args.review_batch_size or 1,
                                       review_batch_max_bytes=args.review_batch_max_bytes or 65536)
             runner.journal = RunJournal(out, retry_roles=args.retry_role)
+            clients = _cloud_clients(args, out)
             result = runner.execute(manifest["subject"]["ticker"], manifest, clients["author"], clients["verifier"], clients["deep"], clients["global"])
     except Exception as exc:
         details = exc.details() if isinstance(exc, AntigravityError) else {}
