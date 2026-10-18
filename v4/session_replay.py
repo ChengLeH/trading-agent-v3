@@ -14,6 +14,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 from .storage import write_json
 from .response_json import normalize_json_response
+from .agy_protocol import interrupted_json_response
 
 _HELD = threading.local()
 
@@ -141,7 +142,8 @@ def abandon_session(session_dir, *, reason):
                         if len(terminal) != 1 or active[-1] != terminal[0]:
                             raise ValueError('ambiguous terminal audit; refuse paid replay')
                         result = terminal[0].get('result', {})
-                        if isinstance(result, dict) and result.get('status') == 'SUCCESS':
+                        if isinstance(result, dict) and (result.get('status') == 'SUCCESS'
+                                                       or interrupted_json_response(result) is not None):
                             try:
                                 normalize_json_response(result.get('response'))
                             except (ValueError, TypeError):

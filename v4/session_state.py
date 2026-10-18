@@ -10,12 +10,7 @@ from uuid import uuid4
 from .storage import write_json
 from .session_replay import lifecycle_lock, recover_authorized_replay
 from .response_json import normalize_json_response
-
-
-def is_stream_interruption(result):
-    """Recognize one CLI diagnostic, never inspect Claim or response prose."""
-    return (result.get("status") == "ERROR" and result.get("error_code") is None
-            and result.get("error") == "The stream was interrupted. Please continue the task you were working on.")
+from .agy_protocol import is_stream_interruption, interrupted_json_response
 
 
 def validate_limits(max_continuations=None, budget_seconds=None):
@@ -157,23 +152,25 @@ class SessionState:
             if (not isinstance(step, dict) or step.get("step_type") in ("tool", "subagent")
                     or any(k in step for k in ("tool_name", "tool_info", "subagent_info"))):
                 raise ValueError("unsafe terminal stream")
-        if is_stream_interruption(result):
+        recovered = interrupted_json_response(result)
+        if is_stream_interruption(result) and recovered is None:
             self.save(status="paused", last_error="stream_interrupted", turn_acknowledged=True)
             return False
-        response = result.get("response")
-        if result.get("status") == "SUCCESS" and isinstance(response, str) and response.strip():
+        response = recovered if recovered is not None else result.get("response")
+        if (result.get("status") == "SUCCESS" or recovered is not None) and isinstance(response, str) and response.strip():
             if require_json or self.data.get("json_required"):
                 response = self.validate_json_response(response)
                 if response is None:
                     return False
             self.save(status="complete", response=response, last_error=None, turn_acknowledged=True,
-                      result_received_at=terminal[0].get("v4_received_at", self.data.get("result_received_at")))
+                      result_received_at=terminal[0].get("v4_received_at", self.data.get("result_received_at")),
+                      transport_anomaly="stream_interrupted" if recovered is not None else None)
             return True
         return False
 
     def event(self, value):
-        # Append and fsync before exposing progress. Partial output is evidence,
-        # never an accepted verdict in the absence of a successful result.
+        # Append and fsync before exposing progress. Deltas alone are evidence;
+        # only a complete validated terminal answer can become a result.
         import os
         received_at = datetime.now(timezone.utc).isoformat()
         with (self.directory / "events.jsonl").open("a", encoding="utf-8") as stream:

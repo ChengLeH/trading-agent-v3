@@ -12,7 +12,8 @@ import subprocess
 import tempfile
 import time
 from uuid import uuid4, UUID
-from .session_state import SessionState, validate_limits, is_stream_interruption
+from .session_state import SessionState, validate_limits
+from .agy_protocol import is_stream_interruption, interrupted_json_response
 from .storage import write_json
 from .session_replay import abandon_session  # public, explicitly authorized escape hatch
 
@@ -279,8 +280,10 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
         terminal_deadline = None
         advertised_count = None
 
+        recovered = None
+
         def event(line):
-            nonlocal initialized, terminal, request, advertised_count, terminal_deadline
+            nonlocal initialized, terminal, request, advertised_count, terminal_deadline, recovered
             try:
                 item = json.loads(line)
             except (ValueError, UnicodeError):
@@ -366,9 +369,10 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                     raise AntigravityError("invalid_stream")
                 if permission_denied(str(terminal.get("error", "")).encode("utf-8")):
                     raise AntigravityError("permission_denied")
-                if is_stream_interruption(terminal):
+                recovered = interrupted_json_response(terminal)
+                if is_stream_interruption(terminal) and recovered is None:
                     raise AntigravityError("stream_interrupted", retryable=True)
-                if terminal.get("status") != "SUCCESS":
+                if terminal.get("status") != "SUCCESS" and recovered is None:
                     raise AntigravityError("result_failed", retryable=True)
                 if not isinstance(terminal.get("response"), str) or offset != len(request):
                     raise AntigravityError("invalid_stream")
@@ -438,7 +442,7 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                             user_prompt_sent=False)
             if terminal is None:
                 raise AntigravityError("empty_response", retryable=True)
-            response = terminal["response"]
+            response = recovered if recovered is not None else terminal["response"]
             if store:
                 if not response.strip():
                     raise AntigravityError("empty_response")
@@ -447,6 +451,7 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                     if response is None:
                         raise AntigravityError("invalid_json", retryable=True, conversation_id=store.data.get("conversation_id"))
                 store.save(status="complete", response=response, last_error=None, turn_acknowledged=True,
+                           transport_anomaly="stream_interrupted" if recovered is not None else None,
                            result_to_completion_seconds=round(time.monotonic() - (terminal_deadline - _RESULT_DRAIN_SECONDS), 3))
             return response
         except (BrokenPipeError, OSError):

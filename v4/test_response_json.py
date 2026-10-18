@@ -87,3 +87,103 @@ else:
         self.assertNotIn('reference_checks', value)
         with self.assertRaises(ValueError):
             normalize_atomic_result('c', value, expected_ref_ids=['source.required'])
+
+class InterruptedTerminalResponse(unittest.TestCase):
+    ERROR = 'The stream was interrupted. Please continue the task you were working on.'
+
+    def body(self, response, *, status='ERROR', error=None, suffix=''):
+        terminal = dict(status=status, error=self.ERROR if error is None else error, response=response, error_code=None)
+        return 'init()\nsys.stdin.readline()\nemit(dict(event="step_update",step_update=dict(step_type="user_input",state="DONE")))\nemit(' + repr(dict(event='result', result=terminal)) + ')\n' + suffix
+
+    def test_complete_interrupted_answers_reach_receipts_and_keep_fail_verdicts(self):
+        from .test_integration import seeded, verdict, reference_ids
+        for status in ('PASS', 'FAIL', 'SUSPICIOUS'):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temp:
+                runner = seeded()
+                prepared = runner.prepare_phase6_atomic()
+                answer = verdict('a', status)
+                raw = '```json\n' + json.dumps(answer) + '\n```'
+                with cli_stub(self.body(raw)) as executable:
+                    client = AntigravityCloudClient('model', executable=executable, session_root=temp, timeout=3, request_attempts=1)
+                    received = client.complete('original evidence')
+                index = {c['claim_id']:c for c in runner.run.claims}
+                results = {cid:verdict(cid,ref_ids=reference_ids(index[cid])) for cid,_ in prepared['atomic_prompts']}
+                results['a'] = received
+                summary = runner.collect_phase6_atomic(results, model_identity=client.identity)
+                self.assertEqual(runner.receipts['a']['result']['verdict'], status)
+                self.assertEqual(summary['needs_deep_review'], status != 'PASS')
+                state = json.loads(next(Path(temp).glob('*/session.json')).read_text())
+                self.assertEqual(state['transport_anomaly'], 'stream_interrupted')
+                self.assertEqual(state['continuations'], 0)
+                rows = [json.loads(line) for line in next(Path(temp).glob('*/events.jsonl')).read_text().splitlines()]
+                self.assertEqual(rows[-1]['result']['status'], 'ERROR')
+                self.assertEqual(rows[-1]['result']['response'], raw)
+
+    def test_saved_interrupted_answer_recovers_before_exhaustion_without_new_call(self):
+        raw = '{"claim_id":"a","verdict":"FAIL","findings":[{"issue":"wrong attribution"}],"reference_checks":[]}'
+        with tempfile.TemporaryDirectory() as temp, cli_stub(self.body(raw)) as executable:
+            try:
+                run_session(executable,'model','request',3,session_dir=temp,require_json=True)
+            except AntigravityError:
+                pass  # simulate a pre-fix reader that left the terminal in its audit
+            path = Path(temp)/'session.json'
+            state = json.loads(path.read_text())
+            state.update(status='paused',last_error='stream_interrupted',continuations=2,max_continuations=2,
+                         elapsed_seconds=10,budget_seconds=10)
+            path.write_text(json.dumps(state))
+            with self.assertRaisesRegex(ValueError,'complete result already saved'):
+                abandon_session(temp,reason='recover the answer instead')
+            with patch('v4.agy_session.subprocess.Popen') as start:
+                recovered=run_session(executable,'model','request',3,session_dir=temp,resume=True,require_json=True)
+            start.assert_not_called()
+            self.assertEqual(json.loads(recovered)['verdict'],'FAIL')
+            after=json.loads(path.read_text())
+            self.assertEqual(after['continuations'],2)
+            self.assertEqual(after['elapsed_seconds'],10)
+            self.assertEqual(after['transport_anomaly'],'stream_interrupted')
+
+    def test_only_complete_json_in_the_known_interrupted_terminal_is_recovered(self):
+        cases = [(None,self.ERROR),('',self.ERROR),('{"a":',self.ERROR),('explanation {}',self.ERROR),
+                 ('{} {}',self.ERROR),('{}','unknown error')]
+        for response,error in cases:
+            with self.subTest(response=response,error=error), tempfile.TemporaryDirectory() as temp, cli_stub(self.body(response,error=error)) as executable:
+                with self.assertRaises(AntigravityError):
+                    run_session(executable,'model','request',3,session_dir=temp,require_json=True)
+                state=json.loads((Path(temp)/'session.json').read_text())
+                self.assertNotEqual(state['status'],'complete')
+                self.assertEqual(state['last_error'],'stream_interrupted' if error==self.ERROR else 'result_failed')
+
+    def test_recovered_json_still_requires_reference_checks(self):
+        from .atomic_phase6 import normalize_atomic_result
+        raw='{"claim_id":"a","verdict":"PASS","findings":[]}'
+        with tempfile.TemporaryDirectory() as temp, cli_stub(self.body(raw)) as executable:
+            client=AntigravityCloudClient('model',executable=executable,session_root=temp,timeout=3,request_attempts=1)
+            response=client.complete('original evidence')
+            with self.assertRaises(ValueError):
+                normalize_atomic_result('a',response,expected_ref_ids=['source.required'])
+
+    def test_second_terminal_still_rejects_an_otherwise_recoverable_answer(self):
+        with tempfile.TemporaryDirectory() as temp, cli_stub(self.body('{}',suffix='result("{}")\n')) as executable:
+            with self.assertRaises(AntigravityError) as caught:
+                run_session(executable,'model','request',3,session_dir=temp,require_json=True)
+            self.assertEqual(caught.exception.code,'invalid_stream')
+            self.assertNotEqual(json.loads((Path(temp)/'session.json').read_text())['status'],'complete')
+
+    def test_nonzero_cli_exit_keeps_explicit_failure_and_protects_saved_answer(self):
+        body = self.body('{}',suffix='sys.exit(7)\n')
+        import subprocess
+        start = subprocess.Popen
+        def completed_exit_snapshot(*args, **kwargs):
+            process = start(*args, **kwargs)
+            # Exercise the known-exit guard, independently of OS reap timing.
+            process.poll = lambda: process.wait(timeout=3)
+            return process
+        with tempfile.TemporaryDirectory() as temp, cli_stub(body) as executable, \
+                patch('v4.agy_session.subprocess.Popen',side_effect=completed_exit_snapshot):
+            with self.assertRaises(AntigravityError):
+                run_session(executable,'model','request',3,session_dir=temp,require_json=True)
+            state=json.loads((Path(temp)/'session.json').read_text())
+            self.assertEqual(state['last_error'],'cli_exit')
+            self.assertNotEqual(state['status'],'complete')
+            with self.assertRaisesRegex(ValueError,'complete result already saved'):
+                abandon_session(temp,reason='do not discard the saved answer')

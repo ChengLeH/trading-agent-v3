@@ -304,3 +304,37 @@ agy_session.py 的 result 分支把所有非 SUCCESS 都歸 result_failed；run_
 本輪完整驗收：V4 214 項通過（26.483 秒），V3 基準 13＋11 項通過，git diff --check 通過。測試使用本機模擬子程序，沒有載入本地模型或新增雲端模型呼叫。
 
 獨立審查：未發現阻塞缺陷，另重跑六項新回歸測試通過。上限語義明確採「每次 client 呼叫有界＋跨重啟時間有界」；transport_retries 是累計紀錄，不另設跨生命週期固定次數上限。操作者多次 resume 不會重置已用執行時間，也不會新開對話，但仍可能產生額外費用。
+
+
+## 已知中斷 ERROR 帶完整答案卻遭丟棄
+
+### Problem（問題）
+
+使用者回報 trader.fundamental_and_catalyst_assessment 卡在 47/57，24 次 terminal（結束事件）含完整有效 JSON verdict，20 PASS＋4 FAIL，但 status=ERROR 且 error 為已知串流中斷診斷。這次未附原始 24 筆事件；該數量與真實 verdict 分布是使用者回報，未在 Mac 回放驗證。
+
+### Root Cause（因果鏈）
+
+agy_session.py 的 result 分支在 is_stream_interruption 命中時直接拋錯，尚未讀 response。session_state.py 的 recover_terminal 亦先把同類 ERROR 標為 paused 並返回 False，忽略其中答案。因此已保存完整回覆的即時／重啟路徑都仍重試原 CID，耗費額外時間。adbd53f 只分開傳輸恢復與內容續接額度，未涵蓋帶答案的 ERROR。session_replay.py 也僅保護 SUCCESS 的完整答案，可能允許操作者放棄本來能取回的 ERROR 答案。
+
+### Fix（修正與影響）
+
+- agy_protocol.py 收納原封不動的已知中斷診斷分類器，並共用 interrupted_json_response：只有該精確 ERROR 才試既有 normalize_json_response；完整 JSON 回傳，空白、片段、解說混雜或多物件不回收。不是 Claim prose（自然語言內容）的語義判斷。
+- 即時接收容許該完整答案進入既有尾端事件、送達、程序退出及 JSON 驗證；session.json 記錄 transport_anomaly=stream_interrupted，events.jsonl 原始 ERROR 不改寫。異常本身不代表 Claim 通過。
+- 保存事件恢復使用同一規則，在重試／時間上限檢查之前取回目前 attempt 的唯一最後完整答案，零模型呼叫，不歸零歷史時間或次數。不合格答案照舊保留 paused 並走串流中斷恢復。
+- 放棄 session 前也檢查這種完整答案，拒絕有答案仍新開付費請求。未改 CID、continuation 協定、重試額度、模型／API、權限、Claim 驗收或 V3。
+
+### Recommended Tests／Prevention（驗收）
+
+test_response_json.py 新增六項回歸測試（以模擬 CLI 子程序執行）：PASS／FAIL／SUSPICIOUS 都穿過實際 collector 產生對應收據，FAIL／SUSPICIOUS 仍要求深度覆核；舊保存 ERROR 在時間／次數已耗盡時不啟動子程序直接恢復且拒絕付費重跑；空白／片段／未知錯誤不回收；缺少 reference_checks 仍無法通過引用驗收；重複結束事件仍拒絕；已知非零程序退出仍回 cli_exit 並保護保存答案（測試固定已知退出狀態，與 OS 程序回收時序分開）。先在未修版重現 stream_interrupted，再修正通過。
+
+### Confidence／更新與回滾
+
+這條程式因果鏈及模擬重現信心高。未收到原始 24 筆，未呼叫真實模型／操作 VM，不宣稱昨晚的 20 PASS＋4 FAIL 已實際回放或真實 run 已完成；串流為何中斷仍未知。本次修的是已有完整答案的回收，不是網路斷線本身。
+
+更新後重啟驅動程序，保留整個輸出目錄並一般 --resume；恢復已存完整答案不需 --recover-session 或重送原任務。回滾撤回本次提交並重啟，先備份輸出；舊版會再次拒絕同類 ERROR 答案，原始事件仍保存。已被丟棄或刪除的 response 無法憑錯誤摘要重建。
+
+本輪主代理完整驗收：V4 219 項通過（35.822 秒），V3 基準 13＋11 項通過，git diff --check 通過。原始 24 筆事件未附，未把模擬案例數量或結果聲稱為真實回放。
+
+獨立審查未發現阻塞問題；依建議重用即時解析結果，避免重複解析。保留的限制：如果 CLI 程序另有已確認的非零退出，仍依既有 cli_exit 政策拒收，不能將其視為這次已涵蓋的正常程序退出案例；原始 24 筆未附，無法確認是否含此情況。
+
+最終重新驗收：V4 220 項通過（29.206 秒），V3 基準 24 項通過；git diff --check 通過。以上均無新增模型呼叫；工作範圍限本輪修復檔案。
