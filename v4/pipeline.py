@@ -329,7 +329,8 @@ class OrchestratorV4(Orchestrator):
         """Validate the entire candidate before publishing any changed state."""
         run = self.runs[run_id]
         original = deepcopy(run.claims)
-        index = claim_index(original)
+        original_index = claim_index(original)
+        index = deepcopy(original_index)
         if not isinstance(patches, list) or not patches:
             raise ValueError("nonempty claim patches required")
         changed = []
@@ -344,6 +345,9 @@ class OrchestratorV4(Orchestrator):
                 raise ValueError("patch cannot change author_role")
             index[cid] = Claim.from_dict(candidate).to_dict()
             changed.append(cid)
+        changed = [cid for cid in changed if index[cid] != original_index[cid]]
+        if not changed:
+            return []
         candidate = list(index.values())
         affected = set(descendants(original, changed)) | set(descendants(candidate, changed))
         # Reuse exactly the same source/schema contracts as initial ingestion.

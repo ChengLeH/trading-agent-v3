@@ -15,8 +15,9 @@ from copy import deepcopy
 from uuid import uuid4
 from .cloud import structured_prompt
 from .schema import claim_index, digest
-from .semantic_contracts import (REFERENCE_INSTRUCTIONS, normalize_reference_checks,
-                                 SEMANTIC_REVIEW_CONTRACT, semantic_review_schema, review_ref_ids)
+from .semantic_contracts import (REFERENCE_INSTRUCTIONS, MissingReferenceChecks,
+                                 normalize_reference_checks, SEMANTIC_REVIEW_CONTRACT,
+                                 semantic_review_schema, review_ref_ids, require_text)
 
 
 @dataclass
@@ -161,8 +162,11 @@ ATOMIC_INSTRUCTIONS = r"""
 4. Claim 的每個引用來源都已附在 context；不得把不存在的來源當成存在。
 5. 如果 context 不足以判定真假，回 SUSPICIOUS，不得猜 PASS。
 6. 如果是 interpretation/forecast，只在它把來源事實說錯、或推論明確超出所引證據時才報。
-7. findings 必須綁定本 claim_id。不要自行改寫其他 claim。
-8. 本任務只查這條 Claim 對直接前提的使用；每個上游 Claim 另有必做驗證，不重審整條祖先鏈。
+7. 只有會改變事實、歸因、因果、範圍、條件或決策的問題才列 findings。輕微籠統或措辭不夠清楚，
+   若合理解讀不會改變上述內容，可用 clarity_notes 留下簡短提醒，也可不記；不可因此判 FAIL 或要求修補。
+   若含糊可能改變數值、責任、前提或動作，仍是實質問題，回 SUSPICIOUS/FAIL。
+8. findings 與 clarity_notes 都必須綁定本 claim_id。不要自行改寫其他 claim。
+9. 本任務只查這條 Claim 對直接前提的使用；每個上游 Claim 另有必做驗證，不重審整條祖先鏈。
    父 Claim 出錯會阻擋總體交付並在修補後重驗下游；沒有提供的來源仍不能猜測。
 
 輸出單一 JSON object：
@@ -179,9 +183,10 @@ ATOMIC_INSTRUCTIONS = r"""
       "evidence": "context 中支持判斷的內容",
       "suggested_fix": "只寫必要修正"
     }
-  ]
+  ],
+  "clarity_notes": [{"issue":"不影響事實或決策的輕微表達提醒","reason":"為何合理解讀不會改變主張"}]
 }
-PASS 時 findings 必須是空陣列。
+clarity_notes 可省略。PASS 時 findings 必須是空陣列；小幅措辭提醒不算 finding。
 """.strip() + "\n\n" + REFERENCE_INSTRUCTIONS
 
 
@@ -198,7 +203,79 @@ def build_atomic_prompt(task: AtomicTask, *, verification_epoch=None) -> str:
     return structured_prompt(text, json.dumps(semantic_review_schema(task.claim), ensure_ascii=False, separators=(",", ":")))
 
 
-def normalize_atomic_result(claim_id: str, result: Dict[str, Any], *, expected_ref_ids=()) -> Dict[str, Any]:
+def build_reference_supplement_prompt(task: AtomicTask, prior_result, missing_ref_ids, *,
+                                      verification_epoch=None, layer="atomic", first_review=None,
+                                      previous_error=None):
+    """Ask the LLM to fill only missing reference checks and refresh its verdict."""
+    if layer not in {"atomic", "deep"} or not missing_ref_ids:
+        raise ValueError("reference supplement needs a review layer and missing IDs")
+    payload = task.review_dict()
+    payload.update(response_contract=SEMANTIC_REVIEW_CONTRACT,
+                   expected_reference_ids=list(missing_ref_ids),
+                   accepted_reference_checks=deepcopy(prior_result.get("reference_checks", [])),
+                   prior_verdict=prior_result.get("verdict"),
+                   prior_findings=deepcopy(prior_result.get("findings", [])),
+                   verification_epoch=verification_epoch or uuid4().hex)
+    if previous_error:
+        payload["previous_supplement_validation_error"] = previous_error
+    if first_review is not None:
+        payload["first_layer_review"] = deepcopy(first_review)
+    role_instructions = (
+        "你是 V4 的深度對抗覆核員。重新判斷 Claim 的整體 verdict，並檢查第一層判斷；"
+        "但 accepted_reference_checks 是已完成且保留的檢查，不要重審、改寫或重複它們。"
+        if layer == "deep" else
+        "你是 V4 的原子化語義驗證員。這條 Claim 已由同一驗證流程檢查過部分引用。"
+    )
+    instructions = (
+        role_instructions
+        + "只補 expected_reference_ids 所列的缺漏引用；reference_checks 必須只含這些 ID。"
+        + "逐項比對原文歸因與 context 內實際證據，不相關的真實摘錄不構成支持。"
+        + "relation 只能是 SUPPORTS、CONTRADICTS、INSUFFICIENT；矛盾必須判 FAIL，"
+        + "證據不足不可判 PASS。根據全部已接受檢查和本次補審，重新回傳整條 Claim 的 verdict 與 findings。"
+        + "PASS 時 findings=[]；SUSPICIOUS/FAIL 必須有具體 findings。不要因多空立場或文字風格判錯。"
+        + "不得捏造來源，不得修改 accepted_reference_checks。只回完整 JSON object。"
+    )
+    text = (instructions + "\n\n## Claim、局部證據及已接受引用檢查\n```json\n"
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+            + "\n```\n")
+    schema = semantic_review_schema(task.claim, reference_ids=missing_ref_ids)
+    return structured_prompt(text, json.dumps(schema, ensure_ascii=False, separators=(",", ":")))
+
+
+def build_reference_verdict_repair_prompt(task: AtomicTask, accepted_reference_checks, *,
+                                         validation_error, verification_epoch=None,
+                                         layer="atomic", first_review=None):
+    """Repair a malformed overall verdict without repeating accepted source checks."""
+    if layer not in {"atomic", "deep"}:
+        raise ValueError("semantic verdict repair needs a review layer")
+    payload = task.review_dict()
+    payload.update(response_contract=SEMANTIC_REVIEW_CONTRACT,
+                   expected_reference_ids=[],
+                   accepted_reference_checks=deepcopy(accepted_reference_checks),
+                   validation_error=validation_error,
+                   verification_epoch=verification_epoch or uuid4().hex)
+    if first_review is not None:
+        payload["first_layer_review"] = deepcopy(first_review)
+    role = ("你是 V4 的深度對抗覆核員。重新判斷 Claim 的整體語義與 verdict，並檢查第一層判斷。"
+            if layer == "deep" else
+            "你是 V4 的原子化語義驗證員。重新判斷 Claim 的整體語義與 verdict。")
+    instructions = (
+        role
+        + "accepted_reference_checks 是已完成且保存的來源審查；使用它們判斷主張，但不要重審、改寫或重複回傳。"
+        + "只修正 validation_error 指出的 verdict/findings/結構契約問題。"
+        + "所有 Claim 仍須由你作語義判斷；來源支持不足、矛盾或不確定時，不可判 PASS。"
+        + "若 verdict=PASS，findings=[]；若 verdict=SUSPICIOUS/FAIL，提供具體 findings。"
+        + "不要輸出 reference_checks。只回完整 JSON object。"
+    )
+    text = (instructions + "\n\n## Claim、局部證據及已接受引用檢查\n```json\n"
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+            + "\n```\n")
+    schema = semantic_review_schema(task.claim, reference_ids=[])
+    return structured_prompt(text, json.dumps(schema, ensure_ascii=False, separators=(",", ":")))
+
+
+def normalize_atomic_result(claim_id: str, result: Dict[str, Any], *, expected_ref_ids=(),
+                            allow_missing_references=False) -> Dict[str, Any]:
     """Strict structural normalization; no semantic judgment in Python."""
     if not isinstance(result, dict):
         raise ValueError(f"atomic result for {claim_id} must be an object")
@@ -220,11 +297,23 @@ def normalize_atomic_result(claim_id: str, result: Dict[str, Any], *, expected_r
             raise ValueError("every finding requires issue text")
         if finding.get("claim_id", claim_id) != claim_id:
             raise ValueError("finding targets another claim")
+    if "clarity_notes" in result:
+        notes = result["clarity_notes"]
+        if not isinstance(notes, list):
+            raise ValueError("clarity_notes must be a list")
+        for note in notes:
+            if not isinstance(note, dict):
+                raise ValueError("clarity note must be an object")
+            require_text(note.get("issue"), "clarity_notes.issue")
+            require_text(note.get("reason"), "clarity_notes.reason")
     out = dict(result)
     out["claim_id"] = claim_id
     out["verdict"] = verdict
     out["findings"] = findings
-    out["reference_checks"] = normalize_reference_checks(expected_ref_ids, out)
+    if "clarity_notes" in result:
+        out["clarity_notes"] = deepcopy(result["clarity_notes"])
+    out["reference_checks"] = normalize_reference_checks(
+        expected_ref_ids, out, allow_missing=allow_missing_references)
     return out
 
 
@@ -251,13 +340,21 @@ def summarize_atomic_results(
             "findings": [],
         }
 
-    normalized, invalid = {}, {}
+    normalized, invalid, partial_results, missing_reference_ids = {}, {}, {}, {}
     for cid in expected:
         if cid not in results_by_claim:
             continue
         try:
             normalized[cid] = normalize_atomic_result(cid, results_by_claim[cid],
                                                       expected_ref_ids=(expected_refs_by_claim or {}).get(cid, ()))
+        except MissingReferenceChecks as exc:
+            if not report_invalid:
+                raise
+            partial_results[cid] = normalize_atomic_result(
+                cid, results_by_claim[cid], expected_ref_ids=(expected_refs_by_claim or {}).get(cid, ()),
+                allow_missing_references=True)
+            missing_reference_ids[cid] = exc.missing_ref_ids
+            invalid[cid] = str(exc)
         except (ValueError, TypeError) as exc:
             if not report_invalid:
                 raise
@@ -282,6 +379,8 @@ def summarize_atomic_results(
         "missing_claim_ids": missing,
         "invalid_claim_ids": list(invalid),
         "validation_errors": invalid,
+        "partial_results": partial_results,
+        "missing_reference_ids": missing_reference_ids,
         "pass_claim_ids": passed,
         "suspicious_claim_ids": suspicious,
         "fail_claim_ids": failed,

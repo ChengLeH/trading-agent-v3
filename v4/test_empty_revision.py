@@ -45,6 +45,60 @@ class EmptyRevision(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "stale or unprepared"):
             runner.collect_phase6_revision([])
 
+    def test_nonempty_noop_patch_preserves_findings_receipts_and_revision_budget(self):
+        runner, findings = self.prepared()
+        before = deepcopy(dict(claims=runner.run.claims, receipts=runner.receipts,
+                               deep=runner.deep_receipts, global_review=runner.global_receipt,
+                               pending=runner.pending_patch, history=runner.history))
+        claim = next(c for c in runner.run.claims if c["claim_id"] == "a")
+
+        result = runner.collect_phase6_revision([dict(claim_id="a", text=claim["text"])])
+
+        self.assertTrue(result["blocked"])
+        self.assertEqual(result["status"], "blocked:revision_no_changes")
+        self.assertEqual(result["findings"], findings)
+        self.assertEqual(runner.revision_round, 0)
+        self.assertEqual(before, dict(claims=runner.run.claims, receipts=runner.receipts,
+                                     deep=runner.deep_receipts, global_review=runner.global_receipt,
+                                     pending=runner.pending_patch, history=runner.history))
+        self.assertNotIn("report_markdown", result)
+
+    def test_noop_patch_does_not_discard_descendant_receipts(self):
+        runner, _ = self.prepared()
+        receipts_before = deepcopy(runner.receipts)
+        original_patch = runner.orch.patch
+        with patch.object(runner.orch, "patch", wraps=original_patch) as apply_patch:
+            claim = next(c for c in runner.run.claims if c["claim_id"] == "a")
+            runner.collect_phase6_revision([dict(claim_id="a", text=claim["text"])])
+
+        self.assertEqual(apply_patch.call_count, 1)
+        self.assertEqual(runner.receipts, receipts_before)
+        self.assertEqual(runner.revision_round, 0)
+
+    def test_partial_patch_keeps_sibling_global_findings_for_fresh_sweep(self):
+        runner = seeded()
+        review_all(runner)
+        findings = [
+            dict(finding_id="global.a", issue="repair A", claim_ids=["a"]),
+            dict(finding_id="global.b", issue="repair B", claim_ids=["b"]),
+        ]
+        runner.prepare_phase6_revision_v4(findings)
+
+        result = runner.collect_phase6_revision([dict(claim_id="a", text="fixed A")])
+
+        self.assertEqual(runner.revision_round, 1)
+        self.assertEqual(result["revalidate_claim_ids"], ["a", "b", "c"])
+        self.assertEqual({f["finding_id"] for f in runner.deferred_global_findings},
+                         {"global.a", "global.b"})
+        self.assertEqual([f["finding_id"] for f in runner.history[-1]["invalidated_global_findings"]],
+                         ["global.a"])
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "partial-patch.json"
+            save_checkpoint(runner, path)
+            restored = load_checkpoint(path)
+            self.assertEqual({f["finding_id"] for f in restored.deferred_global_findings},
+                             {"global.a", "global.b"})
+
     def test_pipeline_nonempty_patch_contract_is_preserved(self):
         runner, _ = self.prepared()
         with self.assertRaisesRegex(ValueError, "nonempty claim patches"):

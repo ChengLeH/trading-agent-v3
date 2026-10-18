@@ -28,7 +28,7 @@ class RunJournal:
             atomic_verified=len(runner.receipts), deep_verified=len(runner.deep_receipts),
             max_workers=runner.max_workers, review_batch_size=runner.review_batch_size))
 
-    def complete(self, runner, client, task_id, prompt, *, reuse_role_output=False, response_schema=None, review_context=None):
+    def _response_metadata(self, runner, client, task_id, prompt, response_schema, review_context):
         metadata = dict(format="v4-response/1", run_id=runner.run_id, model=client.identity,
                         task_id=task_id, prompt_hash=digest(prompt))
         if review_context is not None:
@@ -37,6 +37,69 @@ class RunJournal:
             metadata["agent_policy_sha256"] = (load_agent_profile()[1] if callable(getattr(client, "complete_in_session", None)) else "external")
         if response_schema is not None:
             metadata["response_schema_hash"] = digest(response_schema)
+        return metadata
+
+    def response_provenance(self, runner, client, task_id, prompt, response, *, response_schema=None,
+                            review_context=None):
+        """Return the durable received-attempt identity for this exact response."""
+        metadata = self._response_metadata(runner, client, task_id, prompt, response_schema, review_context)
+        path = self.directory / "responses" / (digest(metadata) + ".json")
+        if not path.is_file():
+            return None
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            attempt_id = saved.get("attempt_id")
+            if (saved.get("status") != "received" or any(saved.get(k) != v for k, v in metadata.items())
+                    or saved.get("response") != response or not isinstance(attempt_id, str)
+                    or UUID(attempt_id).hex != attempt_id):
+                return None
+            archive_path = self.directory / "responses" / "archive" / (attempt_id + ".json")
+            archived = json.loads(archive_path.read_text(encoding="utf-8"))
+            if archived != saved:
+                return None
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+        return dict(attempt_id=attempt_id, metadata_hash=digest(metadata), response_hash=digest(response))
+
+    def response_attempt(self, attempt_id, run_id):
+        """Read a received response archive only when it belongs to this run."""
+        try:
+            if not isinstance(attempt_id, str) or UUID(attempt_id).hex != attempt_id:
+                return None
+        except (ValueError, TypeError, AttributeError):
+            return None
+        for directory in self.read_directories:
+            path = directory / "responses" / "archive" / (attempt_id + ".json")
+            if not path.is_file():
+                continue
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return None
+            if (record.get("attempt_id") == attempt_id and record.get("status") == "received"
+                    and record.get("run_id") == run_id):
+                return record
+        return None
+
+    def received_attempts(self, run_id):
+        attempts = {}
+        for directory in self.read_directories:
+            archive_dir = directory / "responses" / "archive"
+            if not archive_dir.is_dir():
+                continue
+            for path in archive_dir.glob("*.json"):
+                try:
+                    record = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                attempt_id = record.get("attempt_id")
+                if (record.get("status") == "received" and record.get("run_id") == run_id
+                        and isinstance(attempt_id, str) and UUID(attempt_id).hex == attempt_id):
+                    attempts[attempt_id] = record
+        return list(attempts.values())
+
+    def complete(self, runner, client, task_id, prompt, *, reuse_role_output=False, response_schema=None, review_context=None):
+        metadata = self._response_metadata(runner, client, task_id, prompt, response_schema, review_context)
         relative = Path("responses") / (digest(metadata) + ".json")
         session_directory = self.directory / "sessions" / digest(metadata)
         if task_id in self.retry_roles:

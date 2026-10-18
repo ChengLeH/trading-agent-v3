@@ -15,11 +15,14 @@ BATCH_INSTRUCTIONS = """你是 V4 語義驗證員。對 tasks 中每一條 Claim
 投資觀點不同不構成錯誤；證據不足回 SUSPICIOUS，不可猜 PASS。禁止使用外部工具。
 resolved_ref_ids 指向 evidence_catalog；dependency_claim_ids 指向 dependency_catalog；兩者均保留完整物件。
 每條只使用自己列出的來源與相依 ID；其他 task 或未列出的共用來源不是它的證據，不得偷偷借用。
-每條的 findings 只指向該 claim_id；PASS 的 findings=[]，其他 verdict 必須解釋問題。
+每條只把會改變事實、歸因、因果、範圍、條件或決策的問題列入 findings；輕微措辭不清但合理解讀不變，
+可放 clarity_notes 或忽略。若含糊可能改變主張或動作，仍須列為 SUSPICIOUS/FAIL。
+不同角色、立場或條件化情境本身不構成錯誤。每條的 findings 與 clarity_notes 只指向該 claim_id；PASS 的 findings=[]。
 只回嚴格 JSON object：{"results":[{"claim_id":"原ID","verdict":"PASS|SUSPICIOUS|FAIL",
 "reference_checks":[{"ref_id":"引用ID","relation":"SUPPORTS|CONTRADICTS|INSUFFICIENT",
 "attributed_assertion":"原文歸因命題","source_evidence":"實際來源證據","reason":"理由"}],
-"findings":[{"issue":"問題","evidence":"證據","suggested_fix":"必要修正"}]}]}。
+"findings":[{"issue":"問題","evidence":"證據","suggested_fix":"必要修正"}],
+"clarity_notes":[{"issue":"輕微措辭提醒","reason":"不改變主張的原因"}]}]}。
 逐條回報，不能把不相關真實來源綁到錯誤命題而判 PASS。
 """ + REFERENCE_INSTRUCTIONS
 

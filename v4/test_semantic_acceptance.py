@@ -4,6 +4,7 @@ import json
 import unittest
 from .test_integration import seeded, review_all, verdict, CloudDouble, reference_ids as claim_reference_ids
 from v3.facts import Fact
+from v3.evidence import EvidencePacket
 from collections import Counter
 from pathlib import Path
 import tempfile
@@ -29,6 +30,14 @@ def global_review(r, findings=None, required=None, unresolved=()):
 
 
 class SemanticAcceptance(unittest.TestCase):
+    @staticmethod
+    def add_evidence_reference(runner, claim_id, evidence_id):
+        runner.run.evidence_store.add(EvidencePacket(
+            evidence_id=evidence_id, claim_candidate="new source passage", source_id="source.new",
+            source_type="generic_text", source_span="p.1"))
+        claim = next(c for c in runner.run.claims if c["claim_id"] == claim_id)
+        claim["refs"].append(evidence_id)
+
     def test_new_execution_uses_fresh_atomic_and_deep_requests_with_exact_schema(self):
         from .checkpoint import save_checkpoint, load_checkpoint
         original = seeded()
@@ -48,6 +57,442 @@ class SemanticAcceptance(unittest.TestCase):
             r.collect_phase6_atomic(results, model_identity="test/first")
             deep.append(r.prepare_phase6_deep_review()["deep_prompts"])
         self.assertNotEqual(deep[0], deep[1])
+
+    def test_missing_reference_array_is_only_optional_when_claim_has_no_references(self):
+        from .semantic_contracts import semantic_review_schema
+        r = seeded()
+        claim = next(c for c in r.run.claims if c["claim_id"] == "a")
+        response = verdict("a")
+        response.pop("reference_checks")
+
+        normalized = normalize_atomic_result("a", response, expected_ref_ids=[])
+        schema = semantic_review_schema(claim)
+
+        self.assertEqual(normalized["reference_checks"], [])
+        self.assertNotIn("reference_checks", schema["required"])
+
+    def test_missing_single_reference_is_supplemented_without_rechecking_valid_refs(self):
+        from .checkpoint import save_checkpoint, load_checkpoint
+        r = seeded()
+        claim_b = next(c for c in r.run.claims if c["claim_id"] == "b")
+        claim_b["dependencies"].append("independent")
+        prepared = r.prepare_phase6_atomic()
+        tasks = {t.claim_id: t for t in build_atomic_tasks(r.run)}
+        results = {cid: verdict(cid, ref_ids=reference_ids(tasks[cid]))
+                   for cid, _ in prepared["atomic_prompts"]}
+        results["b"]["reference_checks"] = source_checks(["a"])
+
+        first = r.collect_phase6_atomic(results, model_identity="test/first")
+
+        self.assertTrue(first["blocked"])
+        self.assertEqual(first["retry_claim_ids"], ["b"])
+        self.assertEqual(first["missing_reference_ids"], {"b": ["independent"]})
+        self.assertEqual(first["response_schemas"]["b"]["properties"]["reference_checks"]["items"]["properties"]["ref_id"]["enum"],
+                         ["independent"])
+        self.assertEqual([row["ref_id"] for row in r.reference_supplements["atomic"]["b"]["base_result"]["reference_checks"]],
+                         ["a"])
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "checkpoint.json"
+            save_checkpoint(r, path)
+            resumed = load_checkpoint(path)
+            restored = resumed.prepare_phase6_atomic()
+            b_prompt = dict(restored["atomic_prompts"])["b"]
+            self.assertNotIn("b", resumed.reference_supplements["atomic"])
+            self.assertEqual(restored["response_schemas"]["b"]["properties"]["reference_checks"]["items"]["properties"]["ref_id"]["enum"],
+                             ["a", "independent"])
+            self.assertIn('"expected_reference_ids":["a","independent"]', b_prompt)
+
+        completed = r.collect_phase6_atomic(
+            {"b": verdict("b", ref_ids=["independent"])}, model_identity="test/first")
+        self.assertFalse(completed["blocked"])
+        self.assertEqual([row["ref_id"] for row in r.receipts["b"]["result"]["reference_checks"]],
+                         ["a", "independent"])
+
+    def test_missing_supplement_response_preserves_accepted_reference_checks(self):
+        r = seeded()
+        next(c for c in r.run.claims if c["claim_id"] == "b")["dependencies"].append("independent")
+        prepared = r.prepare_phase6_atomic()
+        tasks = {task.claim_id: task for task in build_atomic_tasks(r.run)}
+        results = {cid: verdict(cid, ref_ids=reference_ids(tasks[cid]))
+                   for cid, _ in prepared["atomic_prompts"]}
+        results["b"]["reference_checks"] = source_checks(["a"])
+        r.collect_phase6_atomic(results, model_identity="test/first")
+        accepted = copy.deepcopy(r.reference_supplements["atomic"]["b"]["base_result"]["reference_checks"])
+
+        retry = r.collect_phase6_atomic({}, model_identity="test/first")
+
+        self.assertEqual([row["ref_id"] for row in r.reference_supplements["atomic"]["b"]["base_result"]["reference_checks"]],
+                         [row["ref_id"] for row in accepted])
+        self.assertEqual(retry["response_schemas"]["b"]["properties"]["reference_checks"]["items"]["properties"]["ref_id"]["enum"],
+                         ["independent"])
+
+    def test_invalid_supplement_verdict_retries_without_rechecking_accepted_references(self):
+        from .checkpoint import load_checkpoint, save_checkpoint
+        r = seeded()
+        next(c for c in r.run.claims if c["claim_id"] == "b")["dependencies"].append("independent")
+        prepared = r.prepare_phase6_atomic()
+        tasks = {task.claim_id: task for task in build_atomic_tasks(r.run)}
+        initial = {cid: verdict(cid, ref_ids=reference_ids(tasks[cid]))
+                   for cid, _ in prepared["atomic_prompts"]}
+        initial["b"]["reference_checks"] = source_checks(["a"])
+        first = r.collect_phase6_atomic(initial, model_identity="test/original")
+        self.assertEqual(first["missing_reference_ids"], {"b": ["independent"]})
+
+        malformed = verdict("b", "NOT_A_VERDICT", ref_ids=["independent"])
+        r.collect_phase6_atomic({"b": malformed}, model_identity="test/original")
+        repair = r.reference_supplements["atomic"]["b"]
+        self.assertTrue(repair["contract_repair"])
+        self.assertEqual(repair["missing_ref_ids"], [])
+        self.assertEqual([row["ref_id"] for row in repair["accepted_reference_checks"]],
+                         ["a", "independent"])
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "supplement-repair.json"
+            save_checkpoint(r, path)
+            resumed = load_checkpoint(path)
+            prepared = resumed.prepare_phase6_atomic()
+            self.assertNotIn("b", resumed.reference_supplements["atomic"])
+            self.assertEqual(prepared["response_schemas"]["b"]["properties"]["reference_checks"]["maxItems"], 2)
+
+        result = r.collect_phase6_atomic(
+            {"b": dict(claim_id="b", verdict="PASS", findings=[])},
+            model_identity="test/original")
+        self.assertFalse(result["blocked"], result)
+        self.assertEqual([row["ref_id"] for row in r.receipts["b"]["result"]["reference_checks"]],
+                         ["a", "independent"])
+
+    def test_checkpoint_reuses_only_reference_checks_found_in_durable_response_archive(self):
+        from .checkpoint import load_checkpoint, save_checkpoint
+        from .journal import RunJournal
+        from .semantic_contracts import SEMANTIC_REVIEW_CONTRACT
+        from .schema import digest
+
+        r = seeded()
+        next(c for c in r.run.claims if c["claim_id"] == "b")["dependencies"].append("independent")
+        prepared = r.prepare_phase6_atomic()
+        tasks = {task.claim_id: task for task in build_atomic_tasks(r.run)}
+        prompt = dict(prepared["atomic_prompts"])["b"]
+        response = verdict("b", ref_ids=["a"])
+        client = CloudDouble("test/archive-bound", lambda _prompt: response)
+        with tempfile.TemporaryDirectory() as temp:
+            r.journal = RunJournal(temp)
+            context = dict(layer="atomic", verification_epoch=r._verification_epoch,
+                           contract=SEMANTIC_REVIEW_CONTRACT,
+                           task_hashes={"b": digest(tasks["b"].to_dict())})
+            received, provenance = r._complete(
+                client, "b", prompt, response_schema=prepared["response_schemas"]["b"],
+                review_context=context, with_provenance=True)
+            self.assertIsNotNone(provenance)
+            source = {**provenance, "claim_id": "b", "layer": "atomic"}
+            r._record_review_progress({"b": received}, client, "atomic", {"b": source})
+            partial = r.collect_phase6_atomic({"b": received}, model_identity=client.identity)
+            self.assertTrue(partial["blocked"])
+            checkpoint = Path(temp) / "checkpoint.json"
+            saved = json.loads(checkpoint.read_text())
+            supplement = saved["reference_supplements"]["atomic"]["b"]
+            self.assertEqual(len(supplement["reference_sources"]), 1)
+            self.assertEqual(supplement["base_result_source"]["attempt_id"], provenance["attempt_id"])
+
+            restored = load_checkpoint(checkpoint)
+            self.assertIn("b", restored.reference_supplements["atomic"])
+            self.assertEqual(restored.prepare_phase6_atomic()["response_schemas"]["b"][
+                "properties"]["reference_checks"]["items"]["properties"]["ref_id"]["enum"], ["independent"])
+
+            supplement["base_result"]["reference_checks"][0]["source_evidence"] = "checkpoint-only fabricated support"
+            checkpoint.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+            tampered = load_checkpoint(checkpoint)
+            self.assertNotIn("b", tampered.reference_supplements["atomic"])
+            self.assertEqual(tampered.prepare_phase6_atomic()["response_schemas"]["b"][
+                "properties"]["reference_checks"]["items"]["properties"]["ref_id"]["enum"], ["a", "independent"])
+
+            second = r.prepare_phase6_atomic()
+            second_prompt = dict(second["atomic_prompts"])["b"]
+            malformed = verdict("b", "NOT_A_VERDICT", ref_ids=["independent"])
+            client.responder = lambda _prompt: malformed
+            second_context = dict(layer="atomic", verification_epoch=r._verification_epoch,
+                                  contract=SEMANTIC_REVIEW_CONTRACT,
+                                  task_hashes={"b": digest(tasks["b"].to_dict())})
+            received, provenance = r._complete(
+                client, "b", second_prompt, response_schema=second["response_schemas"]["b"],
+                review_context=second_context, with_provenance=True)
+            r._record_review_progress({"b": received}, client, "atomic",
+                                      {"b": {**provenance, "claim_id": "b", "layer": "atomic"}})
+            r.collect_phase6_atomic({"b": received}, model_identity=client.identity)
+            repair = r.reference_supplements["atomic"]["b"]
+            self.assertTrue(repair["contract_repair"])
+            self.assertEqual(len(repair["reference_sources"]), 2)
+
+            saved = json.loads(checkpoint.read_text())
+            accepted = saved["reference_supplements"]["atomic"]["b"]["accepted_reference_checks"]
+            self.assertEqual([row["ref_id"] for row in accepted], ["a", "independent"])
+            restored_repair = load_checkpoint(checkpoint)
+            self.assertTrue(restored_repair.reference_supplements["atomic"]["b"]["contract_repair"])
+            self.assertEqual(restored_repair.prepare_phase6_atomic()["response_schemas"]["b"][
+                "properties"]["reference_checks"]["maxItems"], 0)
+
+            accepted[0]["source_evidence"] = "checkpoint-only fabricated accepted reference"
+            checkpoint.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+            tampered_repair = load_checkpoint(checkpoint)
+            self.assertNotIn("b", tampered_repair.reference_supplements["atomic"])
+
+    def test_model_change_is_rejected_before_supplement_request_is_sent(self):
+        from .checkpoint import load_checkpoint, save_checkpoint
+        from .journal import RunJournal
+        from .semantic_contracts import SEMANTIC_REVIEW_CONTRACT
+        from .schema import digest
+        r = seeded()
+        next(c for c in r.run.claims if c["claim_id"] == "b")["dependencies"].append("independent")
+        prepared = r.prepare_phase6_atomic()
+        tasks = {task.claim_id: task for task in build_atomic_tasks(r.run)}
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "model-bound-supplement.json"
+            r.journal = RunJournal(temp)
+            prompt = dict(prepared["atomic_prompts"])["b"]
+            response = verdict("b", ref_ids=["a"])
+            response_schema = prepared["response_schemas"]["b"]
+            context = dict(layer="atomic", verification_epoch=r._verification_epoch,
+                           contract=SEMANTIC_REVIEW_CONTRACT,
+                           task_hashes={"b": digest(tasks["b"].to_dict())})
+            client = CloudDouble("test/original", lambda _prompt: response)
+            received, provenance = r._complete(
+                client, "b", prompt, response_schema=response_schema,
+                review_context=context, with_provenance=True)
+            self.assertIsNotNone(provenance)
+            r._record_review_progress(
+                {"b": received}, client, "atomic",
+                {"b": {**provenance, "claim_id": "b", "layer": "atomic"}})
+            r.collect_phase6_atomic({"b": received}, model_identity=client.identity)
+            save_checkpoint(r, path)
+            r = load_checkpoint(path)
+
+        replacement = CloudDouble("test/replacement")
+        blocked = r.execute_phase6(replacement, CloudDouble("test/deep"), CloudDouble("test/patch"),
+                                   CloudDouble("test/global"))
+
+        self.assertTrue(blocked["blocked"])
+        self.assertIn("reference supplement model differs", blocked["reason"])
+        self.assertEqual(replacement.calls, [])
+
+    def test_minor_clarity_note_does_not_trigger_deep_review_or_patch(self):
+        r = seeded()
+        prepared = r.prepare_phase6_atomic()
+        tasks = {task.claim_id: task for task in build_atomic_tasks(r.run)}
+        results = {cid: verdict(cid, ref_ids=reference_ids(tasks[cid]))
+                   for cid, _ in prepared["atomic_prompts"]}
+        results["a"]["clarity_notes"] = [dict(issue="描述略籠統", reason="不影響主體、事實或決策")]
+
+        summary = r.collect_phase6_atomic(results, model_identity="test/first")
+
+        self.assertFalse(summary["needs_deep_review"])
+        self.assertEqual(summary["pass_claim_ids"], list(results))
+        self.assertEqual(r.receipts["a"]["result"]["clarity_notes"], results["a"]["clarity_notes"])
+
+    def test_global_clarity_only_finding_is_recorded_without_blocking_delivery(self):
+        r = seeded(); review_all(r)
+        r.prepare_phase6_global_sweep()
+        note = dict(claim_ids=["b"], issue="措辭略籠統", evidence="Claim text", suggested_fix="可選擇改寫",
+                    materiality="clarity_only", materiality_reason="合理解讀都保留相同事實與決策")
+
+        result = r.collect_phase6_global_sweep(global_review(r, [note]), model_identity="test/global")
+        report = r.finalize()
+
+        self.assertFalse(result["blocked"])
+        self.assertEqual(result["findings"], [])
+        self.assertEqual(result["clarity_notes"], [note | {"finding_id": result["clarity_notes"][0]["finding_id"]}])
+        self.assertFalse(report["blocked"])
+        self.assertEqual(report["sidecar"]["global_review"]["clarity_notes"], result["clarity_notes"])
+
+    def test_global_prompt_distinguishes_role_views_from_same_scope_conflicts(self):
+        r = seeded(); review_all(r)
+        _, prompt = r.prepare_phase6_global_sweep()
+
+        self.assertIn("不同角色可呈現不同觀點", prompt)
+        self.assertIn("同一標的、期間、條件與決策層級", prompt)
+        self.assertIn("resolution_route", prompt)
+
+    def test_external_resolution_route_blocks_without_spending_revision_round(self):
+        r = seeded()
+        r.max_revisions = 0
+        finding = dict(claim_ids=["b"], issue="缺少九月的來源數據", evidence="當前 source store 無該期間資料",
+                       materiality="material", resolution_route="evidence_needed",
+                       resolution_reason="Claim 修補器不能建立不存在的行情資料")
+        verifier, deep = CloudDouble(), CloudDouble("test/deep")
+        patcher = CloudDouble("test/patcher")
+        global_client = CloudDouble("test/global", lambda _: global_review(r, [finding]))
+
+        blocked = r.execute_phase6(verifier, deep, patcher, global_client)
+
+        self.assertTrue(blocked["blocked"])
+        self.assertEqual(blocked["status"], "blocked:resolution_required")
+        self.assertEqual(blocked["resolution_routes"], ["evidence_needed"])
+        self.assertEqual(r.revision_round, 0)
+        self.assertEqual(patcher.calls, [])
+        self.assertEqual(r.deferred_global_findings[0]["resolution_route"], "evidence_needed")
+        self.assertEqual(r.deferred_global_findings[0]["resolution_state_hash"],
+                         r._resolution_state_hash(r.deferred_global_findings[0]))
+        from .checkpoint import load_checkpoint, save_checkpoint
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "external-route.json"
+            save_checkpoint(r, path)
+            restored = load_checkpoint(path)
+            self.assertEqual(restored.deferred_global_findings[0]["resolution_state_hash"],
+                             r._resolution_state_hash(restored.deferred_global_findings[0]))
+
+        global_client.responder = lambda _: global_review(r)
+        next(c for c in r.run.claims if c["claim_id"] == "role.bear")["text"] = "另一個角色的新觀察。"
+        unchanged = r.execute_phase6(verifier, deep, patcher, global_client)
+        self.assertTrue(unchanged["blocked"])
+        self.assertEqual(unchanged["status"], "blocked:resolution_required")
+        self.assertEqual(r.revision_round, 0)
+
+        saved_id = r.deferred_global_findings[0]["finding_id"]
+        global_client.responder = lambda _: global_review(r) | {
+            "resolved_external_findings": [dict(finding_id=saved_id,
+                                                 evidence="已有來源",
+                                                 reason="此自由文字不構成 typed proof")]
+        }
+        rejected = r.execute_phase6(verifier, deep, patcher, global_client)
+        self.assertTrue(rejected["blocked"])
+        self.assertEqual(rejected["status"], "blocked:resolution_required")
+        self.assertTrue(rejected["rejected_external_resolutions"])
+
+        self.add_evidence_reference(r, "b", "ev.new_data")
+        global_client.responder = lambda _: global_review(r) | {
+            "resolved_external_findings": [dict(finding_id=saved_id,
+                                                 evidence="引用新的 evidence object",
+                                                 reason="新來源已由該 Claim 直接引用",
+                                                 claim_ids=["b"], resolution_refs=["ev.new_data"])]
+        }
+        completed = r.execute_phase6(verifier, deep, patcher, global_client)
+        self.assertFalse(completed["blocked"], completed)
+        self.assertEqual(r.deferred_global_findings, [])
+        self.assertEqual(r.revision_round, 0)
+
+    def test_unmapped_external_finding_needs_explicit_global_resolution(self):
+        r = seeded(); review_all(r)
+        finding = dict(claim_ids=[], unresolved=True, issue="缺少來源證據",
+                       evidence="來源資料尚未提供", materiality="material",
+                       resolution_route="evidence_needed", resolution_reason="需要補上來源資料")
+        global_calls = []
+        def global_response(_prompt):
+            global_calls.append(True)
+            return global_review(r, [finding] if len(global_calls) == 1 else [])
+        global_client = CloudDouble("test/global", global_response)
+        clients = (CloudDouble(), CloudDouble("test/deep"), CloudDouble("test/patch"), global_client)
+
+        first = r.execute_phase6(*clients)
+        self.assertTrue(first["blocked"])
+        saved_id = r.deferred_global_findings[0]["finding_id"]
+
+        next(c for c in r.run.claims if c["claim_id"] == "role.bear")["text"] = "無關的角色觀察更新。"
+        second = r.execute_phase6(*clients)
+
+        self.assertTrue(second["blocked"])
+        self.assertEqual(second["status"], "blocked:resolution_required")
+        self.assertEqual([f["finding_id"] for f in r.deferred_global_findings], [saved_id])
+        with self.assertRaises(ValueError):
+            r.finalize()
+
+        global_client.responder = lambda _prompt: global_review(r) | {
+            "resolved_external_findings": [dict(finding_id=saved_id,
+                                                 evidence="已新增可核對的來源資料",
+                                                 reason="新來源直接補足原先缺漏",
+                                                 claim_ids=["b"], resolution_refs=["ev.followup"])]
+        }
+        free_prose = r.execute_phase6(*clients)
+        self.assertTrue(free_prose["blocked"])
+        self.assertTrue(free_prose["rejected_external_resolutions"])
+        self.add_evidence_reference(r, "b", "ev.followup")
+        resolved = r.execute_phase6(*clients)
+        self.assertFalse(resolved["blocked"], resolved)
+        self.assertEqual(r.deferred_global_findings, [])
+
+    def test_model_cannot_clear_human_decision_route(self):
+        r = seeded(); review_all(r)
+        finding = dict(claim_ids=["b"], issue="需要使用者決定風險偏好", evidence="現有資訊無法決定可承受損失",
+                       materiality="material", resolution_route="human_decision",
+                       resolution_reason="需要使用者選擇最大風險")
+        r.prepare_phase6_global_sweep()
+        first = r.collect_phase6_global_sweep(global_review(r, [finding]), model_identity="test/global")
+        finding_id = r.deferred_global_findings[0]["finding_id"]
+
+        r.prepare_phase6_global_sweep()
+        second = r.collect_phase6_global_sweep(
+            global_review(r) | {"resolved_external_findings": [dict(
+                finding_id=finding_id, evidence="我已替使用者決定", reason="模型認為偏好已明確",
+                claim_ids=["b"], resolution_refs=["b"])]}, model_identity="test/global")
+
+        self.assertTrue(first["blocked"])
+        self.assertTrue(second["blocked"])
+        self.assertEqual(second["rejected_external_resolutions"][0]["finding_id"], finding_id)
+        self.assertEqual(r.deferred_global_findings[0]["finding_id"], finding_id)
+
+    def test_role_redeliberation_requires_received_original_role_output(self):
+        from .journal import RunJournal
+        from .schema import Claim
+
+        r = seeded(); review_all(r)
+        original = copy.deepcopy(next(c for c in r.run.claims if c["claim_id"] == "b"))
+        finding = dict(claim_ids=["b"], issue="原角色結論需要重新裁決", evidence="原主張仍未解決",
+                       materiality="material", resolution_route="role_redeliberation",
+                       resolution_reason="需要原作者重新確認結論")
+        with tempfile.TemporaryDirectory() as temp:
+            r.journal = RunJournal(temp)
+            r.prepare_phase6_global_sweep()
+            r.collect_phase6_global_sweep(global_review(r, [finding]), model_identity="test/global")
+            finding_id = r.deferred_global_findings[0]["finding_id"]
+
+            # A manual edit is not evidence that the author reconsidered the claim.
+            next(c for c in r.run.claims if c["claim_id"] == "b")["text"] = "手動修改，沒有原角色重新回覆。"
+            review_all(r)
+            r.prepare_phase6_global_sweep()
+            manual_edit = r.collect_phase6_global_sweep(global_review(r) | {
+                "resolved_external_findings": [dict(finding_id=finding_id, evidence="文字已改",
+                                                     reason="只有手動編輯", claim_ids=["b"],
+                                                     resolution_refs=["b"])]}, model_identity="test/global")
+            self.assertTrue(manual_edit["blocked"])
+
+            # A response from the wrong role cannot satisfy the route either.
+            wrong_role = copy.deepcopy(original)
+            wrong_role["author_role"] = "bear"
+            rejected_response = r.journal.complete(
+                r, CloudDouble("test/role", lambda _: {"claims": [wrong_role]}),
+                "bull", "重新裁決 b")
+            self.assertEqual(rejected_response["claims"][0]["author_role"], "bear")
+            r.prepare_phase6_global_sweep()
+            wrong_attempt = r.collect_phase6_global_sweep(global_review(r) | {
+                "resolved_external_findings": [dict(finding_id=finding_id, evidence="有新回覆",
+                                                     reason="回覆作者與原角色不符", claim_ids=["b"],
+                                                     resolution_refs=[row["attempt_id"] for row in
+                                                         r.journal.received_attempts(r.run_id)
+                                                         if row["task_id"] == "bull"])]}, model_identity="test/global")
+            self.assertTrue(wrong_attempt["blocked"])
+
+            # Only a durable, post-finding response from the original role that
+            # exactly matches the current canonical Claim can resolve it.
+            revised = copy.deepcopy(original)
+            revised["text"] = "原作者重新分析後改變了結論。"
+            r.journal.complete(r, CloudDouble("test/role", lambda _: {"claims": [revised]}),
+                               "bull", "重新裁決 b")
+            attempt = next(row for row in r.journal.received_attempts(r.run_id)
+                           if row["task_id"] == "bull"
+                           and row["response"].get("claims", [{}])[0].get("text") == revised["text"])
+            r.run.claims = [Claim.from_dict(revised).to_dict() if c["claim_id"] == "b" else c
+                            for c in r.run.claims]
+            r.orch._sync_views(r.run)
+            review_all(r)
+            _, prompt = r.prepare_phase6_global_sweep()
+            payload = json.loads(prompt.split("<context-data>\n")[1].split("\n</context-data>")[0])
+            records = payload["external_resolution_candidates"][0]["role_redeliberation_records"]
+            self.assertEqual(records, [dict(attempt_id=attempt["attempt_id"], task_id="bull", claim_ids=["b"])])
+            resolved = r.collect_phase6_global_sweep(global_review(r) | {
+                "resolved_external_findings": [dict(finding_id=finding_id, evidence="原角色新回覆已存檔",
+                                                     reason="原角色重新裁決並重新驗證", claim_ids=["b"],
+                                                     resolution_refs=[attempt["attempt_id"]])]},
+                model_identity="test/global")
+            self.assertFalse(resolved["blocked"], resolved)
 
     def test_schema_retries_do_not_preserve_legacy_pass_or_skip_deep_review(self):
         from .semantic_contracts import semantic_review_schema
@@ -141,9 +586,10 @@ class SemanticAcceptance(unittest.TestCase):
         result = r.execute_phase6(verifier, deep, CloudDouble("test/author"),
                                  CloudDouble("test/global", lambda _: global_review(r)))
         self.assertFalse(result["blocked"], result)
-        self.assertEqual(len(verifier.calls), 174)
-        self.assertEqual(set(generated), {c["claim_id"] for c in r.run.claims})
-        self.assertEqual(len(generated), 87)
+        refs_required = {c["claim_id"] for c in r.run.claims if claim_reference_ids(c)}
+        self.assertEqual(len(verifier.calls), len(r.run.claims) + len(refs_required))
+        self.assertEqual(set(generated), refs_required)
+        self.assertEqual(len(generated), len(refs_required))
         self.assertEqual(deep.calls, [])
         self.assertTrue(all("reference_checks" in x["result"] for x in r.receipts.values()))
 
@@ -196,19 +642,17 @@ class SemanticAcceptance(unittest.TestCase):
             path.write_text(json.dumps(saved))
             r = load_checkpoint(path)
         review_all(r)
-        findings = r._review_findings()
-        self.assertEqual(len({f["finding_id"] for f in findings}), 2)
-        r.prepare_finding_linker(findings)
-        linked = r.apply_finding_links(findings, [
-            dict(finding_index=0, claim_ids=["b"], unresolved=False),
-            dict(finding_index=1, claim_ids=["c"], unresolved=False)])
-        self.assertEqual([f["claim_ids"] for f in r.deferred_global_findings], [["b"], ["c"]])
-        r.prepare_phase6_revision_v4([linked[0]])
-        r.collect_phase6_revision([dict(claim_id="b", text="first issue repaired")])
-        self.assertEqual(r.deferred_global_findings, [linked[1]])
-        review_all(r)
-        with self.assertRaisesRegex(ValueError, "outstanding semantic findings"):
-            r.prepare_phase6_global_sweep()
+        role, prompt = r.prepare_phase6_global_sweep()
+        payload = json.loads(prompt.split("<context-data>\n")[1].split("\n</context-data>")[0])
+        self.assertEqual(payload["deferred_global_findings"], r.deferred_global_findings)
+        self.assertEqual(len({f["finding_id"] for f in payload["deferred_global_findings"]}), 2)
+        rechecked = r.collect_phase6_global_sweep(global_review(r, findings=[
+            dict(issue="same wording, different claims", claim_ids=["b"]),
+            dict(issue="same wording, different claims", claim_ids=["c"])]), model_identity="test/global")
+        self.assertEqual([f["claim_ids"] for f in rechecked["findings"]], [["b"], ["c"]])
+        self.assertEqual(len({f["finding_id"] for f in rechecked["findings"]}), 2)
+        revision = r.prepare_phase6_revision_v4(rechecked["findings"])
+        self.assertEqual(revision["allowed_claim_ids"], ["b", "c"])
 
     def test_deferred_content_finding_survives_graph_repair_and_reload(self):
         from .checkpoint import save_checkpoint, load_checkpoint
@@ -228,11 +672,19 @@ class SemanticAcceptance(unittest.TestCase):
             self.assertEqual(restored.deferred_global_findings, [content])
             linker = CloudDouble("test/linker", lambda _: [dict(finding_index=0, claim_ids=["b"], unresolved=False)])
             patcher = CloudDouble("test/author", lambda _: [dict(claim_id="b", text="new decision")])
-            global_model = CloudDouble("test/global", lambda _: global_review(restored))
+            prompts = []
+            def clean_global(prompt):
+                payload = json.loads(prompt.split("<context-data>\n")[1].split("\n</context-data>")[0])
+                prompts.append(payload)
+                return global_review(restored)
+            global_model = CloudDouble("test/global", clean_global)
             delivered = restored.execute_phase6(CloudDouble(), CloudDouble("test/deep"), patcher, global_model, linker)
             self.assertFalse(delivered["blocked"], delivered)
             self.assertEqual(restored.deferred_global_findings, [])
-            self.assertEqual(len(linker.calls), 1)
+            self.assertEqual(len(prompts), 1)
+            self.assertEqual(prompts[0]["deferred_global_findings"], [content])
+            self.assertEqual(linker.calls, [])
+            self.assertEqual(patcher.calls, [])
 
     def test_dependencies_only_patch_invalidates_target_finding_and_revalidates_descendants(self):
         from .checkpoint import save_checkpoint, load_checkpoint
@@ -247,7 +699,8 @@ class SemanticAcceptance(unittest.TestCase):
         result = r.collect_phase6_revision([dict(claim_id="b",dependencies=["a","independent"])])
         after = next(c for c in r.run.claims if c["claim_id"]=="b")
         self.assertEqual({k for k in original if original[k]!=after[k]}, {"dependencies"})
-        self.assertEqual(r.deferred_global_findings,[untouched,unmapped])
+        self.assertEqual({f["finding_id"] for f in r.deferred_global_findings},
+                         {target["finding_id"], untouched["finding_id"], unmapped["finding_id"]})
         self.assertEqual(set(result["revalidate_claim_ids"]),{"b","c"})
         self.assertFalse({"b","c"}.intersection(r.receipts))
         self.assertEqual(r.receipts["independent"],retained)
@@ -257,7 +710,8 @@ class SemanticAcceptance(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/"patched.json"; save_checkpoint(r,path)
             restored=load_checkpoint(path)
-            self.assertEqual(restored.deferred_global_findings,[untouched,unmapped])
+            self.assertEqual({f["finding_id"] for f in restored.deferred_global_findings},
+                             {target["finding_id"], untouched["finding_id"], unmapped["finding_id"]})
             self.assertIn(target,restored.history[-1]["findings"])
             self.assertEqual(restored.history[-1]["invalidated_global_findings"],[target])
             with self.assertRaises(ValueError): restored.finalize()
@@ -276,7 +730,7 @@ class SemanticAcceptance(unittest.TestCase):
         r.deferred_global_findings=[finding]
         r.prepare_phase6_revision_v4([finding])
         r.collect_phase6_revision([dict(claim_id="b",dependencies=["a","independent"])])
-        self.assertEqual(r.deferred_global_findings,[])
+        self.assertEqual(r.deferred_global_findings,[finding])
         with self.assertRaises(ValueError): r.finalize()
         review_all(r)
         with self.assertRaises(ValueError): r.finalize()
@@ -427,6 +881,8 @@ class SemanticAcceptance(unittest.TestCase):
             if len(sweeps) == 1:
                 return global_review(r, findings=[dict(issue="outdated interpretation", claim_ids=[], unresolved=True)],
                                      required={"independent": ["a"]})
+            if len(sweeps) == 2:
+                return global_review(r, findings=[dict(issue="outdated interpretation", claim_ids=[], unresolved=True)])
             return global_review(r)
         def linker(_):
             links.append(True)
@@ -437,7 +893,7 @@ class SemanticAcceptance(unittest.TestCase):
         result = r.execute_phase6(CloudDouble(), CloudDouble("test/deep"), CloudDouble("test/author", patcher),
                                  CloudDouble("test/global", sweep), CloudDouble("test/linker", linker))
         self.assertFalse(result["blocked"], result)
-        self.assertEqual((len(sweeps), len(links), len(authored)), (2, 1, 1))
+        self.assertEqual((len(sweeps), len(links), len(authored)), (3, 1, 1))
         self.assertEqual(r.deferred_global_findings, [])
 
     def test_unresolved_or_stale_dependency_audit_blocks_delivery(self):

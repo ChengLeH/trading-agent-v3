@@ -27,6 +27,11 @@ SEMANTIC_REVIEW_SCHEMA = {
             "type": "object", "required": ["issue"],
             "properties": {"issue": {"type": "string", "minLength": 1}},
         }},
+        "clarity_notes": {"type": "array", "items": {
+            "type": "object", "required": ["issue", "reason"],
+            "properties": {"issue": {"type": "string", "minLength": 1},
+                           "reason": {"type": "string", "minLength": 1}},
+        }},
     },
 }
 
@@ -37,21 +42,26 @@ attributed_assertion 必須反映原文歸因，不能偷偷把錯誤原文改�
 source_evidence 必須指出 context 內的實際證據；不相關的真實摘錄不構成支持。
 引用用於反證時，檢查原文對反證內容的歸因是否正確，不要求每個來源獨立支持整個投資結論。
 來源矛盾回 CONTRADICTS 且 verdict=FAIL；證據不足回 INSUFFICIENT，禁止 PASS。
-無任何引用或相依時 reference_checks=[]，仍需完整審查 Claim 語義。"""
+無任何引用或相依時可省略 reference_checks 或回 []，仍需完整審查 Claim 語義；有任何引用時不可省略或少審。"""
 
 
 def review_ref_ids(claim):
     return list(dict.fromkeys(claim.get("refs", []) + claim.get("fact_refs", []) + claim.get("dependencies", [])))
 
 
-def semantic_review_schema(claim):
+def semantic_review_schema(claim, *, reference_ids=None):
     schema = deepcopy(SEMANTIC_REVIEW_SCHEMA)
-    refs = review_ref_ids(claim)
+    all_refs = review_ref_ids(claim)
+    refs = all_refs if reference_ids is None else list(reference_ids)
+    if len(set(refs)) != len(refs) or set(refs) - set(all_refs):
+        raise ValueError("semantic review schema reference IDs must be unique Claim references")
     schema["properties"]["claim_id"]["enum"] = [claim["claim_id"]]
     checks = schema["properties"]["reference_checks"]
     checks.update(minItems=len(refs), maxItems=len(refs))
     if refs:
         checks["items"]["properties"]["ref_id"]["enum"] = refs
+    else:
+        schema["required"].remove("reference_checks")
     return schema
 
 
@@ -60,10 +70,20 @@ def require_text(value, name):
         raise ValueError(f"{name} must be nonempty text")
 
 
-def normalize_reference_checks(expected_refs, result):
+class MissingReferenceChecks(ValueError):
+    def __init__(self, missing_ref_ids):
+        self.missing_ref_ids = list(missing_ref_ids)
+        super().__init__(f"every direct source and dependency requires semantic reference checking; missing_ref_ids={self.missing_ref_ids}")
+
+
+def normalize_reference_checks(expected_refs, result, *, allow_missing=False):
     rows = result.get("reference_checks")
+    if not expected_refs and rows is None:
+        return []
+    if rows is None and allow_missing:
+        rows = []
     if not isinstance(rows, list):
-        raise ValueError("reference_checks array required, including [] for no refs")
+        raise ValueError("reference_checks must be an array when supplied; nonempty refs require checks")
     seen = set()
     for row in rows:
         if not isinstance(row, dict):
@@ -81,8 +101,9 @@ def normalize_reference_checks(expected_refs, result):
             raise ValueError("PASS cannot override unsupported reference attribution")
         if relation == "CONTRADICTS" and result["verdict"] != "FAIL":
             raise ValueError("contradicted attribution requires FAIL")
-    if seen != set(expected_refs):
-        raise ValueError(f"every direct source and dependency requires semantic reference checking; missing_ref_ids={sorted(set(expected_refs) - seen)}")
+    missing = [ref for ref in expected_refs if ref not in seen]
+    if missing and not allow_missing:
+        raise MissingReferenceChecks(missing)
     return deepcopy(rows)
 
 

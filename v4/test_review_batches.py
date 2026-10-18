@@ -11,6 +11,7 @@ from .test_integration import seeded, verdict, reference_ids, CloudDouble, globa
 from .checkpoint import load_checkpoint, save_checkpoint
 from .journal import RunJournal
 from .semantic_contracts import semantic_review_schema
+from .schema import digest
 
 
 class ReviewBatches(unittest.TestCase):
@@ -109,6 +110,37 @@ class ReviewBatches(unittest.TestCase):
             records = [json.loads(p.read_text()) for p in (Path(temp) / "responses/archive").glob("*.json")]
             self.assertEqual(len(records), 4)
             self.assertTrue(all(row["status"] == "received" for row in records))
+
+    def test_single_reference_supplement_does_not_disable_batches_for_other_claims(self):
+        r = seeded()
+        r.review_batch_size = 16
+        next(c for c in r.run.claims if c["claim_id"] == "b")["dependencies"].append("independent")
+        task = {row.claim_id: row for row in build_atomic_tasks(r.run)}["b"]
+        r.reference_supplements["atomic"]["b"] = dict(
+            input_hash=digest(task.to_dict()),
+            model="test/atomic", base_result=verdict("b", ref_ids=["a"]),
+            missing_ref_ids=["independent"])
+        prepared = r.prepare_phase6_atomic()
+
+        class Client(CloudDouble):
+            def complete(self, prompt):
+                self.calls.append(prompt)
+                payload = json.loads(prompt.split("```json\n")[1].split("\n```\n")[0])
+                if "tasks" in payload:
+                    return {"results": [verdict(row["claim"]["claim_id"], ref_ids=row["expected_reference_ids"])
+                                        for row in payload["tasks"]]}
+                if "accepted_reference_checks" in payload:
+                    return verdict("b", ref_ids=payload["expected_reference_ids"])
+                raise AssertionError("unexpected review request format")
+
+        client = Client("test/atomic")
+        summary = r._execute_review_batch(client, prepared["atomic_prompts"], r.collect_phase6_atomic)
+
+        self.assertFalse(summary["blocked"], summary)
+        self.assertEqual(len(client.calls), 2)  # one normal Claim batch plus b's targeted supplement
+        self.assertEqual(set(r.receipts), {claim_id for claim_id, _ in prepared["atomic_prompts"]})
+        self.assertEqual([row["ref_id"] for row in r.receipts["b"]["result"]["reference_checks"]],
+                         ["a", "independent"])
 
     def test_failed_batch_still_persists_running_successful_sibling(self):
         from threading import Barrier
