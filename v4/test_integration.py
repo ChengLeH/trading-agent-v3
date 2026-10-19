@@ -702,6 +702,24 @@ class AdjustableRuntimeLimits(unittest.TestCase):
 
 
 class BindingReferenceContracts(unittest.TestCase):
+    def test_exact_source_index_uses_catalog_type_without_prefix_guessing(self):
+        runner = seeded()
+        fact = Fact('opaque-ledger-row', 10, 'USD', 'FY2025', entity='TEST', concept='Revenue',
+                    basis='gaap', scope='consolidated', source_id='fixture')
+        runner.run.fact_store.add(fact)
+        packet = runner.orch.get_packet(runner.run_id, 'fundamentals_analyst')
+        self.assertEqual(packet['source_index'][fact.fact_id], 'fact')
+        source = claim('opaque.user')
+        source.update(author_role='source_analyst', refs=[fact.fact_id], fact_refs=[fact.fact_id],
+            bindings=[dict(ref_id=fact.fact_id, **{key: getattr(fact, key) for key in
+                ('entity', 'concept', 'period', 'unit', 'scope', 'basis')})])
+        runner.orch.submit_batch(runner.run_id, {'source_analyst': [source]})
+        self.assertEqual(runner.receipts, {})
+        fact.value = 11
+        self.assertEqual(runner.orch.get_packet(runner.run_id, 'fundamentals_analyst')['facts'][fact.fact_id]['value'], 11)
+        runner.run.fact_store._facts.pop(fact.fact_id)
+        self.assertNotIn(fact.fact_id, runner.orch.get_packet(runner.run_id, 'fundamentals_analyst')['source_index'])
+
     def fixture(self):
         from .schema import DIMENSIONS
         runner = seeded()
@@ -713,6 +731,19 @@ class BindingReferenceContracts(unittest.TestCase):
                  bindings=[dict(ref_id=fact.fact_id, **{key: getattr(fact, key) for key in DIMENSIONS}),
                            dict(ref_id="a", **{key: "unknown" for key in DIMENSIONS})])
         return runner, c
+
+    def test_fact_reference_in_refs_is_checked_even_without_redundant_fact_refs(self):
+        runner, c = self.fixture()
+        c['fact_refs'] = []
+        runner.orch.submit_batch(runner.run_id, {'binding_user': [c]})
+        prepared = runner.prepare_phase6_atomic()
+        cid = c['claim_id']; schema = prepared['response_schemas'][cid]
+        self.assertIn('fact.binding', schema['properties']['reference_checks']['items']['properties']['ref_id']['enum'])
+        results = {row['claim_id']: verdict(row['claim_id'], ref_ids=reference_ids(row)) for row in runner.run.claims}
+        results[cid]['reference_checks'] = [row for row in results[cid]['reference_checks'] if row['ref_id'] != 'fact.binding']
+        summary = runner.collect_phase6_atomic(results, model_identity='test/verifier')
+        self.assertTrue(summary['blocked'])
+        self.assertIn(cid, summary['invalid_claim_ids'])
 
     def test_source_and_claim_bindings_are_preserved_and_both_semantically_checked(self):
         runner, c = self.fixture()

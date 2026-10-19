@@ -38,6 +38,9 @@ semantic_fact 描述可驗證命題、interpretation 描述推論、forecast 描
 資料限制只能說目前提供內容中可確認的缺口，不能推成公司未揭露或數值為零。
 不得憑自己覺得內容不全就宣稱資料遭截斷或傳輸失敗；沒有實際紀錄時只能說無法確認。
 每一項論述都必須回傳 Claim object。refs 列來源及論述 ID；fact_refs 是 refs 中的 FACT ID；
+source_index 提供可逐字複製的合法來源 ID 與型別，完整內容仍在 facts/calcs/evidence/events。
+不要自創 ID、改寫 ID 或以來源名稱/網址代替目錄 ID。重試不得保留原論述卻刪引用來消除格式錯誤；
+應查合法 ID 並核對它是否支持原論述，或依實際證據修訂/撤回不受支持的主張。
 dependencies 列全部依賴的 Claim ID（即使未寫在 refs）。不可依賴未提供的未來論述。
 refs 的來源 ID 與 Claim ID 是不同類型：來源以 facts/calcs/evidence/events 目錄為準，Claim 以 claims 目錄為準，不從 ID 字樣猜類型。
 每個來源 ref 必須恰有一個 binding。Claim ID 的 binding 可省略；若提供，必須是已宣告的 dependency，僅描述對上游論述的歸因，不能當作 Fact 來源。

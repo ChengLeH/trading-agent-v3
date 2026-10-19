@@ -15,6 +15,62 @@ class NativeRoles(unittest.TestCase):
         save_checkpoint(runner, source)
         return source, NativeWorkflow.from_checkpoint(source, Path(root) / 'native')
 
+    def test_retry_keeps_shape_rejected_raw_response_after_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, workflow = self.bootstrap(root); packet = workflow.next()
+            role = 'fundamentals_analyst'
+            bad = {'claims': [dict(claim_id=role + '.one', text='Original financial assertion',
+                                  refs=['invented-source'], fact_refs=['invented-fact'])]}
+            workflow.submit(packet['packet_id'], {role: bad}, 'host/main', packet['input_hash'])
+            NativeWorkflow(workflow.directory).retry_role(role)
+            following = NativeWorkflow(workflow.directory).next()
+            self.assertIn('Original financial assertion', following['items'][role]['prompt'])
+            self.assertIn('invented-fact', following['items'][role]['prompt'])
+            with workflow.queue.transaction() as state:
+                self.assertEqual(state['role_retry_context'][role]['previous_response'], bad)
+
+    def test_group_reference_error_routes_exact_claim_and_field(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, workflow = self.bootstrap(root); packet = workflow.next()
+            outputs = {role: author_response(item['prompt']) for role, item in packet['items'].items()}
+            bad = outputs['fundamentals_analyst']['claims'][0]
+            bad['refs'] = ['invented-source']
+            outcome = workflow.submit(packet['packet_id'], outputs, 'host/main', packet['input_hash'])
+            validation = outcome['role_validation']
+            self.assertEqual(validation['author_role'], 'fundamentals_analyst')
+            self.assertEqual(validation['claim_id'], bad['claim_id'])
+            self.assertEqual(validation['field'], 'refs')
+            self.assertEqual(validation['invalid_ids'], ['invented-source'])
+            self.assertEqual(outcome['allowed_retry_roles'], ['fundamentals_analyst'])
+
+    def test_retry_cannot_drop_citations_from_an_unchanged_assertion(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, workflow = self.bootstrap(root); packet = workflow.next()
+            role = 'fundamentals_analyst'; output = author_response(packet['items'][role]['prompt'])
+            output['claims'][0]['refs'] = ['invented-source']
+            siblings = {r: author_response(item['prompt']) for r, item in packet['items'].items() if r != role}
+            workflow.submit(packet['packet_id'], {**siblings, role: output}, 'host/main', packet['input_hash'])
+            workflow.retry_role(role); following = workflow.next()
+            output['claims'][0]['refs'] = []
+            result = workflow.submit(following['packet_id'], {role: output}, 'host/main', following['input_hash'])
+            self.assertEqual(result['status'], 'blocked:roles')
+            self.assertEqual(result['role_errors'][role]['role_validation']['code'], 'unchanged_claim_sources_removed')
+            with workflow.queue.transaction() as state:
+                self.assertEqual(state['checkpoint']['state']['claims'], [])
+            workflow.retry_role(role); repeated = workflow.next()
+            result = workflow.submit(repeated['packet_id'], {role: output}, 'host/main', repeated['input_hash'])
+            self.assertEqual(result['role_errors'][role]['role_validation']['code'], 'unchanged_claim_sources_removed')
+            # A genuinely revised source-free interpretation remains eligible
+            # for the mandatory semantic check; code does not classify its prose.
+            workflow.retry_role(role); third = workflow.next()
+            output['claims'][0]['text'] = 'Revised interpretation with no external assertion.'
+            result = workflow.submit(third['packet_id'], {role: output}, 'host/main', third['input_hash'])
+            self.assertNotEqual(result['status'], 'blocked:roles')
+            with workflow.queue.transaction() as state:
+                runner = workflow._load(state)
+                self.assertEqual(len(runner.run.claims), 4)
+                self.assertEqual(runner.receipts, {})
+
     def test_all_roles_survive_partial_submissions_and_new_instances(self):
         with tempfile.TemporaryDirectory() as root:
             source, workflow = self.bootstrap(root); original = source.read_bytes(); completed = []
@@ -68,8 +124,10 @@ class NativeRoles(unittest.TestCase):
             workflow.retry_role('fundamentals_analyst')
             again = workflow.next()
             self.assertEqual(set(again['items']), {'fundamentals_analyst'})
-            result = workflow.submit(again['packet_id'], {'fundamentals_analyst':
-                author_response(again['items']['fundamentals_analyst']['prompt'])}, 'host/two', again['input_hash'])
+            revised = author_response(again['items']['fundamentals_analyst']['prompt'])
+            revised['claims'][0]['text'] = 'Revised unsupported assertion into an explicit limitation.'
+            result = workflow.submit(again['packet_id'], {'fundamentals_analyst': revised},
+                                     'host/two', again['input_hash'])
             self.assertFalse(result.get('blocked'), result)
             self.assertEqual(set(workflow.next()['items']), {'bull', 'bear'})
 

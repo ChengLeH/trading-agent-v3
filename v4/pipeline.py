@@ -24,6 +24,18 @@ class ClaimSourceError(ValueError):
         return dict(role_validation=dict(code="grounded_source_required", **deepcopy(self.claim)))
 
 
+class ClaimReferenceError(ValueError):
+    """Exact structured reference diagnostics; never guess replacement IDs."""
+    def __init__(self, claim, code, field, invalid_ids, message):
+        self.validation = dict(code=code, author_role=claim['author_role'],
+            claim_id=claim['claim_id'], field=field, invalid_ids=sorted(invalid_ids))
+        super().__init__(f"{message}; author_role={claim['author_role']}; "
+                         f"claim_id={claim['claim_id']}; field={field}; invalid_ids={sorted(invalid_ids)}")
+
+    def details(self):
+        return dict(role_validation=deepcopy(self.validation))
+
+
 def source_catalog(run):
     sources = {}
     for kind, store in (("fact", run.fact_store), ("calc", run.calc_store),
@@ -187,17 +199,19 @@ class OrchestratorV4(Orchestrator):
         for c in incoming:
             unknown = set(c["refs"]) - sources.keys() - index.keys()
             if unknown:
-                raise ValueError(f"unknown refs: {sorted(unknown)}")
+                raise ClaimReferenceError(c, "unknown_reference_ids", "refs", unknown, "unknown refs")
             if set(c["fact_refs"]) - fact_ids:
-                raise ValueError("fact_refs must refer to canonical facts")
+                raise ClaimReferenceError(c, "noncanonical_fact_ids", "fact_refs",
+                                          set(c["fact_refs"]) - fact_ids, "fact_refs must refer to canonical facts")
             expected = set(c["refs"]).intersection(sources)
             bound = [b["ref_id"] for b in c["bindings"]]
             bound_sources = set(bound).intersection(sources)
             if bound_sources != expected or len(bound) != len(set(bound)):
                 missing = sorted(expected - bound_sources)
                 duplicates = sorted({ref for ref in bound if bound.count(ref) > 1})
-                raise ValueError(f"every source ref requires exactly one typed binding; claim_id={c['claim_id']}; "
-                                 f"missing_source_bindings={missing}; duplicate_bindings={duplicates}")
+                raise ClaimReferenceError(c, "source_binding_mismatch", "bindings", missing + duplicates,
+                    f"every source ref requires exactly one typed binding; "
+                    f"missing_source_bindings={missing}; duplicate_bindings={duplicates}")
             # Claim refs already resolve through claim_index and must be DAG
             # dependencies. Optional bindings preserve the model's attribution;
             # they are not canonical source records or a reason to skip NLI.
@@ -218,7 +232,12 @@ class OrchestratorV4(Orchestrator):
         # Structured objects replace long prose handoffs. No text clipping,
         # keyword routing, source guessing, or hidden summaries.
         calcs = run.calc_store.to_dict()
-        packet = dict(role=role, ticker=run.ticker, as_of=run.manifest["as_of"],
+        source_index = {}
+        for kind, records in (("fact", run.fact_store.to_dict()), ("calc", calcs),
+                              ("evidence", run.evidence_store.to_dict()), ("event", run.events)):
+            for ref, record in records.items():
+                source_index[ref] = kind
+        packet = dict(source_index=source_index, role=role, ticker=run.ticker, as_of=run.manifest["as_of"],
                       facts=run.fact_store.to_dict(), calcs=calcs,
                       calculation_definitions=calculation_definitions(calcs),
                       evidence=run.evidence_store.to_dict(), events=deepcopy(run.events),

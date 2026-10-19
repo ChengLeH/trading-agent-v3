@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 from .agent_queue import NativeWorkQueue, _require_identity
 from .checkpoint import load_checkpoint, save_checkpoint
 from .journal import RunJournal
+from .pipeline import ClaimReferenceError
 from .runner import PHASE_2_ROLES, PHASE_3_ROLES, PipelineRunnerV4
 from .schema import Claim, digest
 from .storage import write_json
@@ -252,9 +253,22 @@ class NativeWorkflow:
             processed[item_id] = packet_id
             try:
                 normalized = _role_output(item_id, row["response"])
+                baselines = state.get("role_retry_context", {}).get(item_id, {}).get("citation_baselines", {})
+                for old in baselines.values():
+                    if not isinstance(old, dict):
+                        continue
+                    for claim in normalized:
+                        if (claim["claim_id"] == old.get("claim_id")
+                                and claim["text"] == old.get("text")
+                                and claim["assertion"] == old.get("assertion")
+                                and (old.get("refs") or old.get("fact_refs"))
+                                and not claim["refs"] and not claim["fact_refs"]):
+                            raise ClaimReferenceError(claim, "unchanged_claim_sources_removed", "refs", [],
+                                "unchanged Claim cannot discard its declared sources; correct IDs or revise the assertion")
             except (ValueError, TypeError, KeyError) as exc:
                 role_errors[item_id] = dict(executor=row["executor"],
-                                            reason=f"{type(exc).__name__}: {exc}")
+                                            reason=f"{type(exc).__name__}: {exc}",
+                                            **(exc.details() if hasattr(exc, "details") else {}))
                 continue
             provenance = journal.archive_external_submission(
                 runner, model=row["executor"], task_id=item_id,
@@ -280,7 +294,9 @@ class NativeWorkflow:
                                reason=f"{type(exc).__name__}: {exc}",
                                role_errors=deepcopy(role_errors),
                                staged_roles=sorted(candidates), packet_id=packet_id,
-                               allowed_retry_roles=sorted(group))
+                               allowed_retry_roles=([exc.validation["author_role"]]
+                                                    if isinstance(exc, ClaimReferenceError) else sorted(group)),
+                               **(exc.details() if hasattr(exc, "details") else {}))
                 state["group_error"] = deepcopy(outcome)
             else:
                 for role in group:
@@ -333,9 +349,22 @@ class NativeWorkflow:
             group = self._expected_group(runner)
             if group is None or role not in group:
                 raise ValueError("role is not in the current generation group")
+            # Shape-rejected rows never entered candidates, but their actual
+            # response is still needed to repair this role after a restart.
+            previous, baselines = None, {}
+            for packet in state["packets"].values():
+                if (packet.get("kind") == "roles" and packet.get("input_hash") == state["input_hash"]
+                        and role in packet.get("received", {})):
+                    previous = deepcopy(packet["received"][role]["response"])
+                    claims = previous.get("claims", []) if isinstance(previous, dict) else []
+                    for claim in claims if isinstance(claims, list) else []:
+                        if (isinstance(claim, dict) and isinstance(claim.get("claim_id"), str)
+                                and (claim.get("refs") or claim.get("fact_refs"))):
+                            baselines[claim["claim_id"]] = deepcopy(claim)
             state.setdefault("role_retry_context", {})[role] = dict(
                 error=deepcopy(role_errors.get(role) or state.get("group_error")),
-                candidate=deepcopy(candidates.get(role)))
+                candidate=deepcopy(candidates.get(role)), previous_response=previous,
+                citation_baselines=baselines)
             candidates.pop(role, None)
             role_errors.pop(role, None)
             state.pop("group_error", None)
