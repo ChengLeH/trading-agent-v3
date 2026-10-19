@@ -15,6 +15,7 @@ from copy import deepcopy
 from uuid import uuid4
 from .cloud import structured_prompt
 from .schema import claim_index, digest
+from .review_context import calculation_definitions
 from .semantic_contracts import (REFERENCE_INSTRUCTIONS, EVIDENCE_INSTRUCTIONS, MissingReferenceChecks,
                                  normalize_reference_checks, SEMANTIC_REVIEW_CONTRACT,
                                  semantic_review_schema, review_ref_ids, require_text)
@@ -162,6 +163,8 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
         for dep in claim.get("dependencies", []):
             dependency(dep)
 
+        definitions = calculation_definitions({ref: item["value"] for ref, item in resolved.items()
+                                               if item["kind"] == "calc"})
         tasks.append(AtomicTask(
             claim_id=cid,
             claim=deepcopy(claim),
@@ -169,6 +172,7 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
             dependency_claims=deps,
             unresolved_refs=unresolved,
             context={"as_of": getattr(run, "manifest", {}).get("as_of"),
+                     **({"calculation_definitions": definitions} if definitions else {}),
                      "evidence_scope": deepcopy(evidence_scope),
                      "trade": deepcopy(getattr(run, "trade", {}))
                      if claim.get("author_role") in {"trader", "risk_manager"} else {}},

@@ -8,6 +8,7 @@ from v3.validation import check_source_identity, check_source_integrity
 from .schema import Claim, claim_index, descendants, digest
 from .bindings import validate_claim_bindings
 from .atomic_phase6 import build_atomic_tasks
+from .review_context import calculation_definitions
 from datetime import date
 
 
@@ -216,8 +217,10 @@ class OrchestratorV4(Orchestrator):
         run = self.runs[run_id]
         # Structured objects replace long prose handoffs. No text clipping,
         # keyword routing, source guessing, or hidden summaries.
+        calcs = run.calc_store.to_dict()
         packet = dict(role=role, ticker=run.ticker, as_of=run.manifest["as_of"],
-                      facts=run.fact_store.to_dict(), calcs=run.calc_store.to_dict(),
+                      facts=run.fact_store.to_dict(), calcs=calcs,
+                      calculation_definitions=calculation_definitions(calcs),
                       evidence=run.evidence_store.to_dict(), events=deepcopy(run.events),
                       claims=deepcopy(run.claims), trade=deepcopy(run.trade))
         run.packets[role] = deepcopy(packet)

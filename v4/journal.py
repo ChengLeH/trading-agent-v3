@@ -3,6 +3,7 @@ import json
 import hashlib
 import time
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 from pathlib import Path
 from .checkpoint import save_checkpoint, write_json
@@ -97,6 +98,38 @@ class RunJournal:
                         and isinstance(attempt_id, str) and UUID(attempt_id).hex == attempt_id):
                     attempts[attempt_id] = record
         return list(attempts.values())
+
+    def archive_external_submission(self, runner, *, model, task_id, prompt, response,
+                                    response_schema=None, review_context=None):
+        """Durably archive an externally completed response without any network call.
+
+        Native bridge executors submit complete structured results outside the
+        agy session machinery. The record keeps the same v4-response/1 identity
+        and raw-archive placement as cloud receipts so checkpoint reload can
+        rebuild receipts from the archive, never from an audit-only snapshot.
+        ``agent_policy_sha256`` stays ``"external"`` because no session agent
+        policy executed this response.
+        """
+        if not isinstance(response, (dict, list)) and not isinstance(response, str):
+            raise ValueError("external submission response must be decoded JSON or text")
+        if isinstance(response, str):
+            response = json.loads(response)
+        if not isinstance(response, (dict, list)):
+            raise ValueError("external submission requires a JSON object or array")
+        client = SimpleNamespace(identity=model)
+        existing = self.response_provenance(runner, client, task_id, prompt, response,
+            response_schema=response_schema, review_context=review_context)
+        if existing is not None:
+            return existing
+        metadata = self._response_metadata(runner, client, task_id,
+                                           prompt, response_schema, review_context)
+        attempt_id = uuid4().hex
+        archived = {**metadata, "attempt_id": attempt_id, "status": "received",
+                    "completed_at": datetime.now(timezone.utc).isoformat(), "response": response}
+        write_json(self.directory / "responses" / "archive" / (attempt_id + ".json"), archived)
+        write_json(self.directory / "responses" / (digest(metadata) + ".json"), archived)
+        return dict(attempt_id=attempt_id, metadata_hash=digest(metadata),
+                    response_hash=digest(response))
 
     def complete(self, runner, client, task_id, prompt, *, reuse_role_output=False, response_schema=None, review_context=None):
         metadata = self._response_metadata(runner, client, task_id, prompt, response_schema, review_context)
