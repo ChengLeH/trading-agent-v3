@@ -384,6 +384,37 @@ class PipelineRunnerV4:
                 merged[cid] = dict(claim_id=cid, verdict="INVALID", findings=[], reference_checks=[])
         return merged, errors
 
+    def _bind_completed_reference_sources(self, layer, accepted):
+        """Keep a verifiable merge recipe, never invent a full raw LLM answer."""
+        for cid in accepted:
+            supplement = self.reference_supplements[layer].get(cid)
+            current = self._latest_review_sources[layer].get(cid)
+            if not supplement or not current or "attempt_id" not in current:
+                continue
+            sources = deepcopy(supplement.get("reference_sources", []))
+            if not sources:
+                continue  # manual collector calls without archives are not restart proofs
+            if current["attempt_id"] not in {source["attempt_id"] for source in sources}:
+                sources.append(deepcopy(current))
+            self._latest_review_sources[layer][cid] = dict(format="v4-reference-composition/1",
+                claim_id=cid, layer=layer, sources=sources, verdict_source=deepcopy(current))
+
+    def review_context_for(self, layer, claim_ids, *, tasks=None):
+        """Bind an external or transport request to current inputs and prior checks."""
+        if layer not in {"atomic", "deep"}:
+            raise ValueError("unknown review layer")
+        tasks = self._tasks() if tasks is None else tasks
+        context = dict(layer=layer, verification_epoch=self._verification_epoch,
+                       contract=SEMANTIC_REVIEW_CONTRACT,
+                       task_hashes={cid: digest(tasks[cid].to_dict()) for cid in claim_ids})
+        if layer == "deep":
+            context["first_review_hashes"] = {cid: digest(self.receipts[cid]["result"]) for cid in claim_ids}
+        parents = {cid: deepcopy(self.reference_supplements[layer][cid]["reference_sources"])
+                   for cid in claim_ids if self.reference_supplements[layer].get(cid, {}).get("reference_sources")}
+        if parents:
+            context["reference_parent_sources"] = parents
+        return context
+
     def _role_prompts(self, roles):
         return [(role, json_prompt(ROLE_CONTRACT, self.orch.get_packet(self.run_id, role))) for role in roles]
 
@@ -517,6 +548,8 @@ class PipelineRunnerV4:
                 previous = supplement_state.get(cid, {})
                 source_rows = deepcopy(previous.get("reference_sources", []))
                 current_source = self._latest_review_sources[layer].get(cid)
+                if current_source and "attempt_id" not in current_source:
+                    current_source = None
                 if current_source and current_source["attempt_id"] not in {row["attempt_id"] for row in source_rows}:
                     source_rows.append(current_source)
                 supplement_state[cid] = dict(
@@ -548,6 +581,8 @@ class PipelineRunnerV4:
                     "last_error": summary["validation_errors"].get(cid, "invalid semantic result contract"),
                 }
                 current_source = self._latest_review_sources[layer].get(cid)
+                if current_source and "attempt_id" not in current_source:
+                    current_source = None
                 source_rows = supplement_state[cid].setdefault("reference_sources", [])
                 if current_source and current_source["attempt_id"] not in {row["attempt_id"] for row in source_rows}:
                     source_rows.append(current_source)
@@ -592,12 +627,21 @@ class PipelineRunnerV4:
                     accepted_claim_ids=list(summary["results"]), response_contract=SEMANTIC_REVIEW_CONTRACT,
                     response_schemas=schemas)
 
-    def collect_phase6_atomic(self, results_by_claim, *, model_identity=None):
+    @staticmethod
+    def _received_review_scope(pending, results, allow_partial):
+        if type(allow_partial) is not bool or not isinstance(results, dict):
+            raise ValueError("review collection requires an object and a boolean partial flag")
+        if set(results) - pending.keys():
+            raise ValueError("unprepared Claim review IDs")
+        return {cid: value for cid, value in pending.items() if not allow_partial or cid in results}
+
+    def collect_phase6_atomic(self, results_by_claim, *, model_identity=None, allow_partial=False):
         require_model_identity(model_identity)
         if self.pending_atomic is None:
             raise ValueError("prepare atomic review before collecting")
         tasks = self._tasks()
-        pending = self.pending_atomic
+        all_pending = self.pending_atomic
+        pending = self._received_review_scope(all_pending, results_by_claim, allow_partial)
         if any(cid not in tasks or digest(tasks[cid].to_dict()) != h for cid, h in pending.items()):
             raise ValueError("state changed while atomic review was in flight")
         expected_refs = {cid: review_ref_ids(task.claim) for cid, task in tasks.items()}
@@ -605,18 +649,27 @@ class PipelineRunnerV4:
         summary = summarize_atomic_results(pending, merged_results, expected_refs_by_claim=expected_refs,
                                             report_invalid=True)
         summary["supplement_errors"] = supplement_errors
+        self._bind_completed_reference_sources("atomic", summary["results"])
         for cid, result in summary["results"].items():
             self.receipts[cid] = dict(input_hash=pending[cid], result=deepcopy(result), model=model_identity)
             self.deep_receipts.pop(cid, None)
             self.reference_supplements["atomic"].pop(cid, None)
         if not summary["complete"]:
             remaining = summary["missing_claim_ids"] + summary["invalid_claim_ids"]
-            self.pending_atomic = {cid: pending[cid] for cid in remaining}
+            self.pending_atomic = ({cid: value for cid, value in all_pending.items() if cid not in summary["results"]}
+                                   if allow_partial else {cid: pending[cid] for cid in remaining})
             return self._contract_retry(summary, tasks, model_identity, "atomic", results_by_claim=merged_results)
-        self.pending_atomic = None
         missing = set(tasks) - self.receipts.keys()
         if missing:
+            if allow_partial:
+                self.pending_atomic = {cid: digest(tasks[cid].to_dict()) for cid in tasks if cid in missing}
+                self.status = "atomic"
+                self._persist()
+                return {**summary, "blocked": False, "complete": False, "partial": True,
+                        "pending_claim_ids": list(self.pending_atomic), "needs_deep_review": False,
+                        "deep_review_claim_ids": []}
             raise ValueError("not every Claim received atomic review")
+        self.pending_atomic = None
         combined = summarize_atomic_results(tasks, {cid: r["result"] for cid, r in self.receipts.items()},
                                             expected_refs_by_claim=expected_refs)
         suspicious = combined["suspicious_claim_ids"] + combined["fail_claim_ids"]
@@ -689,25 +742,37 @@ class PipelineRunnerV4:
                 "其他 verdict 至少一項 finding，包含 issue/evidence/suggested_fix。\n" + REFERENCE_INSTRUCTIONS, payload)
         return structured_prompt(text, json.dumps(semantic_review_schema(task.claim), ensure_ascii=False, separators=(",", ":")))
 
-    def collect_phase6_deep_review(self, results_by_claim, *, model_identity=None):
+    def collect_phase6_deep_review(self, results_by_claim, *, model_identity=None, allow_partial=False):
         require_model_identity(model_identity)
         if not self.pending_deep:
             raise ValueError("prepare deep review first")
         tasks = self._require_atomic()
-        if any(digest(tasks[cid].to_dict()) != h for cid, h in self.pending_deep.items()):
+        all_pending = self.pending_deep
+        pending = self._received_review_scope(all_pending, results_by_claim, allow_partial)
+        if any(digest(tasks[cid].to_dict()) != h for cid, h in pending.items()):
             raise ValueError("state changed during deep review")
         merged_results, supplement_errors = self._merge_reference_supplements("deep", results_by_claim, model_identity)
-        summary = summarize_atomic_results(self.pending_deep, merged_results,
+        summary = summarize_atomic_results(pending, merged_results,
                                             expected_refs_by_claim={cid: review_ref_ids(t.claim) for cid, t in tasks.items()},
                                             report_invalid=True)
         summary["supplement_errors"] = supplement_errors
+        self._bind_completed_reference_sources("deep", summary["results"])
         for cid, result in summary["results"].items():
-            self.deep_receipts[cid] = dict(input_hash=self.pending_deep[cid], result=deepcopy(result), model=model_identity)
+            self.deep_receipts[cid] = dict(input_hash=pending[cid], result=deepcopy(result), model=model_identity)
             self.reference_supplements["deep"].pop(cid, None)
         if not summary["complete"]:
             remaining = summary["missing_claim_ids"] + summary["invalid_claim_ids"]
-            self.pending_deep = {cid: self.pending_deep[cid] for cid in remaining}
+            self.pending_deep = ({cid: value for cid, value in all_pending.items() if cid not in summary["results"]}
+                                 if allow_partial else {cid: pending[cid] for cid in remaining})
             return self._contract_retry(summary, tasks, model_identity, "deep", results_by_claim=merged_results)
+        missing = [cid for cid in tasks if self.receipts[cid]["result"]["verdict"] != "PASS"
+                   and cid not in self.deep_receipts]
+        if allow_partial and missing:
+            self.pending_deep = {cid: digest(tasks[cid].to_dict()) for cid in missing}
+            self.status = "deep"
+            self._persist()
+            return {**summary, "blocked": False, "complete": False, "partial": True,
+                    "pending_claim_ids": missing}
         self.pending_deep = None
         findings = self._review_findings()
         self.status = "revision" if findings else "global"
@@ -1362,10 +1427,7 @@ class PipelineRunnerV4:
                 for cid, prompt in single_prompts]
             results, errors = {}, []
             def one(request):
-                review_context = dict(layer=layer, verification_epoch=self._verification_epoch, contract=SEMANTIC_REVIEW_CONTRACT,
-                                      task_hashes={cid: digest(tasks[cid].to_dict()) for cid in request["claim_ids"]})
-                if layer == "deep":
-                    review_context["first_review_hashes"] = {cid: digest(self.receipts[cid]["result"]) for cid in request["claim_ids"]}
+                review_context = self.review_context_for(layer, request["claim_ids"], tasks=tasks)
                 raw, provenance = self._complete(client, request["request_id"], request["prompt"], response_schema=request["response_schema"],
                     review_context=review_context,
                     with_provenance=True)

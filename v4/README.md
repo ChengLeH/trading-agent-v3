@@ -36,6 +36,35 @@ V3 維持原入口與行為，作為 baseline（比較基準）。V4 保留 V3 �
 
 升級至 `/3` 驗證契約後，保留舊檢查點的資料、Claim 與歷史，但 `/2` 收據不能當作已完成新版語義審查。請保留 `responses/` 與 `sessions/` 並重新啟動 V4 驅動程序後續跑，不需手改檢查點或清空 run。角色提示已更新，尚未提交角色的舊提示快取可能需要重新產生；已提交的角色 Claim 不因本次更新被刪除。
 
+## Native 主 Agent（無 AGY 亦可運作）
+
+此入口將目前執行 V4 的 Agent 視為主 Agent，不綁定 Codex、Qwen 或特定供應商。
+主 Agent 自己讀取持久化工作包、用原生工具執行分析與驗證，再將結構化 JSON 結果送回單一正式狀態；
+init、next、submit、patch 本身不啟動模型。此路徑與下方全 AGY 雲端入口並存。
+
+~~~sh
+python -m v4.agent_cli init --manifest /path/to/manifest.json --work-dir /path/to/native-work
+python -m v4.agent_cli next --work-dir /path/to/native-work
+python -m v4.agent_cli submit --work-dir /path/to/native-work   --packet-id "$PACKET_ID" --input-hash "$INPUT_HASH"   --executor "host/current-agent" --responses /path/to/responses.json
+python -m v4.agent_cli patch --work-dir /path/to/native-work   --packet-id "$PACKET_ID" --input-hash "$INPUT_HASH"   --executor "host/current-agent" --patches /path/to/patches.json
+~~~
+
+每次取得的 packet_id、input_hash 和 items 必須原樣綁定回覆；舊版回覆不能覆寫新版 Claim。
+原子及深度驗證分開產生收據；修補會使受影響及相依後代的驗證失效，必須重新審查。
+finding_linker 對應找不到目標的 finding 後仍須 patch、重驗及新 P6，不能直接宣告完成。
+若送件被拒，依種類透過 retry-role、retry-link、retry-patch 或 retry-global 指定重試理由，
+保留原始錯誤與已完成的有效收據。
+
+AGY 是可選副 Agent，僅處理可並行的 atomic／deep Claim 審查：
+
+~~~sh
+python -m v4.agent_cli dispatch-secondary --work-dir /path/to/native-work   --agy-model "$AGY_REVIEW_MODEL" --max-workers 4 --max-items 8
+~~~
+
+AGY 額度耗盡、連線失敗或回覆不合法時，絕不產生假 PASS。已完成收據保留，
+剩餘工作包仍可由主 Agent 透過 next／submit 處理；角色決策、修補與 P6 全局不自動派給 AGY。
+真實外部模型與帳號須在部署時另外做環境驗收；單元測試均使用模擬 Agent 回覆。
+
 ## 雲端入口
 
 ```sh

@@ -465,6 +465,15 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                except PermissionError:
+                    # Sandboxed macOS workers may own a child PID without
+                    # permission to signal its whole process group. Fall back
+                    # to terminating only the child, preserving the ORIGINAL
+                    # AGY stream/session error instead of masking it.
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
             process.wait(timeout=5)
             if store:
                 store.save(process_id=None)

@@ -17,8 +17,37 @@ from .storage import write_json
 
 def _load_review_row(run_dir, source, *, run_id, model, layer, claim_id, task_hash,
                      verification_epoch=None, allowed_agent_policies=None,
-                     first_review_hash=None):
+                     first_review_hash=None, reference_parents=None):
     from .semantic_contracts import SEMANTIC_REVIEW_CONTRACT
+    if isinstance(source, dict) and source.get("format") == "v4-reference-composition/1":
+        if (set(source) != {"format", "claim_id", "layer", "sources", "verdict_source"}
+                or source["claim_id"] != claim_id or source["layer"] != layer
+                or not isinstance(source["sources"], list) or not source["sources"]
+                or source["verdict_source"] != source["sources"][-1]):
+            return None
+        rows, checks, seen = {}, [], set()
+        for index, part in enumerate(source["sources"]):
+            # Only raw attempts may contribute; recursive compositions and
+            # duplicate attempts cannot manufacture additional reference checks.
+            if (not isinstance(part, dict) or set(part) != {
+                    "attempt_id", "metadata_hash", "response_hash", "claim_id", "layer"}
+                    or not isinstance(part["attempt_id"], str) or part["attempt_id"] in rows):
+                return None
+            row = _load_review_row(run_dir, part, run_id=run_id, model=model, layer=layer,
+                claim_id=claim_id, task_hash=task_hash, verification_epoch=verification_epoch,
+                allowed_agent_policies=allowed_agent_policies, first_review_hash=first_review_hash,
+                reference_parents=source["sources"][:index] if index == len(source["sources"]) - 1 else None)
+            if row is None or not isinstance(row.get("reference_checks", []), list):
+                return None
+            rows[part["attempt_id"]] = row
+            for check in row.get("reference_checks", []):
+                if not isinstance(check, dict) or not isinstance(check.get("ref_id"), str) or check["ref_id"] in seen:
+                    return None
+                seen.add(check["ref_id"])
+                checks.append(deepcopy(check))
+        result = deepcopy(rows[source["verdict_source"]["attempt_id"]])
+        result["reference_checks"] = checks
+        return result
     if (not isinstance(source, dict)
             or set(source) != {"attempt_id", "metadata_hash", "response_hash", "claim_id", "layer"}
             or source.get("claim_id") != claim_id or source.get("layer") != layer):
@@ -61,6 +90,10 @@ def _load_review_row(run_dir, source, *, run_id, model, layer, claim_id, task_ha
         if (not isinstance(first_review_hashes, dict)
                 or first_review_hashes.get(claim_id) != first_review_hash):
             return None
+    if reference_parents is not None:
+        parents = review.get("reference_parent_sources", {})
+        if not isinstance(parents, dict) or parents.get(claim_id, []) != reference_parents:
+            return None
     response = record.get("response")
     try:
         if isinstance(response, str):
@@ -76,7 +109,8 @@ def _load_review_row(run_dir, source, *, run_id, model, layer, claim_id, task_ha
         return None
 
 
-def _verified_reference_supplement(run_dir, run_id, cid, task, supplement, layer):
+def _verified_reference_supplement(run_dir, run_id, cid, task, supplement, layer, *,
+                                  verification_epoch=None, allowed_agent_policies=None, first_review_hash=None):
     from .atomic_phase6 import normalize_atomic_result
     from .semantic_contracts import normalize_reference_checks, review_ref_ids
     expected = review_ref_ids(task.claim)
@@ -87,7 +121,9 @@ def _verified_reference_supplement(run_dir, run_id, cid, task, supplement, layer
     checks_by_ref, base_checks_by_ref, rows_by_attempt = {}, None, {}
     for source in sources:
         row = _load_review_row(run_dir, source, run_id=run_id, model=supplement["model"],
-                               layer=layer, claim_id=cid, task_hash=digest(task.to_dict()))
+                               layer=layer, claim_id=cid, task_hash=digest(task.to_dict()),
+                               verification_epoch=verification_epoch, allowed_agent_policies=allowed_agent_policies,
+                               first_review_hash=first_review_hash)
         if row is None or source["attempt_id"] in rows_by_attempt:
             return False
         rows_by_attempt[source["attempt_id"]] = row
@@ -288,8 +324,13 @@ def load_checkpoint(path, *, continue_verification=True):
                     # durable response archive. Otherwise re-review this
                     # Claim from the original prompt instead of trusting the
                     # checkpoint's semantic prose.
+                    atomic = r.receipts.get(cid)
+                    if layer == "deep" and (atomic is None or atomic["result"]["verdict"] == "PASS"):
+                        continue
                     if not _verified_reference_supplement(
-                            Path(path).parent, r.run_id, cid, tasks[cid], supplement, layer):
+                            Path(path).parent, r.run_id, cid, tasks[cid], supplement, layer,
+                            verification_epoch=r._verification_epoch, allowed_agent_policies=_current_agent_policies(),
+                            first_review_hash=digest(atomic["result"]) if layer == "deep" else None):
                         continue
                     base = normalize_atomic_result(
                         cid, supplement.get("base_result"), expected_ref_ids=review_ref_ids(tasks[cid].claim),

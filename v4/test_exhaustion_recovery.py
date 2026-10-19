@@ -48,6 +48,17 @@ class ExhaustionRecovery(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'continuation_exhausted')
         return runner, client, path, caught.exception
 
+    def test_group_signal_permission_denied_preserves_original_stream_error(self):
+        # A sandbox may forbid killpg despite permitting termination of the
+        # owned child PID. Cleanup must never overwrite the stream failure.
+        with tempfile.TemporaryDirectory() as temp, cli_stub(ERROR_BODY) as failing:
+            with patch('v4.agy_session.os.killpg',
+                       side_effect=PermissionError('sandbox denied group signal')) as group_kill:
+                runner, client, path, exc = self.exhausted_request(temp, failing)
+            self.assertTrue(group_kill.called)
+            self.assertEqual(exc.code, 'continuation_exhausted')
+            self.assertTrue(path.exists())
+
     def test_cloud_and_journal_preserve_budget_and_request_diagnostics(self):
         with tempfile.TemporaryDirectory() as temp, cli_stub(ERROR_BODY) as failing:
             runner, client, path, exc = self.exhausted_request(temp, failing)
