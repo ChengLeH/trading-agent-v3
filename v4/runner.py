@@ -35,6 +35,13 @@ ROLE_CONTRACT = """你是 Trading Agent V4 的指定角色。只使用提供的�
 claim_type 是內容描述，不是驗證豁免：source_fact 描述來源記載、derived_fact 描述計算結果、
 semantic_fact 描述可驗證命題、interpretation 描述推論、forecast 描述預測、trade_assumption 描述交易假設。
 不要為了滿足標籤硬補不相關來源。推論可引用已提供的上游 Claim，須明確保留它的條件與不確定性。
+產生每條 Claim 前，逐一核對所引用來源和上游 Claim 的完整相關證據，包括支持、反向或不利證據；
+不得選擇性引用偏向自己立場的部分，不能以概括的「沒有異議」忽略來源已明示的分歧。
+綜合結論必須保留重要反例、不同評級或風險及適當的比例與限制；若來源相互不一致，應揭露差異，
+並區分轉述與原始統計、不同樣本／時間／口徑，不得將其中一組錯誤歸因為另一來源的共識。
+引用區間高低點、事件及日期時，區分統計截止日與極值發生日；只知道高低價格、觀察期間或
+source_pointer 的窗口計算，不代表知道極值實際日期。來源未明載就省略特定發生日，
+不得猜日期或把推定日期塞進 bindings.period；binding 的 period 應對應所引來源真正標示的期間。
 資料限制只能說目前提供內容中可確認的缺口，不能推成公司未揭露或數值為零。
 不得憑自己覺得內容不全就宣稱資料遭截斷或傳輸失敗；沒有實際紀錄時只能說無法確認。
 每一項論述都必須回傳 Claim object。refs 列來源及論述 ID；fact_refs 是 refs 中的 FACT ID；
@@ -898,6 +905,11 @@ class PipelineRunnerV4:
             '只修改所列 Claim 物件，不得重寫 Markdown、擴大範圍或更改作者與 ID。'
             '回傳 JSON array，每項至少 claim_id 加必要更改的欄位。所有未改欄位保留。'
             '相依檢查任務不是已確認錯誤；不需修改的物件不要回傳。不得藉刪除真正的因果依賴掩蓋決策衝突。'
+            '逐條依 findings 與 tasks 所附的完整來源內容修正論述及歸因：不得選擇性引用有利資訊，'
+            '來源若含相反證據、分歧或限制，應如實揭露並調整結論，不能只拿偏向自己的來源數字。'
+            '不得只刪除引用來躲避矛盾；若要撤回某個引用，必須同步縮小或撤回不再受支持的主張。'
+            '區分統計截止日與事件或極值實際發生日；沒有獨立日期證據就刪除推測日期，'
+            '並同步校正 bindings.period 等相關欄位及受影響的依賴論述，不能僅改 text 留下自相矛盾的欄位。'
             '修正內容必須符合 V4 Claim schema，並更新 assertion/bindings/dependencies。',
             dict(findings=findings, tasks=[tasks[cid].review_dict() for cid in wanted]))
         self._persist()
