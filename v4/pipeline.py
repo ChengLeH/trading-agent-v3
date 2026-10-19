@@ -124,6 +124,58 @@ def calculation_findings(run):
 
 
 class OrchestratorV4(Orchestrator):
+    def build_facts(self, run_id):
+        """Align V4 revenue calculations to income years, not balance years.
+
+        The shared V3 builder uses its balance-sheet fiscal-year list for
+        revenue CAGR and YoY. That list can start later than income history,
+        yielding an incorrect period for a correctly sourced revenue Claim.
+        This V4-only correction preserves V3 behavior and all source facts.
+        """
+        report = super().build_facts(run_id)
+        run = self.runs[run_id]
+        if not any(getattr(rec, "type", None) == "openbb_fundamentals"
+                   for rec in run.records):
+            return report
+        revenue = {}
+        for fid, row in run.fact_store.to_dict().items():
+            year = row.get("fiscal_year")
+            if (row.get("concept") == "Revenue" and type(year) is int
+                    and fid == f"fact.Revenue.FY{year}"
+                    and type(row.get("value")) in (float, int)
+                    and row["value"]):
+                revenue[year] = (fid, row["value"])
+        years = sorted(revenue)
+        if len(years) < 2:
+            return report
+        corrected = {}
+        for start, end in zip(years, years[1:]):
+            corrected[f"calc.rev_growth.FY{end}"] = (
+                K.calc_growth(revenue[end][1], revenue[start][1]), "growth",
+                [revenue[end][0], revenue[start][0]], "RATIO", {})
+        start, end = years[0], years[-1]
+        corrected["calc.cagr.rev"] = (
+            K.calc_cagr(revenue[start][1], revenue[end][1], end - start), "cagr",
+            [revenue[start][0], revenue[end][0]], "RATIO",
+            {"years": float(end - start)})
+        existing = run.calc_store.to_dict()
+        if all(cid in existing and
+               (existing[cid]["value"], existing[cid]["calc_type"],
+                existing[cid]["input_refs"], existing[cid]["unit"],
+                existing[cid]["meta"]) == vals
+               for cid, vals in corrected.items()):
+            return report
+        replacement = CalcStore()
+        for cid, row in existing.items():
+            if cid not in corrected and not cid.startswith("calc.rev_growth.FY"):
+                replacement.add(cid, row["value"], row["calc_type"],
+                                row["input_refs"], row["unit"], row["meta"])
+        for cid, row in corrected.items():
+            replacement.add(cid, *row)
+        run.calc_store = replacement
+        report["calcs"] += len(replacement.to_dict()) - len(existing)
+        return report
+
     def start_run(self, subject, manifest):
         rid = super().start_run(subject, manifest)
         self.runs[rid].events = {}
