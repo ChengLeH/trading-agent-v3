@@ -91,3 +91,27 @@ class ReviewContext(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class IndicatorMethodContext(unittest.TestCase):
+    def test_method_is_typed_and_visible_without_changing_historical_values(self):
+        from .review_context import indicator_definitions
+        from .atomic_phase6 import build_atomic_tasks
+        from .test_integration import seeded
+        from v3.facts import Fact
+        from .schema import DIMENSIONS
+        from .reporting import render_report
+        runner = seeded()
+        fact = Fact('fact.custom-rsi',58.12,'INDEX','2026-10-16',concept='RSI14',source_pointer='rsi(14)',source_id='fixture')
+        runner.run.fact_store.add(fact)
+        target = next(c for c in runner.run.claims if c['claim_id']=='a')
+        target.update(refs=[fact.fact_id],fact_refs=[fact.fact_id],bindings=[dict(ref_id=fact.fact_id,
+            **{k:(getattr(fact,k) or 'unknown') for k in DIMENSIONS})])
+        task = next(t for t in build_atomic_tasks(runner.run) if t.claim_id=='a')
+        self.assertEqual(task.context['indicator_definitions'][fact.fact_id]['method'],'cutler_sma')
+        snapshot = runner.orch.snapshot(runner.run_id)
+        rendered = render_report(snapshot)
+        self.assertIn('Cutler',rendered['report_markdown'])
+        self.assertEqual(snapshot['facts'][fact.fact_id]['value'],58.12)
+        fact.source_pointer = 'external.unknown_method'
+        self.assertEqual(indicator_definitions(runner.run.fact_store.to_dict()),{})

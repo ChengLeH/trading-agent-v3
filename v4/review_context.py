@@ -26,3 +26,15 @@ def calculation_definitions(calcs):
     kinds = {c.get('calc_type') for c in calcs.values()}
     return {kind: deepcopy(definition) for kind, definition in CALCULATION_DEFINITIONS.items()
             if kind in kinds}
+
+
+def indicator_definitions(facts):
+    """Known kernel methods keyed by exact structured provenance, never prose."""
+    methods = {('RSI14', 'rsi(14)'): dict(name='RSI14 (Cutler)', method='cutler_sma', period=14,
+                 formula='100 - 100 / (1 + SMA(gain,14) / SMA(loss,14))',
+                 kernel='v3.calculations.rsi'),
+               ('ATR14', 'atr(14)'): dict(name='ATR14 (simple mean true range)', method='sma_true_range', period=14,
+                 formula='SMA(max(high-low,abs(high-prev_close),abs(low-prev_close)),14)',
+                 kernel='v3.calculations.atr')}
+    return {fid: deepcopy(methods[(fact.get('concept'), fact.get('source_pointer'))])
+            for fid, fact in facts.items() if (fact.get('concept'), fact.get('source_pointer')) in methods}

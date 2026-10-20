@@ -93,7 +93,11 @@ class NativeReviewWorkflow(NativeWorkflow):
             if role_state.get("status") != "phase6_ready":
                 return role_state
         elif not self._has_pending_patch():
-            return role_state
+            with self.queue.transaction() as state:
+                runner = self._load(state)
+                if runner.pending_patch is None:
+                    return role_state
+                return self._next_patch_packet(state, runner) or role_state
         with self.queue.transaction() as state:
             runner = self._load(state)
             pending = runner._pending_revision_block()
@@ -237,6 +241,9 @@ class NativeReviewWorkflow(NativeWorkflow):
 
     def _next_global(self, state, runner, active):
         """Advance the existing P6 runner using one durable JSON packet per sweep."""
+        semantic_findings = runner._claim_review_findings()
+        if semantic_findings:
+            return self._prepare_global_repair(state, runner, findings=semantic_findings)
         blocked = state.get("global_blocked")
         if blocked:
             return dict(status="blocked:global_contract", blocked=True,
@@ -302,7 +309,9 @@ class NativeReviewWorkflow(NativeWorkflow):
         return state.get("patch_prompt") is not None
 
     def _patch_view(self, state, packet):
-        return dict(status="patch", kind="patch", packet_id=packet["packet_id"],
+        manual = bool(packet.get("manual_patch_only"))
+        return dict(status="blocked:revision_limit" if manual else "patch", kind="patch",
+                    blocked=manual, manual_patch_only=manual, packet_id=packet["packet_id"],
                     input_hash=state["input_hash"],
                     allowed_claim_ids=deepcopy(packet["allowed_claim_ids"]),
                     items=deepcopy(packet["items"]))
@@ -312,7 +321,7 @@ class NativeReviewWorkflow(NativeWorkflow):
                     input_hash=state["input_hash"],
                     items=deepcopy(packet["items"]))
 
-    def _prepare_global_repair(self, state, runner):
+    def _prepare_global_repair(self, state, runner, *, findings=None):
         """Bind P6 global findings to the canonical Claim patch request.
 
         The real runner owns finding routing and allowed Claim IDs. Nothing is
@@ -324,7 +333,8 @@ class NativeReviewWorkflow(NativeWorkflow):
                         reason=deepcopy(state["link_blocked"]),
                         input_hash=state["input_hash"])
         if runner.pending_patch is None:
-            findings = [deepcopy(f) for f in runner.global_receipt["findings"]]
+            findings = (deepcopy(findings) if findings is not None else
+                        [deepcopy(f) for f in runner.global_receipt["findings"]])
             accepted = state.get("accepted_links")
             if accepted is not None:
                 if (accepted.get("input_hash") != state["input_hash"]
@@ -350,7 +360,7 @@ class NativeReviewWorkflow(NativeWorkflow):
                     self._save(state, runner)
                     if outcome.get("blocked"):
                         return outcome
-                    return self._prepare_global_repair(state, runner)
+                    return self._prepare_global_repair(state, runner, findings=findings)
                     if state.get("active_packet_id") == active["packet_id"]:
                         state["active_packet_id"] = None
                 for stale in state["packets"].values():
@@ -387,13 +397,14 @@ class NativeReviewWorkflow(NativeWorkflow):
             prompt = state.get("patch_prompt")
             allowed = list(runner.pending_patch["ids"])
             if prompt is None:
-                return dict(blocked=True, status="blocked:pending_revision",
-                            reason="pending claim repairs require explicit patches; original patch prompt unavailable",
-                            findings=deepcopy(runner.pending_patch["findings"]),
-                            allowed_claim_ids=allowed, input_hash=state["input_hash"])
+                prepared = runner.prepare_phase6_revision_v4(deepcopy(runner.pending_patch["findings"]))
+                if "revision_prompts" not in prepared:
+                    self._save(state, runner)
+                    return prepared
+                prompt = prepared["revision_prompts"][0][1]
         state["patch_prompt"] = prompt
         packet_id = uuid4().hex
-        state["packets"][packet_id] = dict(packet_id=packet_id, kind="patch",
+        state["packets"][packet_id] = dict(packet_id=packet_id, kind="patch", manual_patch_only=runner.revision_round >= runner.max_revisions,
                                            input_hash=state["input_hash"],
                                            allowed_claim_ids=allowed,
                                            items={PATCH_ROLE: dict(prompt=prompt)}, received={})
@@ -420,9 +431,9 @@ class NativeReviewWorkflow(NativeWorkflow):
                 state["active_packet_id"] = None
         prompt = state.get("patch_prompt")
         if prompt is None:
-            return None
+            return self._prepare_global_repair(state, runner)
         packet_id = uuid4().hex
-        state["packets"][packet_id] = dict(packet_id=packet_id, kind="patch",
+        state["packets"][packet_id] = dict(packet_id=packet_id, kind="patch", manual_patch_only=runner.revision_round >= runner.max_revisions,
                                            input_hash=state["input_hash"],
                                            allowed_claim_ids=list(runner.pending_patch["ids"]),
                                            items={PATCH_ROLE: dict(prompt=prompt)}, received={})
@@ -687,6 +698,8 @@ class NativeReviewWorkflow(NativeWorkflow):
                 self._save(state, runner)
                 return outcome
         if isinstance(packet, dict) and packet.get("kind") == "patch":
+            if packet.get('manual_patch_only'):
+                raise ValueError('revision limit: use explicit submit_patch for operator patches')
             _require_identity(executor, "executor")
             patches = responses.get(PATCH_ROLE) if isinstance(responses, dict) else None
             return self.submit_patch(packet_id, patches, executor, input_hash)

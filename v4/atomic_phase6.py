@@ -15,7 +15,7 @@ from copy import deepcopy
 from uuid import uuid4
 from .cloud import structured_prompt
 from .schema import claim_index, digest
-from .review_context import calculation_definitions
+from .review_context import calculation_definitions, indicator_definitions
 from .semantic_contracts import (REFERENCE_INSTRUCTIONS, EVIDENCE_INSTRUCTIONS, MissingReferenceChecks,
                                  normalize_reference_checks, SEMANTIC_REVIEW_CONTRACT,
                                  semantic_review_schema, review_ref_ids, require_text)
@@ -90,10 +90,13 @@ def _evidence_scope(run, facts, calcs, evidence, events):
     calculations = [c for cid, c in calcs.items() if cid not in trade_calcs]
     records = [dict(id=r.id, type=r.type, source_hash=r.source_hash)
                for r in getattr(run, "records", []) if hasattr(r, "source_hash")]
+    diagnostics = [deepcopy(rec.meta['cash_flow_extraction']) for rec in getattr(run, 'records', [])
+        if getattr(rec, 'meta', {}).get('cash_flow_extraction', {}).get('input_rows', 0)]
     concepts = sorted({f["concept"] for f in inputs if f.get("concept")})
     include_concepts = len(json.dumps(concepts, ensure_ascii=False).encode("utf-8")) <= CATALOG_DETAIL_MAX_BYTES
     return dict(scope="current_ingested_catalog_metadata", includes_source_contents=False,
                 counts=dict(facts=len(inputs), calcs=len(calculations), evidence=len(evidence), events=len(events)),
+                **({'ingestion_diagnostics': diagnostics} if diagnostics else {}),
                 fact_concepts=concepts if include_concepts else None,
                 fact_concept_count=len(concepts), fact_concepts_hash=digest(concepts),
                 source_record_count=len(records), source_types=sorted({r["type"] for r in records}),
@@ -165,6 +168,8 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
 
         definitions = calculation_definitions({ref: item["value"] for ref, item in resolved.items()
                                                if item["kind"] == "calc"})
+        indicators = indicator_definitions({ref: item['value'] for ref, item in resolved.items()
+                                             if item['kind'] == 'fact'})
         tasks.append(AtomicTask(
             claim_id=cid,
             claim=deepcopy(claim),
@@ -173,6 +178,7 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
             unresolved_refs=unresolved,
             context={"as_of": getattr(run, "manifest", {}).get("as_of"),
                      **({"calculation_definitions": definitions} if definitions else {}),
+                     **({'indicator_definitions': indicators} if indicators else {}),
                      "evidence_scope": deepcopy(evidence_scope),
                      "trade": deepcopy(getattr(run, "trade", {}))
                      if claim.get("author_role") in {"trader", "risk_manager"} else {}},

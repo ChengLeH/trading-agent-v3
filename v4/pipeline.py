@@ -8,7 +8,7 @@ from v3.validation import check_source_identity, check_source_integrity
 from .schema import Claim, claim_index, descendants, digest
 from .bindings import validate_claim_bindings
 from .atomic_phase6 import build_atomic_tasks
-from .review_context import calculation_definitions
+from .review_context import calculation_definitions, indicator_definitions
 from datetime import date
 
 
@@ -124,6 +124,14 @@ def calculation_findings(run):
 
 
 class OrchestratorV4(Orchestrator):
+    def require_issuer_identity(self, run_id):
+        from .issuer_identity import verify_issuer, IssuerIdentityError
+        findings = verify_issuer(self.runs[run_id])
+        for finding in findings:
+            if finding['status'] == 'FAIL':
+                raise IssuerIdentityError(finding)
+        return findings
+
     def build_facts(self, run_id):
         """Align V4 revenue calculations to income years, not balance years.
 
@@ -132,7 +140,8 @@ class OrchestratorV4(Orchestrator):
         yielding an incorrect period for a correctly sourced revenue Claim.
         This V4-only correction preserves V3 behavior and all source facts.
         """
-        report = super().build_facts(run_id)
+        from .cash_flow import build_with_cash_flow
+        report = build_with_cash_flow(self, run_id, super().build_facts)
         run = self.runs[run_id]
         if not any(getattr(rec, "type", None) == "openbb_fundamentals"
                    for rec in run.records):
@@ -179,6 +188,8 @@ class OrchestratorV4(Orchestrator):
     def start_run(self, subject, manifest):
         rid = super().start_run(subject, manifest)
         self.runs[rid].events = {}
+        if 'issuer_registry_path' in manifest:
+            self.runs[rid].manifest['issuer_registry_path'] = manifest['issuer_registry_path']
         return rid
 
     def register_trade(self, run_id, trade):
@@ -289,11 +300,15 @@ class OrchestratorV4(Orchestrator):
                               ("evidence", run.evidence_store.to_dict()), ("event", run.events)):
             for ref, record in records.items():
                 source_index[ref] = kind
-        packet = dict(source_index=source_index, role=role, ticker=run.ticker, as_of=run.manifest["as_of"],
+        diagnostics = [deepcopy(rec.meta['cash_flow_extraction']) for rec in run.records
+                       if getattr(rec, 'meta', {}).get('cash_flow_extraction')]
+        packet = dict(ingestion_diagnostics=diagnostics, source_index=source_index, role=role, ticker=run.ticker, as_of=run.manifest["as_of"],
                       facts=run.fact_store.to_dict(), calcs=calcs,
                       calculation_definitions=calculation_definitions(calcs),
+                      indicator_definitions=indicator_definitions(run.fact_store.to_dict()),
                       evidence=run.evidence_store.to_dict(), events=deepcopy(run.events),
                       claims=deepcopy(run.claims), trade=deepcopy(run.trade))
+        packet['issuer_identity'] = self.require_issuer_identity(run_id)
         run.packets[role] = deepcopy(packet)
         return packet
 
@@ -301,7 +316,8 @@ class OrchestratorV4(Orchestrator):
         run = self.runs[run_id]
         claim_index(run.claims)
         validate_trade_claim(run.claims, run.trade)
-        out = []
+        from .issuer_identity import verify_issuer
+        out = verify_issuer(run)
         for fn, args in ((check_source_integrity, (run.records,)),
                          (check_source_identity, (run.manifest, [r for r in run.records if not isinstance(r, SourceError)]))):
             out.extend(f.to_dict() for f in fn(*args))
@@ -403,6 +419,11 @@ class OrchestratorV4(Orchestrator):
     def snapshot(self, run_id):
         snap = super().snapshot(run_id)
         snap["events"] = self.runs[run_id].events
+        snap['indicator_definitions'] = indicator_definitions(snap['facts'])
+        snap['issuer_identity'] = [deepcopy(rec.meta['issuer_identity']) for rec in self.runs[run_id].records
+                                  if getattr(rec, 'meta', {}).get('issuer_identity')]
+        snap['ingestion_diagnostics'] = [deepcopy(rec.meta['cash_flow_extraction'])
+            for rec in self.runs[run_id].records if getattr(rec, 'meta', {}).get('cash_flow_extraction')]
         snap["manifest"] = self.runs[run_id].manifest
         snap["trade_generated"] = getattr(self.runs[run_id], "trade_generated", ([], []))
         return deepcopy(snap)

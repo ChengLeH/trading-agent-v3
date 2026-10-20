@@ -20,7 +20,7 @@ from .semantic_contracts import (REFERENCE_INSTRUCTIONS, review_ref_ids, normali
                                  semantic_review_schema)
 from .cloud import request_completion, structured_prompt
 from .agy_session import AntigravityError
-from .review_context import SINGLE_REVIEW_INSTRUCTIONS, calculation_definitions
+from .review_context import SINGLE_REVIEW_INSTRUCTIONS, calculation_definitions, indicator_definitions
 
 PHASE_2_ROLES = ("market_analyst", "fundamentals_analyst", "news_analyst", "social_analyst")
 PHASE_3_ROLES = ("bull", "bear")
@@ -46,6 +46,7 @@ source_pointer 的窗口計算，不代表知道極值實際日期。來源未�
 不得憑自己覺得內容不全就宣稱資料遭截斷或傳輸失敗；沒有實際紀錄時只能說無法確認。
 每一項論述都必須回傳 Claim object。refs 列來源及論述 ID；fact_refs 是 refs 中的 FACT ID；
 source_index 提供可逐字複製的合法來源 ID 與型別，完整內容仍在 facts/calcs/evidence/events。
+使用指標時依 indicator_definitions 標示方法；Cutler RSI 與簡單平均 ATR 不得冒稱 Wilder。
 不要自創 ID、改寫 ID 或以來源名稱/網址代替目錄 ID。重試不得保留原論述卻刪引用來消除格式錯誤；
 應查合法 ID 並核對它是否支持原論述，或依實際證據修訂/撤回不受支持的主張。
 dependencies 列全部依賴的 Claim ID（即使未寫在 refs）。不可依賴未提供的未來論述。
@@ -313,6 +314,7 @@ class PipelineRunnerV4:
                 for finding in self.deferred_global_findings]
 
     def _tasks(self):
+        self.orch.require_issuer_identity(self.run_id)
         tasks = {t.claim_id: t for t in build_atomic_tasks(self.run)}
         task_hashes = {cid: digest(t.to_dict()) for cid, t in tasks.items()}
         for cid in list(self.receipts):
@@ -893,13 +895,6 @@ class PipelineRunnerV4:
                                   generated_source_refs=sorted(refs)),
                     suggested_fix="只在新交易狀態使原內容或引用失效時修改；保留仍成立的內容與真正依賴"))
         self.pending_patch = dict(input_hash=self._hash(), ids=wanted, findings=deepcopy(findings))
-        if self.revision_round >= self.max_revisions:
-            # Stop automatic model spending, but retain a state-bound repair
-            # request for explicit operator patches. Never reset used rounds.
-            self.status = "blocked:revision_limit"
-            self._persist()
-            return dict(blocked=True, status=self.status, reason="revision limit reached; explicit patches may be supplied",
-                        findings=self._diagnostic_findings(findings), allowed_claim_ids=list(wanted))
         tasks = self._tasks()
         prompt = json_prompt(
             '只修改所列 Claim 物件，不得重寫 Markdown、擴大範圍或更改作者與 ID。'
@@ -912,6 +907,14 @@ class PipelineRunnerV4:
             '並同步校正 bindings.period 等相關欄位及受影響的依賴論述，不能僅改 text 留下自相矛盾的欄位。'
             '修正內容必須符合 V4 Claim schema，並更新 assertion/bindings/dependencies。',
             dict(findings=findings, tasks=[tasks[cid].review_dict() for cid in wanted]))
+        if self.revision_round >= self.max_revisions:
+            # Stop automatic model spending, but retain a state-bound repair
+            # request for explicit operator patches. Never reset used rounds.
+            self.status = "blocked:revision_limit"
+            self._persist()
+            return dict(blocked=True, status=self.status, reason="revision limit reached; explicit patches may be supplied",
+                        findings=self._diagnostic_findings(findings), allowed_claim_ids=list(wanted), manual_patch_only=True,
+                        revision_prompts=[("claim_patcher", prompt)])
         self._persist()
         return dict(needs_linking=False, revision_prompts=[("claim_patcher", prompt)], allowed_claim_ids=wanted)
 
@@ -1131,6 +1134,8 @@ class PipelineRunnerV4:
         # Rendered Markdown and full session transcripts remain excluded.
         state = self._state()
         state["calculation_definitions"] = calculation_definitions(state.get("calcs", {}))
+        state['indicator_definitions'] = indicator_definitions(state.get('facts', {}))
+        state['ingestion_diagnostics'] = self.orch.snapshot(self.run_id).get('ingestion_diagnostics', [])
         return state
 
     def _global_coverage_status(self):

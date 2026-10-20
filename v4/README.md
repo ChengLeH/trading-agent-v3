@@ -298,3 +298,30 @@ agy 的結束事件若明確回報 `status=ERROR`、`error_code=null`（或省�
 這是舊判定失效，不是 Python 判定問題已解決。受影響 Claim 與 dependency descendants（依賴後代）仍需重驗，舊 global 收據作廢；既有必要的全局掃描會讀 history.findings_to_recheck，重新檢查舊問題，仍成立就回 findings。沒有新增額外的覆核階段，也不提高 max_revisions。有問題的最終報告仍不能交付。
 
 更新後重啟驅動程序。這項狀態更新發生於 collect_phase6_revision；更新程式不會追溯重寫舊檢查點已完成輪次，也不會無證據刪除其 deferred findings。已卡在 revision_limit 的舊 run 不能保證只換版本就解除；需檢查其當前物件、修訂歷史及 findings，再決定如何重驗，不能直接把上限或歷史次數歸零。
+
+
+## 2026-10-20：匯入契約與修補續接
+
+Native 的 Atomic/Deep 問題現在直接進入 Claim 修補包；修補後仍須重驗修改物件與其 dependency descendants，再完成 Global。匯入有 pending_patch、缺少舊提示的 checkpoint，程式會從現行物件及已保存 findings 重建提示，不清掉 findings 或重置輪次。達到輪次上限後，回傳 `blocked:revision_limit`、`manual_patch_only=true`；一般 `submit` 拒收，必須明確使用 `patch` CLI／`submit_patch` 手動接管。
+
+V4 現金流抽取接受以下明確欄位（V3 不變）：
+
+- OCF：`net_cash_from_operating_activities` 或 `operating_cash_flow`。
+- Capex：`purchase_of_plant_property_and_equipment` 或 `capex`。
+- 回購：`share_repurchases`，保留來源原始符號。
+
+原始欄位路徑及來源 hash 保留。年度資料需要整數 `fiscal_year`，`fiscal_period` 為 `FY` 或省略；季度資料不能被錯塞進年度 ID。正值 Capex 必須在 `fundamentals.cash_flow_capex_convention` 宣告 `positive_outflow`（轉為負值以計算 OCF+Capex）或 `signed_cash_flow`（明確為帶符號的現金流），不靠猜測加減。非空段落零產出與不完整 FCF 會在工作包 `ingestion_diagnostics`、sidecar 與報告限制區揭露。重建同一來源時，已移除的現金流年度不會保留成舊 Fact/Calc。
+
+保留既有 RSI/ATR 數值。對既有 kernel 的精確 provenance，`indicator_definitions` 會標示 Cutler/SMA RSI14 及簡單平均 true-range ATR14，傳入角色、Atomic/Deep context、Global 與報告口徑區；未知外部公式不會被擅自貼上方法。相關 Claim 及後代的輸入 hash 改變時，舊收據必須重驗。
+
+### SEC 公司身份核對與離線執行
+
+只要 `subject.cik` 有填，即在角色派發、語義審查與交付前，把 ticker/CIK 對照 SEC 官方 `company_tickers.json`，並揭露公司名稱。這包含僅行情與無來源的狀態；沒有填 CIK 的資料不會被假標為已驗證 CIK，仍沿用來源 payload 的身份檢查。
+
+可以在 manifest 提供 `issuer_registry_path`，指向自行保存的 SEC 官方 JSON 快照；Native 入口會以 manifest 目錄解析相對路徑。程式化 runner 請使用絕對路徑。既有 checkpoint 也可透過環境變數 `V4_SEC_ISSUER_REGISTRY=/absolute/path/company_tickers.json` 指定快照，不必手改 canonical state。請由可信官方來源取得快照：本地提供的檔案會如實標為 `operator_supplied_SEC_snapshot`，程式的內容 hash 不是官方真偽認證。
+
+沒有離線設定時會讀取 `https://www.sec.gov/files/company_tickers.json`，15 秒逾時，可用 `V4_SEC_USER_AGENT` 設定符合 SEC 政策的識別字串。網路快取按 UTC 日期更新；本地快照每次重讀，因此內容更新／移除都會重新核對。SEC 可能限制自動請求；查表不可用與身份不符都會給明確原因，不假裝 PASS、不因此呼叫模型重試，也不轉到其他 API。
+
+這次 Mac 實際探測 SEC 自動讀取回 HTTPError；離線快照流程已用模擬 SEC 格式與真實 Native init/重載測試驗證。部署前需準備可信快照或可用的 SEC 連線。若核實原資料屬另一家公司，不可只改 CIK 或驗證標籤，須換正確來源並重建受影響 Fact/Claim，再重新驗證。
+
+AGY 不可用仍交回主 Agent，未改為預設擋死。沒有新增 ticker 特例、文字語義關鍵字規則或自動放行。既有工作目錄請先備份後沿用；程式更新後重新呼叫 CLI 即生效，長駐 driver 需安全暫停後重啟。

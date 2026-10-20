@@ -22,6 +22,47 @@ class NativeReviews(unittest.TestCase):
         source = Path(root) / 'original.json'; save_checkpoint(runner, source)
         return NativeReviewWorkflow.from_checkpoint(source, Path(root) / 'native')
 
+    def test_nonpass_reviews_issue_patch_then_revalidate_descendants(self):
+        with tempfile.TemporaryDirectory() as root:
+            workflow = self.bootstrap(root)
+            for _ in range(12):
+                packet = workflow.next()
+                if packet.get('kind') not in {'atomic', 'deep'}:
+                    break
+                workflow.submit(packet['packet_id'], {cid: response(cid, item, 'FAIL' if cid == 'b' else 'PASS')
+                    for cid, item in packet['items'].items()}, 'host/test', packet['input_hash'])
+            self.assertEqual(packet.get('kind'), 'patch', packet)
+            self.assertEqual(packet['allowed_claim_ids'], ['b'])
+            resumed = NativeReviewWorkflow(workflow.directory).next()
+            self.assertEqual(resumed['packet_id'], packet['packet_id'])
+            outcome = workflow.submit_patch(packet['packet_id'], [{'claim_id': 'b', 'text': 'Corrected premise'}],
+                                            'host/author', packet['input_hash'])
+            self.assertFalse(outcome.get('blocked'), outcome)
+            next_packet = NativeReviewWorkflow(workflow.directory).next()
+            self.assertEqual(set(next_packet['items']), {'b', 'c'})
+
+    def test_imported_pending_patch_without_prompt_is_reconstructed_at_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            workflow = self.bootstrap(root); self._reach_global(workflow)
+            with workflow.queue.transaction() as state:
+                runner = workflow._load(state); runner.max_revisions = 0
+                runner.prepare_phase6_revision_v4([dict(claim_id='a', issue='wrong premise',
+                    evidence='fixture', suggested_fix='revise')])
+                workflow._save(state, runner)
+            imported = NativeReviewWorkflow.from_checkpoint(workflow.checkpoint_path, Path(root) / 'imported')
+            packet = imported.next()
+            self.assertEqual(packet.get('kind'), 'patch', packet)
+            self.assertEqual(packet['allowed_claim_ids'], ['a'])
+            self.assertTrue(packet['manual_patch_only'])
+            self.assertTrue(packet['blocked'])
+            self.assertEqual(packet['status'], 'blocked:revision_limit')
+            self.assertIn('wrong premise', next(iter(packet['items'].values()))['prompt'])
+            with self.assertRaisesRegex(ValueError,'explicit submit_patch'):
+                imported.submit(packet['packet_id'], {'claim_patcher':[{'claim_id':'a','text':'changed'}]},
+                                'host/automatic', packet['input_hash'])
+            with imported.queue.transaction() as state:
+                self.assertEqual(workflow._load(state).revision_round, 0)
+
     def test_partial_delivery_restarts_without_rescheduling_accepted_siblings(self):
         with tempfile.TemporaryDirectory() as root:
             workflow = self.bootstrap(root); owners = {}; seen = []

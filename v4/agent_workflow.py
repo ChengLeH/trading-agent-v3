@@ -119,6 +119,9 @@ class NativeWorkflow:
                     path = Path(item["path"])
                     if not path.is_absolute():
                         item["path"] = str((source.resolve().parent / path).resolve())
+        registry_path = manifest.get('issuer_registry_path')
+        if isinstance(registry_path, str) and not Path(registry_path).is_absolute():
+            manifest['issuer_registry_path'] = str((source.resolve().parent / registry_path).resolve())
         runner = PipelineRunnerV4()
         prepared = runner.prepare(canonical_ticker, manifest)
         if isinstance(prepared, dict) and prepared.get("blocked"):
@@ -138,6 +141,7 @@ class NativeWorkflow:
         # Journal writes are suppressed inside a transaction; the caller
         # commits the runner snapshot into authoritative state atomically.
         runner.journal = None
+        runner.orch.require_issuer_identity(runner.run_id)
         return runner
 
     def _save(self, state, runner):

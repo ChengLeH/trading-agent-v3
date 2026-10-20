@@ -24,10 +24,23 @@ def render_report(snapshot):
     if snapshot.get("trade"):
         lines.extend(["## 結構化交易計畫", "", "```json",
                       json.dumps(snapshot["trade"], ensure_ascii=False, indent=2), "```", ""])
+    issuers = [{key: row[key] for key in ('ticker','cik','company_name','registry_origin')} for row in snapshot.get('issuer_identity', [])]
+    issuers = list({json.dumps(row,sort_keys=True):row for row in issuers}.values())
+    if issuers:
+        lines.extend(['## 公司身份核對', '', '```json', json.dumps(issuers,ensure_ascii=False,indent=2), '```', ''])
+    limitations = [line for row in snapshot.get('ingestion_diagnostics', [])
+                   for line in row.get('limitations', [])]
+    if limitations:
+        lines.extend(['## 資料抽取限制', '', *('- ' + line for line in limitations), ''])
+    methods = snapshot.get('indicator_definitions', {})
+    if methods:
+        lines.extend(['## 技術指標計算口徑', '', '```json',
+                      json.dumps(methods,ensure_ascii=False,indent=2), '```', ''])
     report = "\n".join(lines)
     sidecar = dict(format="v4-claim-dag/1", run_id=snapshot["run_id"],
                    sections=sections, claims=claims, facts=snapshot["facts"],
                    calcs=snapshot["calcs"], evidence=snapshot["evidence"],
                    events=snapshot.get("events", {}), trade=snapshot.get("trade", {}),
+                   indicator_definitions=methods, issuer_identity=snapshot.get('issuer_identity', []), ingestion_diagnostics=snapshot.get('ingestion_diagnostics', []),
                    report_hash=digest(report), total_claims=len(claims))
     return dict(report_markdown=report, sidecar=sidecar)
