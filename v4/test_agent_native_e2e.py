@@ -22,6 +22,7 @@ class NativeManifestLifecycle(unittest.TestCase):
                     dict(id="news", type="news_json", path="news.json")
                 ])), encoding="utf-8")
             workflow = NativeReviewWorkflow.from_manifest(manifest, root / "native")
+            workflow.record_secondary_event({}, code='secondary_unavailable', requested_identity='antigravity/test')
             kinds = []
             for _ in range(32):
                 packet = workflow.next()
@@ -29,6 +30,8 @@ class NativeManifestLifecycle(unittest.TestCase):
                 if packet.get("status") == "complete":
                     self.assertTrue(packet["report_markdown"])
                     self.assertIn("global_review", packet["sidecar"])
+                    self.assertEqual(packet['execution_disclosure']['secondary_events'][0]['code'], 'secondary_unavailable')
+                    self.assertEqual(packet['sidecar']['execution_disclosure'], packet['execution_disclosure'])
                     break
                 output = {}
                 if kind == "roles":
@@ -70,3 +73,4 @@ class NativeManifestLifecycle(unittest.TestCase):
             repeated = NativeReviewWorkflow(workflow.directory).next()
             self.assertEqual(repeated["report_markdown"], packet["report_markdown"])
             self.assertEqual(repeated["sidecar"]["report_hash"], packet["sidecar"]["report_hash"])
+            self.assertEqual(repeated['execution_disclosure'], packet['execution_disclosure'])

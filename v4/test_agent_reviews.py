@@ -557,8 +557,12 @@ class NativeGlobalFindingsPatch(NativeReviews):
                 packet['packet_id'], [dict(claim_id='nonexistent', text='x')],
                 'host/patcher', packet['input_hash'])
             self.assertEqual(failed['status'], 'blocked:patch_contract')
+            self.assertEqual(failed['next_action'], 'retry-patch')
+            self.assertEqual(failed['failed_packet_id'], packet['packet_id'])
             resumed = NativeReviewWorkflow(workflow.directory)
-            self.assertEqual(resumed.next()['status'], 'blocked:patch_contract')
+            stopped = resumed.next()
+            self.assertEqual(stopped['status'], 'blocked:patch_contract')
+            self.assertEqual(stopped['next_action'], 'retry-patch')
             with self.assertRaises(ValueError):
                 resumed.retry_patch('  ')
             retried = resumed.retry_patch('patch targeted an unknown claim id; request a corrected patch')

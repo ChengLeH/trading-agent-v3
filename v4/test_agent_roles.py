@@ -9,6 +9,29 @@ from .test_journal import author_response
 
 
 class NativeRoles(unittest.TestCase):
+    def test_large_role_prompt_has_exact_durable_artifact_and_budget_notice(self):
+        import hashlib
+        import json
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as root:
+            _, workflow = self.bootstrap(root)
+            prompt = '資料' * 10000
+            with workflow.queue.transaction() as state:
+                state['options'] = dict(role_prompt_budget_bytes=1024)
+            with patch('v4.runner.PipelineRunnerV4._role_prompts', return_value=[
+                    (role, prompt) for role in ('market_analyst','fundamentals_analyst','news_analyst','social_analyst')]):
+                packet = workflow.next()
+            item = packet['items']['market_analyst']
+            delivery = item['delivery']
+            self.assertEqual(delivery['prompt_bytes'], len(prompt.encode('utf-8')))
+            self.assertTrue(delivery['budget_exceeded'])
+            self.assertEqual(delivery['prompt_sha256'], hashlib.sha256(prompt.encode('utf-8')).hexdigest())
+            self.assertEqual(json.loads(Path(delivery['prompt_file']).read_text())['prompt'], prompt)
+            self.assertEqual(item['prompt'], prompt)  # no evidence truncation
+            resumed = NativeWorkflow(workflow.directory).next()
+            self.assertEqual(resumed['items']['market_analyst']['delivery'], delivery)
+            self.assertEqual(packet['warnings'][0]['code'], 'role_prompt_budget_exceeded')
+
     def bootstrap(self, root):
         runner = seeded(); runner.run.claims = []; runner.run.analyses = {}
         source = Path(root) / 'original.json'

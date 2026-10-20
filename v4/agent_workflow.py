@@ -9,6 +9,7 @@ checkpoint.json is only a derived view materialized from it. No cloud client
 or model call is required: executors declare their own runtime identity.
 """
 import json
+import hashlib
 from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -26,6 +27,7 @@ from .storage import write_json
 ROLE_GROUPS = (PHASE_2_ROLES, PHASE_3_ROLES, ("research_manager",), ("trader",), ("risk_manager",))
 ALL_ROLES = tuple(role for group in ROLE_GROUPS for role in group)
 ROLE_CONTRACT = "v4-native-roles/1"
+DEFAULT_ROLE_PROMPT_BUDGET_BYTES = 262144
 
 
 def json_read(path):
@@ -51,6 +53,53 @@ class NativeWorkflow:
         self.directory = Path(directory)
         self.queue = NativeWorkQueue(self.directory)
         self.checkpoint_path = self.directory / "checkpoint.json"
+
+    def record_secondary_event(self, packet, *, code, requested_identity,
+                               accepted_claim_ids=(), failed_claim_ids=()):
+        """Audit optional-worker outcomes without changing canonical Claim state."""
+        event = dict(code=code, packet_id=packet.get('packet_id'),
+                     input_hash=packet.get('input_hash'), requested_identity=requested_identity,
+                     accepted_claim_ids=sorted(accepted_claim_ids), failed_claim_ids=sorted(failed_claim_ids))
+        with self.queue.transaction() as state:
+            state.setdefault('secondary_events', []).append(event)
+        return dict(code='secondary_review_degraded', event_code=code,
+                    next_action='main_agent_complete_outstanding_reviews',
+                    message='Secondary review was unavailable or incomplete; remaining reviews belong to the main Agent.')
+
+    def execution_disclosure(self):
+        with self.queue.transaction() as state:
+            return dict(secondary_events=deepcopy(state.get('secondary_events', [])),
+                        independent_review_guaranteed=False,
+                        identity_assurance='executor identities are declared, not independently attested')
+
+    def _role_packet_view(self, state, packet, items):
+        budget = state.get('options', {}).get('role_prompt_budget_bytes', DEFAULT_ROLE_PROMPT_BUDGET_BYTES)
+        if type(budget) is not int or budget < 1024:
+            raise ValueError('role_prompt_budget_bytes must be an integer >=1024')
+        warnings = []
+        for role, item in items.items():
+            raw = item['prompt'].encode('utf-8')
+            path = (self.directory / 'prompts' / packet['packet_id'] / (digest(role) + '.json')).resolve()
+            artifact = dict(packet_id=packet['packet_id'], input_hash=packet['input_hash'],
+                            role=role, prompt=item['prompt'])
+            # This is a derived delivery artifact. Always materialize from the
+            # authoritative packet, including when a prior file was lost.
+            write_json(path, artifact)
+            wire = path.read_bytes()
+            delivery = dict(prompt_file=str(path), prompt_bytes=len(raw),
+                            prompt_sha256=hashlib.sha256(raw).hexdigest(),
+                            artifact_bytes=len(wire), artifact_sha256=hashlib.sha256(wire).hexdigest(),
+                            budget_bytes=budget, budget_exceeded=len(raw) > budget,
+                            scope='prepared_prompt_only; executor context receipt not provided')
+            item['delivery'] = delivery
+            packet['items'][role]['delivery'] = deepcopy(delivery)
+            if delivery['budget_exceeded']:
+                warnings.append(dict(code='role_prompt_budget_exceeded', role=role,
+                                     prompt_bytes=len(raw), budget_bytes=budget,
+                                     next_action='read_prompt_file_or_use_larger_context',
+                                     message='Full evidence retained; use next --prompt-files to avoid large inline delivery.'))
+        return dict(status='roles', kind='roles', packet_id=packet['packet_id'],
+                    input_hash=state['input_hash'], items=deepcopy(items), warnings=warnings)
 
     @classmethod
     def from_checkpoint(cls, source, directory):
@@ -208,8 +257,7 @@ class NativeWorkflow:
                     outstanding = {role: deepcopy(packet["items"][role]) for role in packet["items"]
                                    if role not in candidates and role not in packet["received"]}
                     if outstanding:
-                        return dict(status="roles", packet_id=active_id, kind="roles",
-                                    input_hash=state["input_hash"], items=outstanding)
+                        return self._role_packet_view(state, packet, outstanding)
                     if role_errors or state.get("group_error"):
                         return dict(status="blocked:roles", packet_id=active_id,
                                     role_errors=deepcopy(role_errors), group_error=deepcopy(state.get("group_error")),
@@ -227,8 +275,7 @@ class NativeWorkflow:
             state["packets"][packet_id] = dict(packet_id=packet_id, kind="roles",
                                                input_hash=state["input_hash"], items=items, received={})
             state["active_packet_id"] = packet_id
-            return dict(status="roles", packet_id=packet_id, kind="roles",
-                        input_hash=state["input_hash"], items=deepcopy(items))
+            return self._role_packet_view(state, state['packets'][packet_id], items)
 
     def submit(self, packet_id, responses, executor, input_hash):
         _require_identity(executor, "executor")

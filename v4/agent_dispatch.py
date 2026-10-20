@@ -35,6 +35,7 @@ def dispatch_secondary_reviews(workflow, client, *, max_workers=4, max_items=16)
                     reason="AGY receives only independent atomic/deep review items")
     if packet.get("blocked"):
         return dict(status="fallback_to_main", kind=kind, packet=packet,
+                    warnings=[workflow.record_secondary_event(packet, code='workflow_blocked', requested_identity=identity)],
                     reason="canonical workflow is blocked, host intervention required")
     items = list(packet["items"].items())[:max_items]
     packet_id, input_hash = packet["packet_id"], packet["input_hash"]
@@ -68,8 +69,11 @@ def dispatch_secondary_reviews(workflow, client, *, max_workers=4, max_items=16)
                 # Tool availability, provider quota, session errors, invalid
                 # response and input-staleness are all host-recoverable.
                 failures[cid] = f"{type(exc).__name__}: {exc}"
+    warning = workflow.record_secondary_event(packet,
+        code='secondary_failed' if failures else 'secondary_completed', requested_identity=identity,
+        accepted_claim_ids=accepted, failed_claim_ids=failures)
     outstanding = workflow.next()
     return dict(status="fallback_to_main" if failures else "secondary_complete",
                 packet_id=packet_id, input_hash=input_hash, kind=kind,
                 accepted_claim_ids=sorted(accepted),
-                failures=failures, outstanding=outstanding)
+                failures=failures, outstanding=outstanding, warnings=[warning] if failures else [])

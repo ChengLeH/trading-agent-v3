@@ -40,9 +40,13 @@ def main(argv=None):
     origin.add_argument("--manifest", help="ingest a fresh V4 manifest without AGY")
     init.add_argument("--ticker", help="optional expected ticker; must match manifest")
     init.add_argument("--work-dir", required=True)
+    init.add_argument('--role-prompt-budget-bytes', type=int, default=None,
+                      help='advisory UTF-8 budget per role; never truncates source evidence')
 
     nxt = sub.add_parser("next", help="show the current outstanding packet")
     nxt.add_argument("--work-dir", required=True)
+    nxt.add_argument('--prompt-files', action='store_true',
+                     help='for role packets, return durable prompt paths/hashes instead of inline prompts')
 
     submit = sub.add_parser("submit", help="submit structured responses for a packet")
     submit.add_argument("--work-dir", required=True)
@@ -87,25 +91,38 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "init":
+            if args.role_prompt_budget_bytes is not None and args.role_prompt_budget_bytes < 1024:
+                raise ValueError('role prompt budget must be >=1024')
             if args.checkpoint is not None:
                 if args.ticker is not None:
                     raise ValueError("--ticker applies only to --manifest")
                 source = Path(args.checkpoint)
                 if not source.is_file():
                     raise ValueError(f"checkpoint not found: {source}")
-                NativeReviewWorkflow.from_checkpoint(source, args.work_dir)
+                instance = NativeReviewWorkflow.from_checkpoint(source, args.work_dir)
+                if args.role_prompt_budget_bytes is not None:
+                    with instance.queue.transaction() as state:
+                        state.setdefault('options', {})['role_prompt_budget_bytes'] = args.role_prompt_budget_bytes
                 _emit(dict(ok=True, status="initialized", work_dir=str(args.work_dir),
                            source_checkpoint=str(source)))
                 return 0
             source = Path(args.manifest)
             if not source.is_file():
                 raise ValueError(f"manifest not found: {source}")
-            NativeReviewWorkflow.from_manifest(source, args.work_dir, ticker=args.ticker)
+            instance = NativeReviewWorkflow.from_manifest(source, args.work_dir, ticker=args.ticker)
+            if args.role_prompt_budget_bytes is not None:
+                with instance.queue.transaction() as state:
+                    state.setdefault('options', {})['role_prompt_budget_bytes'] = args.role_prompt_budget_bytes
             _emit(dict(ok=True, status="initialized", work_dir=str(args.work_dir),
                        source_manifest=str(source)))
             return 0
         if args.command == "next":
-            return _result_exit(NativeReviewWorkflow(args.work_dir).next())
+            payload = NativeReviewWorkflow(args.work_dir).next()
+            if args.prompt_files and payload.get('kind') == 'roles':
+                for item in payload['items'].values():
+                    item.pop('prompt', None)
+                payload['prompt_delivery'] = 'files; read each delivery.prompt_file before answering'
+            return _result_exit(payload)
         if args.command == "submit":
             path = Path(args.responses)
             try:
@@ -152,6 +169,9 @@ def main(argv=None):
             except (RuntimeError, ValueError) as exc:
                 return _result_exit(dict(status="fallback_to_main",
                                          reason=f"{type(exc).__name__}: {exc}",
+                                         warnings=[workflow.record_secondary_event(pending, code='secondary_unavailable',
+                                             requested_identity='antigravity/' + args.agy_model,
+                                             failed_claim_ids=pending['items'])],
                                          packet=pending))
             return _result_exit(dispatch_secondary_reviews(
                 workflow, client, max_workers=args.max_workers,

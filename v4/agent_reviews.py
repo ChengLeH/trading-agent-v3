@@ -88,6 +88,19 @@ class NativeReviewWorkflow(NativeWorkflow):
                     input_hash=state["input_hash"], items=deepcopy(items))
 
     def next(self):
+        result = self._next()
+        disclosure = self.execution_disclosure()
+        events = disclosure['secondary_events']
+        if events:
+            result['secondary_execution'] = dict(event_count=len(events), latest_event=deepcopy(events[-1]),
+                                                independent_review_guaranteed=False)
+            if any(event['code'] != 'secondary_completed' for event in events):
+                result.setdefault('warnings', []).append(dict(code='secondary_review_degraded',
+                    next_action='inspect_execution_disclosure_and_current_review_executors',
+                    message='Secondary review was unavailable or incomplete during this run; independent review is not guaranteed.'))
+        return result
+
+    def _next(self):
         role_state = super().next()
         if role_state.get("status") not in PATCH_WAIT_STATUSES:
             if role_state.get("status") != "phase6_ready":
@@ -280,6 +293,11 @@ class NativeReviewWorkflow(NativeWorkflow):
                 return dict(status="blocked:delivery_gate", blocked=True, reason=str(exc))
             self._save(state, runner)
             # The caller receives exactly the canonical final rendering and sidecar.
+            disclosure = dict(secondary_events=deepcopy(state.get('secondary_events', [])),
+                              independent_review_guaranteed=False,
+                              identity_assurance='executor identities are declared, not independently attested')
+            result['execution_disclosure'] = disclosure
+            result['sidecar']['execution_disclosure'] = deepcopy(disclosure)
             return result
 
         try:
@@ -417,7 +435,9 @@ class NativeReviewWorkflow(NativeWorkflow):
         blocked = state.get("patch_blocked")
         if blocked:
             return dict(status="blocked:patch_contract", blocked=True,
-                        reason=deepcopy(blocked), input_hash=state["input_hash"])
+                        reason=deepcopy(blocked), input_hash=state["input_hash"],
+                        failed_packet_id=blocked['packet_id'], next_action='retry-patch',
+                        retry_requires='operator reason; canonical pending repair and used rounds are retained')
         if runner.pending_patch is None or runner.pending_patch["input_hash"] != runner._hash():
             return None
         active = state["packets"].get(state.get("active_packet_id"))
@@ -493,7 +513,9 @@ class NativeReviewWorkflow(NativeWorkflow):
             failure = dict(packet_id=packet["packet_id"], executor=row["executor"],
                            reason=f"{type(exc).__name__}: {exc}")
             state["patch_blocked"] = failure
-            result = dict(status="blocked:patch_contract", blocked=True, reason=deepcopy(failure))
+            result = dict(status="blocked:patch_contract", blocked=True, reason=deepcopy(failure),
+                          failed_packet_id=packet['packet_id'], next_action='retry-patch',
+                          retry_requires='operator reason; canonical pending repair and used rounds are retained')
         else:
             state.pop("patch_blocked", None)
         packet["retired"] = True

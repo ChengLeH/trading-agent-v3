@@ -20,6 +20,22 @@ def run(args):
 
 
 class AgentCli(unittest.TestCase):
+    def test_prompt_files_deliver_full_role_context_without_large_inline_response(self):
+        import hashlib
+        from .test_agent_roles import NativeRoles
+        with tempfile.TemporaryDirectory() as root:
+            _, workflow = NativeRoles().bootstrap(root)
+            packet = workflow.next()
+            code, compact = run(['next', '--work-dir', str(workflow.directory), '--prompt-files'])
+            self.assertEqual(code, 0)
+            self.assertEqual(compact['packet_id'], packet['packet_id'])
+            for role, item in compact['items'].items():
+                self.assertNotIn('prompt', item)
+                wire = Path(item['delivery']['prompt_file']).read_bytes()
+                self.assertEqual(hashlib.sha256(wire).hexdigest(), item['delivery']['artifact_sha256'])
+                self.assertEqual(json.loads(wire)['prompt'], packet['items'][role]['prompt'])
+            self.assertLess(len(json.dumps(compact)), len(json.dumps(packet)))
+
     def source_checkpoint(self, root):
         runner = seeded()
         source = Path(root) / "original.json"

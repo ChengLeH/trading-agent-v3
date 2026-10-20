@@ -325,3 +325,16 @@ V4 現金流抽取接受以下明確欄位（V3 不變）：
 這次 Mac 實際探測 SEC 自動讀取回 HTTPError；離線快照流程已用模擬 SEC 格式與真實 Native init/重載測試驗證。部署前需準備可信快照或可用的 SEC 連線。若核實原資料屬另一家公司，不可只改 CIK 或驗證標籤，須換正確來源並重建受影響 Fact/Claim，再重新驗證。
 
 AGY 不可用仍交回主 Agent，未改為預設擋死。沒有新增 ticker 特例、文字語義關鍵字規則或自動放行。既有工作目錄請先備份後沿用；程式更新後重新呼叫 CLI 即生效，長駐 driver 需安全暫停後重啟。
+
+
+## 2026-10-20：角色輸入交付與副審核降級紀錄
+
+Native 角色封包現在保存完整提示 JSON 檔（`prompts/<packet_id>/<role-hash>.json`），並回傳 `delivery`：UTF-8 prompt 大小及 SHA256、整個 artifact 大小及 SHA256、路徑與預算比較。預設每角色 262144 bytes 是提醒預算，不是模型 context 上限，也不會截掉來源或直接擋死。可在 `init --role-prompt-budget-bytes N` 調整；既有工作目錄未設定時沿用預設值。
+
+大型輸入請使用 `python -m v4.agent_cli next --work-dir <dir> --prompt-files`，回覆僅列提示檔及交付 metadata，避免把全部來源塞進終端輸出。讀取各檔案中的 `prompt`，核對 artifact hash，並使用能容納完整輸入的主 Agent；一般 `next` 仍保留 inline prompt 相容性。這只證明程式準備及寫出的內容，不能證明外部主 Agent／模型實際看到了完整 context；尚無執行器收件證明，不能把它當成已根治所有外部截斷。讀檔失敗會明確報錯，不會發布成功的交付 metadata；重新 next 可從 canonical packet 重建遺失的檔案。
+
+AGY 建立失敗或部分審查失敗仍回退主 Agent，不偽造 PASS。失敗回覆會含 `secondary_review_degraded` 警示；每次副審核派發結果保存在 `agent-state.json.secondary_events`（packet/input hash、請求的執行器、已收與失敗 Claim IDs，不複製原始錯誤或提示）。重啟後 next 仍揭露歷史降級；交付結果與 sidecar 的 `execution_disclosure` 保存完整紀錄。各 Claim 審核實際宣告的執行者仍在既有 atomic/deep receipts，不能把副審核曾被呼叫當成所有 Claim 都獲得獨立覆核；宣告的 executor identity 也不是遠端身份認證。
+
+`blocked:patch_contract` 現在直接回 `failed_packet_id`、`next_action=retry-patch` 與恢復條件，不再只把錯誤埋在 reason。先修正候選，再用 `retry-patch --reason <原因>` 取得新封包並提交；舊失敗與人工理由保留，不重置已用修訂輪次、不刪待修 findings，也不自動發起付費重試。
+
+上述變更只在 Native 交換流程生效，未改 V3、binding 比對語義或交易 schema。交易物件原已支援 BUY/SHORT/WAIT；主動交易有 entry/stop/target/position_pct 與衍生 R/R，因此「只有 direction」不成立。
