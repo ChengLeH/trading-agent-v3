@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Iterable, List, Optional
 from .schema import DIMENSIONS
+from .precision import equivalent, validate_presentation
 
 
 @dataclass
@@ -18,7 +19,8 @@ class SourceBinding:
     """What a claim says one referenced source means.
 
     All dimensions are optional during migration, but when supplied they must
-    match the referenced canonical FACT exactly. This catches entity/metric/
+    identify the referenced canonical FACT. Typed aliases are normalized; semantic
+    uncertainty remains mandatory LLM work. This catches metric/
     period/scope/unit/basis misbinding without keyword or regex rules.
     """
 
@@ -136,7 +138,11 @@ def validate_claim_bindings(
                     # mismatch. Every such claim still goes to the LLM.
                     continue
                 actual = fact.get(dim)
-                if expected != actual:
+                relation = equivalent(dim, expected, actual)
+                if relation is None:
+                    out.append(BindingFinding(cid, ref_id, 'WARN', dim, expected, actual,
+                        'unresolved semantic attribution; mandatory LLM reference review must establish equivalence'))
+                elif not relation:
                     out.append(BindingFinding(
                         cid, ref_id, "FAIL", dim, expected, actual,
                         f"claim binding {dim} does not match canonical FACT",
@@ -147,7 +153,7 @@ def validate_claim_bindings(
                         f"claim binding {dim} matches canonical FACT",
                     ))
             for dim in ("share_basis", "effective_date"):
-                if dim in raw and fact.get(dim) not in (None, "", "unknown") and raw[dim] != fact[dim]:
+                if dim in raw and fact.get(dim) not in (None, "", "unknown") and not equivalent(dim, raw[dim], fact[dim]):
                     out.append(BindingFinding(cid, ref_id, "FAIL", dim,
                                               raw[dim], fact[dim], "explicit dimension mismatch"))
             assertion = claim.get("assertion", {})
@@ -156,4 +162,10 @@ def validate_claim_bindings(
                 out.append(BindingFinding(cid, ref_id, "FAIL", "value",
                                           assertion.get("value"), fact["value"],
                                           "explicit asserted value differs from source"))
+            if assertion.get('kind') == 'value' and assertion.get('ref_id') == ref_id and 'presentation' in assertion:
+                try:
+                    validate_presentation(assertion, fact['value'], fact.get('unit', 'unknown'))
+                except (ValueError, TypeError, KeyError) as exc:
+                    out.append(BindingFinding(cid, ref_id, 'FAIL', 'presentation',
+                        assertion.get('presentation'), fact.get('value'), str(exc)))
     return out

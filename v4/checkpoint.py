@@ -10,6 +10,7 @@ from v3.evidence import EvidencePacket
 from v3.sources import SourceRecord, SourceError
 from .runner import PipelineRunnerV4
 from .schema import digest
+from .financial_review import FINANCIAL_REVIEW_VERSION
 
 
 from .storage import write_json
@@ -166,7 +167,8 @@ def _verified_reference_supplement(run_dir, run_id, cid, task, supplement, layer
 
 
 def save_checkpoint(runner, path):
-    write_json(path, dict(format="v4-checkpoint/1", state=runner.orch.snapshot(runner.run_id),
+    write_json(path, dict(format="v4-checkpoint/1", financial_review_contract=FINANCIAL_REVIEW_VERSION,
+                          contract_migrations=getattr(runner, "contract_migrations", []), state=runner.orch.snapshot(runner.run_id),
                           status=runner.status, verification_epoch=runner._verification_epoch,
                           contract_attempts=runner._contract_attempts,
                           records=[dict(kind=type(r).__name__, value=asdict(r)) for r in runner.run.records],
@@ -415,7 +417,20 @@ def load_checkpoint(path, *, continue_verification=True):
                 raise ValueError("invalid deferred resolution baseline") from None
     from .semantic_contracts import validate_revision_history
     validate_revision_history(run.claims, r.history)
+    previous_state = r._state()
+    prior_contract = data.get('financial_review_contract')
+    if prior_contract is None:
+        previous_state.pop('financial_review_contract', None)
+    else:
+        previous_state['financial_review_contract'] = prior_contract
+    prior_hash = digest(previous_state)
+    migrating = prior_contract != FINANCIAL_REVIEW_VERSION
+    r.contract_migrations = deepcopy(data.get('contract_migrations', []))
     progress = data.get("global_review_progress")
+    if migrating and isinstance(progress, dict) and progress.get('input_hash') == prior_hash:
+        r.contract_migrations.append(dict(previous_contract=prior_contract,
+            current_contract=FINANCIAL_REVIEW_VERSION, retired_global_progress=deepcopy(progress)))
+        progress = None
     if progress is not None and continue_verification:
         from .semantic_contracts import normalize_dependency_review
         if (not isinstance(progress, dict) or progress.get("format") != "v4-global-progress/1"
@@ -450,6 +465,10 @@ def load_checkpoint(path, *, continue_verification=True):
             if findings and all(r._finding_claim_ids(f) for f in findings):
                 pending = dict(input_hash=r._hash(), ids=list(dict.fromkeys(
                     cid for f in findings for cid in r._finding_claim_ids(f))), findings=findings)
+    retire_pending = (migrating and isinstance(pending, dict) and pending.get('input_hash') == prior_hash)
+    if retire_pending:
+        pending = deepcopy(pending)
+        pending['input_hash'] = r._hash()
     if pending is not None:
         from .schema import id_list
         try:
@@ -478,7 +497,17 @@ def load_checkpoint(path, *, continue_verification=True):
                 raise ValueError("finding targets differ from allowed IDs")
         except (ValueError, TypeError, KeyError) as exc:
             raise ValueError(f"invalid pending claim repair: {exc}") from exc
-        r.pending_patch = pending
+        if retire_pending:
+            r.contract_migrations.append(dict(previous_contract=prior_contract,
+                current_contract=FINANCIAL_REVIEW_VERSION, retired_pending_patch=deepcopy(data['pending_patch'])))
+            known_findings = {f.get('finding_id') for f in r.deferred_global_findings}
+            for finding in deepcopy(findings):
+                finding.setdefault('finding_id', 'upgrade.' + digest(finding))
+                if finding['finding_id'] not in known_findings:
+                    r.deferred_global_findings.append(finding)
+                    known_findings.add(finding['finding_id'])
+        else:
+            r.pending_patch = pending
     elif data.get("status") in {"blocked:revision_no_changes", "blocked:pending_revision"}:
         raise ValueError("missing pending claim repair for blocked revision")
     # Review receipts above are reconstructed from exact response archives;

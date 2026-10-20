@@ -349,3 +349,56 @@ Native 載入時仍核對原始 response archive，重演已接受的 Global pac
 舊版本若已留下重發但尚未處理的 active Global packet，只有在原始存檔已證明同一版狀態的 Global 已以 findings 結案後，才將該多餘封包退役並註記 global_round_already_closed_with_findings，保留候選與歷史；不刪 archive、findings、不重置修訂輪次、不把 pending patch 視為已解決。補邊後仍須重驗該 Claim 與 dependency descendants，並跑新的 Global。
 
 更新後重新啟動 driver，再於原 Native work-dir 呼叫 next；不必清空工作目錄或重跑已接受的 dependency batches。請先備份整個 work-dir。若原始 archive 遺失、內容不符或真正有未完成補審，仍會明確拒絕或派出尚缺的工作；不能只靠序列化快照跳過驗證。這項修復針對 Native 工作目錄的 global_outcomes/packets/archives，僅剩獨立 checkpoint 的狀態不等同於保有完整 Native 證據。
+
+### 泛化金融證據契約與恢復（financial-evidence/1）
+
+角色、atomic、deep、Claim patch 與 Global 共用同一份金融證據契約；沒有新增模型層。
+發布日／事件日／共識彙整日分開，季度 EPS 不與股價目標混比；估值必須繼承盈餘品質限制。
+極端情境可以保留，但不得當作基準預測，也不會硬套收購現金／借款比例或自動扣掉賣方出售款。
+「本次未提供證據」不代表「公司未披露」。Python 不讀金融 prose 做語義路由。
+
+- `assertion.value` 保留來源 canonical 值。可另附
+  `presentation: {value: 1.23, unit: "USD million", decimal_places: 2, rounding: "half_up"}`，
+  明確驗算換單位與顯示捨入；不能用容差放過錯幣別、公式或原始值。
+- Typed metadata 只正規化明確格式（如 FY 與大小寫），無法確定的名稱別名保留 WARN，交 mandatory LLM reference review。
+  不使用字串相似度判定語義等價。
+- 標準財報 `balance` 可提供 `parent_equity`、`consolidated_equity`、
+  `nonredeemable_nci`／`non_redeemable_nci`、`redeemable_nci`。
+  `financial_statement_metadata` 可宣告 unit/currency、basis、entity、precision（來源四捨五入步長，每個運算元貢獻半步誤差界）、equity_attribution；row 可覆寫。
+  `total_equity` 未明示 parent/consolidated 時保留 legacy 欄位與警告，不猜歸屬。
+  非零可贖回 NCI 須明示 redeemable_nci_inclusion=separate/liabilities/consolidated_equity，避免重複加總。
+  母公司與合併權益同時出現時也會互相核對。
+  只有完整且相容的元件才驗資產負債表等式；缺項不當成零，不從殘差捏造少數權益。
+  未映射的非空欄位、單位或口徑不明會寫入 ingestion_diagnostics。
+
+AGY 明確 quota 用盡會回 `quota_exhausted`，停止此 identity 的新派送並保存回退狀態；
+主 Agent 繼續 `next`／`submit`，每條仍須驗證，報告不會宣稱保有獨立第二模型保證。
+速率限制另記 `rate_limited`，只允許有界同 session 重試；未知供應商錯誤不猜成 quota。
+確認額度恢復後才明確執行；恢復會建立新的派送 session 世代，保留舊 session 與耗盡紀錄，一般重試不會換世代：
+
+```sh
+python -m v4.agent_cli restore-secondary --work-dir RUN --identity antigravity/MODEL --reason "operator verified quota reset"
+```
+
+主 Agent 補證據的入口（不會自行搜尋或啟動模型）：
+
+```sh
+python -m v4.agent_cli add-evidence --work-dir RUN --manifest extra-sources.json --reason "main Agent supplied missing filing"
+# next/submit 完成因證據輸入改變而失效的驗證後：
+python -m v4.agent_cli repair-evidence --work-dir RUN --claim-id author.exact_id --reason "link new evidence and narrow unsupported assertions"
+python -m v4.agent_cli next --work-dir RUN
+```
+
+新增 manifest 必須保持原 subject/as_of，使用全新 source IDs，路徑相對該 manifest；
+支援原有 adapter，`generic_text` 全文也會進 canonical EvidenceStore。
+來源或 Fact/Calc/Evidence ID 衝突會拒絕，既有數據不可被默默覆寫。
+原 findings、修補次數與歷史保留；新增文件本身不算問題已解決。
+Claim 修補後仍重驗 descendants 與 Global；`evidence_needed` 必須有新來源及實際 Claim 引用才能結案。
+本契約版本參與 task/state 雜湊；舊契約收據不會冒充新檢查結果。
+
+`semantic_acceptance_cases.json` 提供日期、指標、估值、情境、證據缺口與近似數值的成對語義案例。
+其 expected labels 是驗收規格，**不是已跑過的真實模型成績**；離線回歸不代表實際模型永遠能判對。
+
+升級 financial-evidence/1 時，舊版收據與未完成的 Global 補審不作新版合格證明。
+舊 pending patch 的 findings、輪次與原始候選留存；未提交的舊角色包退役並保留候選／原始回覆紀錄，重新發出新契約工作包。
+已提交的 Claim、來源與修補歷史保留，恢復後先完成新版語義驗證；不需清空 run 或手改 hash。

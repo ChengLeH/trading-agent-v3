@@ -20,6 +20,8 @@ from .semantic_contracts import (REFERENCE_INSTRUCTIONS, EVIDENCE_INSTRUCTIONS, 
                                  normalize_reference_checks, SEMANTIC_REVIEW_CONTRACT,
                                  semantic_review_schema, review_ref_ids, require_text)
 
+from .financial_review import FINANCIAL_REVIEW_CONTRACT, FINANCIAL_REVIEW_VERSION, ingestion_diagnostics
+
 CATALOG_DETAIL_MAX_BYTES = 4096
 
 
@@ -90,8 +92,7 @@ def _evidence_scope(run, facts, calcs, evidence, events):
     calculations = [c for cid, c in calcs.items() if cid not in trade_calcs]
     records = [dict(id=r.id, type=r.type, source_hash=r.source_hash)
                for r in getattr(run, "records", []) if hasattr(r, "source_hash")]
-    diagnostics = [deepcopy(rec.meta['cash_flow_extraction']) for rec in getattr(run, 'records', [])
-        if getattr(rec, 'meta', {}).get('cash_flow_extraction', {}).get('input_rows', 0)]
+    diagnostics = ingestion_diagnostics(run)
     concepts = sorted({f["concept"] for f in inputs if f.get("concept")})
     include_concepts = len(json.dumps(concepts, ensure_ascii=False).encode("utf-8")) <= CATALOG_DETAIL_MAX_BYTES
     return dict(scope="current_ingested_catalog_metadata", includes_source_contents=False,
@@ -176,7 +177,7 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
             resolved_refs=deepcopy(resolved),
             dependency_claims=deps,
             unresolved_refs=unresolved,
-            context={"as_of": getattr(run, "manifest", {}).get("as_of"),
+            context={"financial_review_contract": FINANCIAL_REVIEW_VERSION, "as_of": getattr(run, "manifest", {}).get("as_of"),
                      **({"calculation_definitions": definitions} if definitions else {}),
                      **({'indicator_definitions': indicators} if indicators else {}),
                      "evidence_scope": deepcopy(evidence_scope),
@@ -222,7 +223,7 @@ ATOMIC_INSTRUCTIONS = r"""
   "clarity_notes": [{"issue":"不影響事實或決策的輕微表達提醒","reason":"為何合理解讀不會改變主張"}]
 }
 clarity_notes 可省略。PASS 時 findings 必須是空陣列；小幅措辭提醒不算 finding。
-""".strip() + "\n\n" + REFERENCE_INSTRUCTIONS
+""".strip() + "\n\n" + REFERENCE_INSTRUCTIONS + "\n" + FINANCIAL_REVIEW_CONTRACT
 
 
 def build_atomic_prompt(task: AtomicTask, *, verification_epoch=None) -> str:
@@ -264,6 +265,7 @@ def build_reference_supplement_prompt(task: AtomicTask, prior_result, missing_re
     instructions = (
         role_instructions
         + EVIDENCE_INSTRUCTIONS
+        + FINANCIAL_REVIEW_CONTRACT
         + "只補 expected_reference_ids 所列的缺漏引用；reference_checks 必須只含這些 ID。"
         + "逐項比對原文歸因與 context 內實際證據，不相關的真實摘錄不構成支持。"
         + "relation 只能是 SUPPORTS、CONTRADICTS、INSUFFICIENT；矛盾必須判 FAIL，"
@@ -298,6 +300,7 @@ def build_reference_verdict_repair_prompt(task: AtomicTask, accepted_reference_c
     instructions = (
         role
         + EVIDENCE_INSTRUCTIONS
+        + FINANCIAL_REVIEW_CONTRACT
         + "accepted_reference_checks 是已完成且保存的來源審查；使用它們判斷主張，但不要重審、改寫或重複回傳。"
         + "只修正 validation_error 指出的 verdict/findings/結構契約問題。"
         + "所有 Claim 仍須由你作語義判斷；來源支持不足、矛盾或不確定時，不可判 PASS。"

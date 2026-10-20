@@ -1,0 +1,176 @@
+{
+  "format": "v4-semantic-acceptance/1",
+  "purpose": "Paired generic cases for future real-model acceptance; expected labels are test specifications, not recorded model verdicts",
+  "cases": [
+    {
+      "case_id": "event_dates.pass",
+      "context": {
+        "event_date": "2031-03-01",
+        "consensus_compiled": "2031-05-09",
+        "analyst_update_dates": "not provided"
+      },
+      "claim": "May consensus compilation postdates March event; individual update coverage is unknown.",
+      "expected_verdict": "PASS"
+    },
+    {
+      "case_id": "event_dates.fail",
+      "context": {
+        "event_date": "2031-03-01",
+        "consensus_compiled": "2031-05-09",
+        "analyst_update_dates": "not provided"
+      },
+      "claim": "All May consensus estimates were formed before March event.",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "case_id": "different_metrics.pass",
+      "context": {
+        "quarter_eps_consensus": 0.8,
+        "target_price_12m": 90,
+        "quarter_eps_guidance": 0.7
+      },
+      "claim": "EPS guidance 0.7 is below comparable quarterly EPS consensus 0.8; price target is a separate measure.",
+      "expected_verdict": "PASS"
+    },
+    {
+      "case_id": "different_metrics.fail",
+      "context": {
+        "quarter_eps_consensus": 0.8,
+        "target_price_12m": 90,
+        "quarter_eps_guidance": 0.7
+      },
+      "claim": "EPS guidance 0.7 is far below the 90 consensus price target, proving an earnings miss.",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "case_id": "earnings_quality.pass",
+      "context": {
+        "price": 60,
+        "gaap_eps": 4,
+        "quality_caveat": "material nonrecurring gains; normalized after-tax EPS not supplied"
+      },
+      "claim": "Reported GAAP P/E is 15x; recurring earnings valuation remains uncertain.",
+      "expected_verdict": "PASS"
+    },
+    {
+      "case_id": "earnings_quality.fail",
+      "context": {
+        "price": 60,
+        "gaap_eps": 4,
+        "quality_caveat": "material nonrecurring gains; normalized after-tax EPS not supplied"
+      },
+      "claim": "GAAP P/E 15x proves recurring earnings are cheap despite known material one-time gains.",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "case_id": "earnings_bridge.pass",
+      "context": {
+        "net_income": 100,
+        "operating_income": 60,
+        "tax_bridge": "not supplied"
+      },
+      "claim": "The 40 difference cannot be treated as a fully identified after-tax nonrecurring gain.",
+      "expected_verdict": "PASS"
+    },
+    {
+      "case_id": "earnings_bridge.fail",
+      "context": {
+        "net_income": 100,
+        "operating_income": 60,
+        "tax_bridge": "not supplied"
+      },
+      "claim": "Normalized net income is precisely 60 because every dollar of the 40 gap is an after-tax one-off.",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "case_id": "funding_recipient.pass",
+      "context": {
+        "price": 200,
+        "divestiture_proceeds": 20,
+        "recipient": "seller",
+        "funding_mix": "not disclosed in supplied evidence"
+      },
+      "claim": "Stress case assumes 200 new debt and fixed equity, explicitly excluding unverified cash offsets; not a baseline forecast.",
+      "expected_verdict": "PASS"
+    },
+    {
+      "case_id": "funding_recipient.fail",
+      "context": {
+        "price": 200,
+        "divestiture_proceeds": 20,
+        "recipient": "seller",
+        "funding_mix": "not disclosed in supplied evidence"
+      },
+      "claim": "Buyer must borrow only 180 because the seller divestiture automatically reduces buyer funding need by 20.",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "case_id": "missing_document.pass",
+      "context": {
+        "provided_documents": [
+          "IR summary"
+        ],
+        "financing_details_in_summary": false,
+        "other_company_filings": "not collected"
+      },
+      "claim": "The provided IR summary does not state the funding mix; review other filings before concluding.",
+      "expected_verdict": "PASS"
+    },
+    {
+      "case_id": "missing_document.fail",
+      "context": {
+        "provided_documents": [
+          "IR summary"
+        ],
+        "financing_details_in_summary": false,
+        "other_company_filings": "not collected"
+      },
+      "claim": "The company has not disclosed funding details anywhere.",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "case_id": "rounding.pass",
+      "context": {
+        "raw": 1234567,
+        "unit": "USD",
+        "display_unit": "USD million",
+        "decimal_places": 2
+      },
+      "claim": "Reported amount is approximately USD 1.23 million.",
+      "expected_verdict": "PASS"
+    },
+    {
+      "case_id": "rounding.fail",
+      "context": {
+        "raw": 1234567,
+        "unit": "USD",
+        "display_unit": "USD million",
+        "decimal_places": 2
+      },
+      "claim": "Reported amount is approximately EUR 1.23 million.",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "case_id": "returns.pass",
+      "context": {
+        "previous": 100,
+        "latest": 90,
+        "simple_return": -0.1,
+        "log_return": -0.1053605157
+      },
+      "claim": "Simple return was -10.0%, distinct from log return about -10.54%.",
+      "expected_verdict": "PASS"
+    },
+    {
+      "case_id": "returns.fail",
+      "context": {
+        "previous": 100,
+        "latest": 90,
+        "simple_return": -0.1,
+        "log_return": -0.1053605157
+      },
+      "claim": "Log return was -10.0%, computed as (90-100)/100.",
+      "expected_verdict": "FAIL"
+    }
+  ]
+}

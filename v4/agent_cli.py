@@ -88,6 +88,21 @@ def main(argv=None):
     retry_patch.add_argument("--work-dir", required=True)
     retry_patch.add_argument("--reason", required=True, help="operator reason; recorded durably")
 
+    restore = sub.add_parser("restore-secondary", help="explicitly re-enable a quota-disabled secondary")
+    restore.add_argument("--work-dir", required=True)
+    restore.add_argument("--identity", required=True)
+    restore.add_argument("--reason", required=True)
+
+    evidence = sub.add_parser("add-evidence", help="append new canonical sources without overwriting existing IDs")
+    evidence.add_argument("--work-dir", required=True)
+    evidence.add_argument("--manifest", required=True)
+    evidence.add_argument("--reason", required=True)
+
+    evidence_patch = sub.add_parser("repair-evidence", help="request Claim patches after new evidence and atomic review")
+    evidence_patch.add_argument("--work-dir", required=True)
+    evidence_patch.add_argument("--claim-id", action="append", required=True)
+    evidence_patch.add_argument("--reason", required=True)
+
     args = parser.parse_args(argv)
     try:
         if args.command == "init":
@@ -116,6 +131,16 @@ def main(argv=None):
             _emit(dict(ok=True, status="initialized", work_dir=str(args.work_dir),
                        source_manifest=str(source)))
             return 0
+        if args.command == "restore-secondary":
+            from .agent_dispatch import restore_secondary_availability
+            changed = restore_secondary_availability(NativeReviewWorkflow(args.work_dir), args.identity, reason=args.reason)
+            return _result_exit(dict(status="secondary_restored" if changed else "secondary_not_disabled", identity=args.identity))
+        if args.command == "add-evidence":
+            from .evidence_repair import append_sources
+            return _result_exit(append_sources(NativeReviewWorkflow(args.work_dir), args.manifest, reason=args.reason))
+        if args.command == "repair-evidence":
+            from .evidence_repair import prepare_evidence_patch
+            return _result_exit(prepare_evidence_patch(NativeReviewWorkflow(args.work_dir), args.claim_id, reason=args.reason))
         if args.command == "next":
             payload = NativeReviewWorkflow(args.work_dir).next()
             if args.prompt_files and payload.get('kind') == 'roles':

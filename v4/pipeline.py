@@ -10,6 +10,7 @@ from .bindings import validate_claim_bindings
 from .atomic_phase6 import build_atomic_tasks
 from .review_context import calculation_definitions, indicator_definitions
 from datetime import date
+from .financial_review import ingestion_diagnostics
 
 
 class ClaimSourceError(ValueError):
@@ -143,6 +144,10 @@ class OrchestratorV4(Orchestrator):
         from .cash_flow import build_with_cash_flow
         report = build_with_cash_flow(self, run_id, super().build_facts)
         run = self.runs[run_id]
+        from .financial_statements import augment_financial_statements
+        from .evidence_repair import augment_documents
+        augment_financial_statements(run, report)
+        augment_documents(run, report)
         if not any(getattr(rec, "type", None) == "openbb_fundamentals"
                    for rec in run.records):
             return report
@@ -300,8 +305,7 @@ class OrchestratorV4(Orchestrator):
                               ("evidence", run.evidence_store.to_dict()), ("event", run.events)):
             for ref, record in records.items():
                 source_index[ref] = kind
-        diagnostics = [deepcopy(rec.meta['cash_flow_extraction']) for rec in run.records
-                       if getattr(rec, 'meta', {}).get('cash_flow_extraction')]
+        diagnostics = ingestion_diagnostics(run)
         packet = dict(ingestion_diagnostics=diagnostics, source_index=source_index, role=role, ticker=run.ticker, as_of=run.manifest["as_of"],
                       facts=run.fact_store.to_dict(), calcs=calcs,
                       calculation_definitions=calculation_definitions(calcs),
@@ -329,6 +333,8 @@ class OrchestratorV4(Orchestrator):
         out.extend(f.to_dict() for f in validate_claim_bindings(
             run.claims, run.fact_store, require_bindings=True, sources=sources))
         out.extend(calculation_findings(run))
+        from .financial_statements import financial_statement_findings
+        out.extend(financial_statement_findings(run))
         # Fact identity includes entity. Different entities/bases/scopes are
         # legitimate distinct facts, unlike V3's broader collision grouping.
         seen = {}
@@ -422,8 +428,7 @@ class OrchestratorV4(Orchestrator):
         snap['indicator_definitions'] = indicator_definitions(snap['facts'])
         snap['issuer_identity'] = [deepcopy(rec.meta['issuer_identity']) for rec in self.runs[run_id].records
                                   if getattr(rec, 'meta', {}).get('issuer_identity')]
-        snap['ingestion_diagnostics'] = [deepcopy(rec.meta['cash_flow_extraction'])
-            for rec in self.runs[run_id].records if getattr(rec, 'meta', {}).get('cash_flow_extraction')]
+        snap['ingestion_diagnostics'] = ingestion_diagnostics(self.runs[run_id])
         snap["manifest"] = self.runs[run_id].manifest
         snap["trade_generated"] = getattr(self.runs[run_id], "trade_generated", ([], []))
         return deepcopy(snap)

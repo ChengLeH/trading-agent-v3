@@ -23,6 +23,7 @@ from .pipeline import ClaimReferenceError
 from .runner import PHASE_2_ROLES, PHASE_3_ROLES, PipelineRunnerV4
 from .schema import Claim, digest
 from .storage import write_json
+from .financial_review import FINANCIAL_REVIEW_VERSION
 
 ROLE_GROUPS = (PHASE_2_ROLES, PHASE_3_ROLES, ("research_manager",), ("trader",), ("risk_manager",))
 ALL_ROLES = tuple(role for group in ROLE_GROUPS for role in group)
@@ -134,6 +135,8 @@ class NativeWorkflow:
                     write_json(destination, record)
         # Publish readiness after all reusable raw archives are available.
         instance.queue.create(deepcopy(checkpoint), runner._hash())
+        with instance.queue.transaction() as state:
+            state["financial_review_contract"] = FINANCIAL_REVIEW_VERSION
         return instance
 
     @classmethod
@@ -191,12 +194,44 @@ class NativeWorkflow:
         # commits the runner snapshot into authoritative state atomically.
         runner.journal = None
         runner.orch.require_issuer_identity(runner.run_id)
+        current_hash = runner._hash()
+        if state['input_hash'] != current_hash:
+            previous = runner._state()
+            old_version = state.get('financial_review_contract')
+            if old_version is None:
+                previous.pop('financial_review_contract', None)
+            else:
+                previous['financial_review_contract'] = old_version
+            if digest(previous) != state['input_hash'] or old_version == FINANCIAL_REVIEW_VERSION:
+                raise ValueError('native canonical hash mismatch; refuse implicit state migration')
+            upgrade = dict(previous_contract=old_version, current_contract=FINANCIAL_REVIEW_VERSION,
+                before_hash=state['input_hash'], after_hash=current_hash,
+                role_candidates=deepcopy(state.get('role_candidates', {})),
+                pending_patch=deepcopy(runner.pending_patch))
+            state.setdefault('contract_upgrades', []).append(upgrade)
+            if runner.pending_patch:
+                carry = deepcopy(runner.pending_patch['findings'])
+                for finding in carry:
+                    finding.setdefault('finding_id', 'upgrade.' + digest(finding))
+                runner.deferred_global_findings.extend(carry)
+            runner.pending_patch = runner.pending_global = runner.global_receipt = runner.global_review_progress = None
+            runner.pending_atomic = runner.pending_deep = None
+            runner.status = 'resumed:requires_verification'
+            for packet in state.get('packets', {}).values():
+                if not packet.get('retired'):
+                    packet.update(retired=True, retirement_reason='financial_review_contract_upgraded')
+            state['active_packet_id'] = None
+            for key in ('role_candidates', 'role_errors', 'group_error', 'patch_prompt', 'accepted_links',
+                        'patch_blocked', 'link_blocked', 'review_blocked', 'global_blocked'):
+                state.pop(key, None)
+            self._save(state, runner)
         return runner
 
     def _save(self, state, runner):
         save_checkpoint(runner, self.checkpoint_path)
         state["checkpoint"] = json_read(self.checkpoint_path)
         state["input_hash"] = runner._hash()
+        state["financial_review_contract"] = FINANCIAL_REVIEW_VERSION
 
     def _expected_group(self, runner):
         completed = {claim["author_role"] for claim in runner.run.claims}
