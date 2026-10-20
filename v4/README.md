@@ -338,3 +338,14 @@ AGY 建立失敗或部分審查失敗仍回退主 Agent，不偽造 PASS。失�
 `blocked:patch_contract` 現在直接回 `failed_packet_id`、`next_action=retry-patch` 與恢復條件，不再只把錯誤埋在 reason。先修正候選，再用 `retry-patch --reason <原因>` 取得新封包並提交；舊失敗與人工理由保留，不重置已用修訂輪次、不刪待修 findings，也不自動發起付費重試。
 
 上述變更只在 Native 交換流程生效，未改 V3、binding 比對語義或交易 schema。交易物件原已支援 BUY/SHORT/WAIT；主動交易有 entry/stop/target/position_pct 與衍生 R/R，因此「只有 direction」不成立。
+
+
+## Global dependency 補審以 revision 結案後的續跑修復
+
+Native 載入時仍核對原始 response archive，重演已接受的 Global packets。重演使用隔離 runner 的歷史視圖，不把現在的 pending_patch 當成舊審查的前置狀態；重演後還原目前 pending_patch 與原本 blocked 狀態。這不是解除 live guard：有待修補時仍禁止開始新 Global 或交付。
+
+還原已結案的 revision receipt，必須同時清空前幾批歷史重演所建立的 pending_global 與 global_review_progress；否則會把完整收據與未完成進度同時留下，誤發最後一批 global_dependency_completion。現在 next 會進入原本的局部修訂，而不是無限補審。
+
+舊版本若已留下重發但尚未處理的 active Global packet，只有在原始存檔已證明同一版狀態的 Global 已以 findings 結案後，才將該多餘封包退役並註記 global_round_already_closed_with_findings，保留候選與歷史；不刪 archive、findings、不重置修訂輪次、不把 pending patch 視為已解決。補邊後仍須重驗該 Claim 與 dependency descendants，並跑新的 Global。
+
+更新後重新啟動 driver，再於原 Native work-dir 呼叫 next；不必清空工作目錄或重跑已接受的 dependency batches。請先備份整個 work-dir。若原始 archive 遺失、內容不符或真正有未完成補審，仍會明確拒絕或派出尚缺的工作；不能只靠序列化快照跳過驗證。這項修復針對 Native 工作目錄的 global_outcomes/packets/archives，僅剩獨立 checkpoint 的狀態不等同於保有完整 Native 證據。

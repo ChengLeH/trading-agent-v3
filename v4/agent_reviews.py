@@ -176,6 +176,13 @@ class NativeReviewWorkflow(NativeWorkflow):
         through the real P6 collector.
         """
         runner = super()._load(state)
+        # Reconstruct historical requests on an isolated runner, before the
+        # current repair was opened. Never weaken the live pending-patch guard
+        # or remove the durable repair request from authoritative queue state.
+        pending_patch = deepcopy(runner.pending_patch)
+        pending_status = runner.status
+        runner = deepcopy(runner)
+        runner.pending_patch = None
         journal = RunJournal(self.directory)
         processed = state.get("processed_items", {})
         current_hash = runner._hash()
@@ -208,6 +215,9 @@ class NativeReviewWorkflow(NativeWorkflow):
                 # sweep was accepted; re-running that collector is not
                 # idempotent, so restore the exact finding-bearing receipt.
                 runner.global_receipt = deepcopy(snapshot)
+                runner.pending_global = None
+                runner.global_review_progress = None
+                runner.status = 'revision'
                 continue
             request = runner.prepare_phase6_global_sweep()
             if not self._matches_global(runner, packet, request):
@@ -216,13 +226,25 @@ class NativeReviewWorkflow(NativeWorkflow):
                 deepcopy(row["response"]), model_identity=row["executor"])
             if digest(outcome) != digest(stored):
                 raise ValueError("replayed global outcome differs from accepted candidate")
+        runner.pending_patch = pending_patch
+        if pending_patch is not None:
+            runner.status = pending_status
         active = state.get("packets", {}).get(state.get("active_packet_id"))
         if active and active.get("kind") == "global" and not active.get("retired"):
-            role = next(iter(active["items"]))
-            if processed.get(role) != active["packet_id"]:
-                request = runner.prepare_phase6_global_sweep()
-                if not self._matches_global(runner, active, request):
-                    raise ValueError("pending global packet mismatches canonical request")
+            if (runner.global_receipt is not None and runner.global_receipt.get('findings')
+                    and runner.pending_global is None):
+                # Older versions issued the last completion again after the
+                # round had closed. Preserve its candidate/audit, but do not
+                # reopen a proven closed round or dispatch it another time.
+                active['retired'] = True
+                active['retirement_reason'] = 'global_round_already_closed_with_findings'
+                state['active_packet_id'] = None
+            else:
+                role = next(iter(active["items"]))
+                if processed.get(role) != active["packet_id"]:
+                    request = runner.prepare_phase6_global_sweep()
+                    if not self._matches_global(runner, active, request):
+                        raise ValueError("pending global packet mismatches canonical request")
         linked = state.get("accepted_links")
         if linked is not None and linked.get("input_hash") == current_hash:
             packet = state["packets"].get(linked.get("packet_id"))

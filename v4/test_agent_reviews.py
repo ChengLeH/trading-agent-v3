@@ -365,6 +365,113 @@ class NativeReviews(unittest.TestCase):
 class NativeGlobalFindingsPatch(NativeReviews):
     """P6 global material findings route through the canonical Claim patch repair."""
 
+    def _dependency_gap_sweep(self, workflow, batch_size=4):
+        with workflow.queue.transaction() as state:
+            runner = workflow._load(state)
+            runner.global_dependency_batch_size = batch_size
+            workflow._save(state, runner)
+        packet = self._reach_global(workflow)
+        for _ in range(12):
+            role = next(iter(packet['items']))
+            answer = self._global_response(workflow)
+            for row in answer['dependency_reviews']:
+                if row['claim_id'] == 'a':
+                    row['required_dependencies'] = ['independent']
+            outcome = workflow.submit(packet['packet_id'], {role: answer},
+                                      'host/same', packet['input_hash'])
+            if outcome['status'] == 'revision':
+                return outcome
+            self.assertEqual(outcome['status'], 'blocked:global_dependency_coverage', outcome)
+            packet = NativeReviewWorkflow(workflow.directory).next()
+        self.fail('dependency audit did not close')
+
+    def test_completed_dependency_gap_never_reissues_last_batch_and_patch_survives_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            workflow = self.bootstrap(root)
+            self._dependency_gap_sweep(workflow)
+            patch = NativeReviewWorkflow(workflow.directory).next()
+            self.assertEqual(patch.get('kind'), 'patch', patch)
+            for _ in range(3):
+                resumed = NativeReviewWorkflow(workflow.directory)
+                self.assertEqual(resumed.next()['packet_id'], patch['packet_id'])
+                with resumed.queue.transaction() as state:
+                    runner = resumed._load(state)
+                    self.assertIsNone(runner.pending_global)
+                    self.assertIsNone(runner.global_review_progress)
+                    self.assertIsNotNone(runner.pending_patch)
+                    with self.assertRaisesRegex(ValueError, 'pending claim repairs'):
+                        runner.prepare_phase6_global_sweep()
+            outcome = resumed.submit_patch(patch['packet_id'],
+                [dict(claim_id='a', dependencies=['independent'])], 'host/patcher', patch['input_hash'])
+            self.assertFalse(outcome.get('blocked'), outcome)
+            self.assertEqual(set(outcome['revalidate_claim_ids']), {'a','b','c'})
+            seen = []
+            for _ in range(20):
+                step = NativeReviewWorkflow(workflow.directory).next()
+                seen.append(step.get('kind') or step['status'])
+                if step['status'] == 'complete':
+                    break
+                if step['kind'] == 'global':
+                    output = {next(iter(step['items'])): self._global_response(workflow)}
+                else:
+                    self.assertEqual(step['kind'], 'atomic')
+                    output = {cid: response(cid, item) for cid,item in step['items'].items()}
+                resumed.submit(step['packet_id'], output, 'host/same', step['input_hash'])
+            else:
+                self.fail('dependency patch never reached a new clean global sweep')
+            self.assertIn('atomic', seen)
+            self.assertIn('global', seen)
+            self.assertEqual(seen[-1], 'complete')
+
+    def test_pending_patch_does_not_block_historical_global_replay(self):
+        with tempfile.TemporaryDirectory() as root:
+            workflow = self.bootstrap(root)
+            self._dependency_gap_sweep(workflow)
+            with workflow.queue.transaction() as state:
+                runner = workflow._load(state)
+                runner.prepare_phase6_revision_v4(runner.global_receipt['findings'])
+                workflow._save(state, runner)
+            resumed = NativeReviewWorkflow(workflow.directory)
+            patch = resumed.next()
+            self.assertEqual(patch.get('kind'), 'patch', patch)
+            self.assertEqual(patch['allowed_claim_ids'], ['a'])
+
+    def test_legacy_reissued_completion_packet_is_retired_after_verified_revision_close(self):
+        from copy import deepcopy
+        from uuid import uuid4
+        with tempfile.TemporaryDirectory() as root:
+            workflow = self.bootstrap(root)
+            self._dependency_gap_sweep(workflow)
+            with workflow.queue.transaction() as state:
+                last = [p for p in state['packets'].values() if p['kind'] == 'global'][-1]
+                duplicate = deepcopy(last)
+                duplicate.update(packet_id=uuid4().hex, received={}, retired=False)
+                state['packets'][duplicate['packet_id']] = duplicate
+                state['active_packet_id'] = duplicate['packet_id']
+            resumed = NativeReviewWorkflow(workflow.directory)
+            patch = resumed.next()
+            self.assertEqual(patch.get('kind'), 'patch', patch)
+            with workflow.queue.transaction() as state:
+                self.assertTrue(state['packets'][duplicate['packet_id']]['retired'])
+                self.assertEqual(state['packets'][duplicate['packet_id']]['retirement_reason'],
+                                 'global_round_already_closed_with_findings')
+
+    def test_pending_repair_still_requires_all_original_global_archives(self):
+        import json
+        with tempfile.TemporaryDirectory() as root:
+            workflow = self.bootstrap(root)
+            self._dependency_gap_sweep(workflow)
+            patch = NativeReviewWorkflow(workflow.directory).next()
+            self.assertEqual(patch['kind'], 'patch')
+            for path in (workflow.directory / 'responses' / 'archive').glob('*.json'):
+                if json.loads(path.read_text()).get('task_id') == 'global_dependency_completion':
+                    path.unlink()
+                    break
+            else:
+                self.fail('missing completion archive fixture')
+            with self.assertRaisesRegex(ValueError, 'verified raw response archive'):
+                NativeReviewWorkflow(workflow.directory).next()
+
     def _finding(self, runner, cid='a'):
         deps = next(c for c in runner.run.claims if c['claim_id'] == cid)['dependencies']
         return dict(claim_id=cid, category='semantic_conflict', issue='Fixture global conflict for test claim ' + cid,
