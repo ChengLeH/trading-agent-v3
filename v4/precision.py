@@ -106,3 +106,34 @@ def validate_presentation(assertion, source_value, source_unit):
             raise ValueError('presentation differs from explicit unit conversion and rounding')
     except InvalidOperation:
         raise ValueError('presentation precision is not representable') from None
+
+
+def validate_calculation_value(expected, actual, metadata):
+    """Recompute from identical canonical inputs, not uncertain source intervals.
+
+    A calculation may declare output rounding; absent that, only floating-point
+    representation error (one ULP) is allowed, never a global absolute epsilon.
+    """
+    expected_decimal, actual_decimal = number(expected), number(actual)
+    rounding = metadata.get('output_rounding')
+    if rounding is not None:
+        if (not isinstance(rounding, dict) or set(rounding) != {'decimal_places', 'rounding'}
+                or type(rounding['decimal_places']) is not int or not 0 <= rounding['decimal_places'] <= 18
+                or rounding['rounding'] not in {'half_up', 'half_even'}):
+            raise ValueError('output_rounding requires decimal_places(0..18) and half_up/half_even')
+        try:
+            expected_decimal = expected_decimal.quantize(Decimal(1).scaleb(-rounding['decimal_places']),
+                rounding=ROUND_HALF_UP if rounding['rounding'] == 'half_up' else ROUND_HALF_EVEN)
+        except InvalidOperation:
+            raise ValueError('calculation output rounding is not representable') from None
+        allowed = Decimal(0)
+    else:
+        allowed = Decimal(str(math.ulp(float(expected))))
+    legacy = metadata.get('tolerance')
+    if legacy is not None:
+        declared = number(legacy)
+        if declared < 0 or declared > allowed:
+            raise ValueError('arbitrary arithmetic tolerance is unsupported; declare output_rounding instead')
+        allowed = declared
+    if abs(expected_decimal - actual_decimal) > allowed:
+        raise ValueError(f'stored value differs from kernel result {expected}; output precision must be explicit')

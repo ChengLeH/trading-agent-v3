@@ -462,7 +462,10 @@ class Integration(unittest.TestCase):
                  assertion=dict(kind="event", event_ref=event["event_id"], is_aggregate=False),
                  bindings=[{k: event[k] for k in ("entity", "concept", "period", "unit", "scope", "basis")}])
         c["bindings"][0]["ref_id"] = event["event_id"]
-        r.orch.submit_batch(r.run_id, {"event_analyst": [c]})
+        with self.assertRaisesRegex(ValueError, 'event assertion requires a registered matching event'):
+            r.orch.submit_batch(r.run_id, {"event_analyst": [c]})
+        # Old checkpoints can still reach the final deterministic guard for repair.
+        r.orch.submit_batch(r.run_id, {"event_analyst": [c]}, validate_events=False)
         findings, blocked = r.orch.validate_stage(r.run_id, "final")
         self.assertTrue(blocked)
         self.assertTrue(any(f.get("check_id") == "event_binding" for f in findings))

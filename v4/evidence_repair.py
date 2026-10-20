@@ -115,6 +115,93 @@ def append_sources(workflow, manifest_path, *, reason):
                     findings_resolved=False)
 
 
+def _reopen_evidence_reviews(workflow, state, runner, retirement_reason):
+    """Preserve unresolved findings and archives while replacing their context."""
+    carry = deepcopy(runner.deferred_global_findings)
+    if runner.pending_patch:
+        carry.extend(deepcopy(runner.pending_patch['findings']))
+    by_id = {}
+    for finding in carry:
+        finding.setdefault('finding_id', 'recovery.' + digest(finding))
+        by_id[finding['finding_id']] = finding
+    runner.deferred_global_findings = list(by_id.values())
+    runner.pending_patch = runner.pending_global = runner.global_receipt = runner.global_review_progress = None
+    runner.pending_atomic = runner.pending_deep = None
+    runner.reference_supplements = {'atomic': {}, 'deep': {}}
+    runner._tasks()
+    runner.status = runner.run.stage = 'atomic'
+    for packet in state.get('packets', {}).values():
+        if not packet.get('retired'):
+            packet.update(retired=True, retirement_reason=retirement_reason)
+    state['active_packet_id'] = None
+    for key in ('role_candidates', 'role_errors', 'group_error', 'patch_prompt', 'accepted_links',
+                'link_blocked', 'patch_blocked', 'review_blocked', 'global_blocked'):
+        state.pop(key, None)
+
+
+def declare_financial_source(workflow, source_id, declarations, *, reason):
+    """Explicit extraction defaults, separate from the immutable source payload.
+
+    Row-level declarations still take precedence. This command cannot change
+    values, currencies, dates, or a fact's explicitly declared entity.
+    """
+    from .financial_statements import augment_financial_statements
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError('operator reason required')
+    if (not isinstance(declarations, dict) or not declarations or set(declarations) - {'entity', 'basis'}
+            or any(not isinstance(v, str) or not v.strip() for v in declarations.values())):
+        raise ValueError('declare nonempty entity and/or accounting basis only')
+    if declarations.get('basis', '').strip().casefold() in {'parent', 'consolidated', 'single_company', 'segment', 'unknown'}:
+        raise ValueError('declare an accounting framework, not a scope or unknown basis')
+    with workflow.queue.transaction() as state:
+        runner = workflow._load(state)
+        matches = [r for r in runner.run.records if getattr(r, 'id', None) == source_id
+                   and getattr(r, 'type', None) == 'openbb_fundamentals']
+        if len(matches) != 1:
+            raise ValueError('source_id must identify one financial statement source')
+        record = matches[0]
+        before_hash = runner._hash()
+        before = deepcopy(record.meta.get('financial_statement_declarations', {}))
+        after = {**before, **declarations}
+        if before == after:
+            return dict(status='financial_declarations_unchanged', input_hash=before_hash)
+        record.meta['financial_statement_declarations'] = after
+        augment_financial_statements(runner.run, dict(facts=0, limitations=[]))
+        # Declarations enter canonical/task hashes and the LLM context, even
+        # when a source has no newly extracted equity values.
+        _reopen_evidence_reviews(workflow, state, runner, 'financial_source_declarations_changed')
+        event = dict(source_id=source_id, before=before, after=after, reason=reason.strip(),
+                     before_hash=before_hash, after_hash=runner._hash(), verification_epoch=runner._verification_epoch)
+        state.setdefault('financial_declaration_changes', []).append(event)
+        workflow._save(state, runner)
+        return dict(status='financial_declarations_updated', findings_resolved=False, **event)
+
+
+def register_event_catalog(workflow, events, *, reason):
+    """Replace an explicit typed catalog; registration is not semantic acceptance."""
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError('operator reason required')
+    if not isinstance(events, list):
+        raise ValueError('event catalog must be a JSON array')
+    with workflow.queue.transaction() as state:
+        runner = workflow._load(state)
+        before_hash = runner._hash()
+        referenced = {ref for claim in runner.run.claims for ref in claim['refs']}
+        supplied = {row.get('event_id') for row in events if isinstance(row, dict)}
+        removed = (set(runner.run.events) - supplied).intersection(referenced)
+        if removed:
+            raise ValueError(f'cannot remove referenced events; patch their Claims first: {sorted(removed)}')
+        runner.orch.register_events(runner.run_id, events)
+        if runner._hash() == before_hash:
+            return dict(status='events_unchanged', input_hash=before_hash)
+        _reopen_evidence_reviews(workflow, state, runner, 'event_catalog_updated')
+        event = dict(event_ids=[row['event_id'] for row in events], reason=reason.strip(),
+                     before_hash=before_hash, after_hash=runner._hash())
+        state.setdefault('event_catalog_changes', []).append(event)
+        workflow._save(state, runner)
+        return dict(status='events_registered', findings_resolved=False, **event)
+
+
 def prepare_evidence_patch(workflow, claim_ids, *, reason):
     """Explicit main-Agent repair scope; never guess Claim IDs from prose."""
     if not isinstance(reason, str) or not reason.strip():

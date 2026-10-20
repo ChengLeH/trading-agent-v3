@@ -113,6 +113,8 @@ def permission_denied(diagnostic):
     # Only callers with a typed error/legacy notice may pass an envelope.
     # Bytes are the separate CLI stderr channel, never a serialized event.
     if isinstance(diagnostic, dict):
+        if diagnostic.get('status') not in (None, 'ERROR'):
+            return False
         code = diagnostic.get('error_code')
         if code is not None:
             return isinstance(code, str) and code.strip().casefold() == 'permission_denied'

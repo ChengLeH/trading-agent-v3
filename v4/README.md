@@ -402,3 +402,48 @@ Claim 修補後仍重驗 descendants 與 Global；`evidence_needed` 必須有新
 升級 financial-evidence/1 時，舊版收據與未完成的 Global 補審不作新版合格證明。
 舊 pending patch 的 findings、輪次與原始候選留存；未提交的舊角色包退役並保留候選／原始回覆紀錄，重新發出新契約工作包。
 已提交的 Claim、來源與修補歷史保留，恢復後先完成新版語義驗證；不需清空 run 或手改 hash。
+
+### Native 審查與來源修復入口
+
+審查預算分為單項 context（`review_batch_max_bytes`）與整包（`review_packet_max_bytes`）。
+Native 與直接執行均先保存可審項目的收據，超限項保持未驗證並列出 ID／實際 UTF-8 bytes；不截斷內容、不預設 PASS。
+`init` 可帶 `--review-batch-max-bytes`／`--review-packet-max-bytes`；既有 run 用正式入口調整，不能手改 agent-state/checkpoint：
+
+```sh
+python -m v4.agent_cli configure-reviews --work-dir RUN --review-batch-max-bytes 131072 --review-packet-max-bytes 262144 --reason "operator approved context capacity"
+```
+
+Claim 的 `kind=event` 只能綁定已註冊目錄事件，不能把新聞 evidence ID 當 event ID，或將一般新聞全部標成 aggregate。
+一般敘述可使用 `kind=text`；需要量化事件及合計關係時，主 Agent 提供完整 catalog：
+
+```sh
+python -m v4.agent_cli register-events --work-dir RUN --events events.json --reason "main Agent checked typed event evidence"
+```
+
+`events.json` 是完整 JSON array；欄位沿用 register_events 契約。新生成的錯誤 event binding 會提早拒收；
+舊 checkpoint 仍可載入，確定性 Claim finding 會轉局部修補，修後重驗 descendants，最後仍須 Global。
+註冊事件本身不代表語義已通過，原始候選與審查 archives 保留。
+
+財務 `basis` 是會計準則（例如 `gaap`／`ifrs`），`scope` 才是 `parent`／`consolidated`。
+同一來源已明示的 entity 可補足 legacy 空 entity；不以相近公司名猜別名、不跨主體／準則合併。
+來源中未明示 basis 時不猜 gaap。既有 run 需要操作者依證據明示 extraction defaults，可用：
+
+```sh
+python -m v4.agent_cli declare-financial-source --work-dir RUN --source-id SOURCE_ID --basis gaap --entity "Declared issuer name" --reason "operator verified statement metadata"
+```
+
+此命令只接受 entity/basis，將宣告保存於獨立 metadata 與修改紀錄，不覆寫原始來源 payload/hash 或數字。
+Row 的明示欄位仍優先，不會藉 source default 蓋掉衝突 row。宣告納入 canonical/task hash 與 LLM context；
+受影響收據失效，先完成重新驗證及必要 Claim patch，再做 Global。權益組成不再因缺 Assets/Liabilities 而被略過。
+
+算術重算不再有全域 `1e-4` 絕對容差；同輸入重算只容許浮點表示誤差。
+若 canonical calculation 故意儲存較粗輸出，須在該 calc 的 meta 明示
+`output_rounding: {decimal_places: 2, rounding: "half_up"}`（亦支援 half_even），不能用任意 tolerance 放過錯公式或數字。
+來源 precision 的誤差傳播仍用於不同捨入來源的財務恆等式；不拿來源不確定性合理化同輸入的錯算。
+
+Canonical renderer 逐字使用 Claim.text，不從壓縮摘要重建表格。外部重寫的投資摘要不是已驗收的 canonical report。
+Native `next` 回傳 `delivery_ready`／`verification_status`；sidecar 預設 unverified，只有完成目前版本 Global 並通過 final gate 才標 complete。
+Atomic 全 PASS 不代表整輪完成，不得將尚未完成的 Global 說成純形式關卡。
+
+CLI 診斷僅讀錯誤 envelope：stream interruption 支援明示代碼及有限的大小寫／空白／標點正規化；
+permission 判斷不再搜尋整個 step JSON，結構化 error_code 優先。未知錯誤仍保持未知，工具政策不放寬。

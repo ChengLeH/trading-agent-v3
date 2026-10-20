@@ -418,6 +418,12 @@ sys.stderr.flush()
             self.assertEqual(caught.exception.code, 'session_pending')
             self.assertEqual(json.loads((Path(root) / 'session.json').read_text())['last_error'], 'result_failed')
 
+    def test_success_result_ignores_stale_permission_error_field(self):
+        body = 'init()\nsys.stdin.readline()\nemit(' + repr(dict(event='result',result=dict(status='SUCCESS',
+            response='{"done":true}',error='permission that headless mode cannot prompt for'))) + ')\n'
+        with tempfile.TemporaryDirectory() as root, cli_stub(body) as exe:
+            self.assertEqual(json.loads(run_session(exe,'model','request',3,session_dir=root)),{'done':True})
+
     def test_tool_or_subagent_event_aborts_even_with_successful_looking_result(self):
         for step in (dict(step_type="tool", tool_name="run_command"),
                      dict(step_type="agent_response", tool_info={}), dict(subagent_info={})):

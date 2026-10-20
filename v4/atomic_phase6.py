@@ -112,6 +112,8 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
     evidence = _evidence_dict(run.evidence_store)
     events = getattr(run, "events", {})
     evidence_scope = _evidence_scope(run, facts, calcs, evidence, events)
+    from .financial_statements import source_declarations
+    declarations = source_declarations(run)
     claims = claim_index(run.claims)
     tasks: List[AtomicTask] = []
 
@@ -178,6 +180,7 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
             dependency_claims=deps,
             unresolved_refs=unresolved,
             context={"financial_review_contract": FINANCIAL_REVIEW_VERSION, "as_of": getattr(run, "manifest", {}).get("as_of"),
+                     **({'source_declarations': declarations} if declarations else {}),
                      **({"calculation_definitions": definitions} if definitions else {}),
                      **({'indicator_definitions': indicators} if indicators else {}),
                      "evidence_scope": deepcopy(evidence_scope),

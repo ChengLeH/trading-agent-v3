@@ -15,6 +15,120 @@ def response(cid, item, status='PASS'):
 
 
 class NativeReviews(unittest.TestCase):
+    def test_older_global_receipt_cannot_hide_new_deterministic_failure_or_block_diagnostics(self):
+        from unittest.mock import patch
+        from v3.facts import Fact
+        with tempfile.TemporaryDirectory() as root:
+            r=seeded()
+            for fid,value in [('now',2),('before',1)]:
+                r.run.fact_store.add(Fact(fid,value,'USD','FY2030',concept=fid,source_id='fixture'))
+            r.run.calc_store.add('old.rounded',1.00004,'growth',['now','before'],'RATIO')
+            source=Path(root)/'legacy.json';save_checkpoint(r,source)
+            w=NativeReviewWorkflow.from_checkpoint(source,Path(root)/'native')
+            # Simulate a receipt accepted by the former global 1e-4 policy.
+            with patch('v4.pipeline.calculation_findings',return_value=[]):
+                packet=self._reach_global(w)
+                w.submit(packet['packet_id'],{next(iter(packet['items'])):self._global_response(w)},
+                         'host/global',packet['input_hash'])
+                self.assertEqual(w.next()['status'],'complete')
+            current=NativeReviewWorkflow(w.directory).next()
+            self.assertEqual(current['status'],'blocked:deterministic',current)
+            self.assertFalse(current['delivery_ready'])
+            self.assertTrue(any(f['object_id']=='old.rounded' for f in current['findings']))
+
+    def test_legacy_invalid_event_routes_to_patch_instead_of_global_hard_wall(self):
+        with tempfile.TemporaryDirectory() as root:
+            r = seeded()
+            from v3.facts import Fact
+            r.run.fact_store.add(Fact('source.event', 5, 'USD', 'FY2026', concept='quantity', source_id='fixture'))
+            r.run.claims[0].update(refs=['source.event'],bindings=[dict(ref_id='source.event',
+                **{k:'unknown' for k in ('entity','concept','period','scope','unit','basis')})],
+                assertion=dict(kind='event',event_ref='source.event',is_aggregate=True))
+            source = Path(root) / 'legacy-event.json'; save_checkpoint(r, source)
+            w = NativeReviewWorkflow.from_checkpoint(source, Path(root) / 'native')
+            for _ in range(20):
+                packet = w.next()
+                if packet.get('kind') != 'atomic':
+                    break
+                w.submit(packet['packet_id'],{cid:response(cid,item) for cid,item in packet['items'].items()},
+                         'host/test',packet['input_hash'])
+            self.assertEqual(packet.get('kind'),'patch',packet)
+            self.assertEqual(packet['allowed_claim_ids'],['a'])
+            outcome = w.submit_patch(packet['packet_id'],[dict(claim_id='a',assertion=dict(kind='text'))],
+                                     'host/repair',packet['input_hash'])
+            self.assertFalse(outcome.get('blocked'),outcome)
+            packet = NativeReviewWorkflow(w.directory).next()
+            self.assertEqual(packet['kind'],'atomic')
+
+    def test_native_event_registration_is_transactional_and_survives_restart(self):
+        from .evidence_repair import register_event_catalog
+        with tempfile.TemporaryDirectory() as root:
+            w = self.bootstrap(root)
+            with w.queue.transaction() as state:
+                r=w._load(state)
+                from v3.facts import Fact
+                r.run.fact_store.add(Fact('source.quantity',5,'USD','FY2026',concept='quantity',source_id='fixture'))
+                w._save(state,r)
+                ref='source.quantity'
+            event=dict(event_id='catalog.event',date='2026-10-15',source_ref=ref,
+                entity='TEST',concept='quantity',period='FY2026',unit='USD',basis='reported',
+                scope='consolidated',value=5,is_aggregate=False)
+            changed=register_event_catalog(w,[event],reason='main Agent registered structured evidence')
+            self.assertEqual(changed['status'],'events_registered')
+            with w.queue.transaction() as state:
+                r=w._load(state)
+                self.assertEqual(r.run.events['catalog.event'],event)
+                r.run.claims[0].update(refs=['catalog.event'],assertion=dict(kind='event',event_ref='catalog.event',is_aggregate=False),
+                    bindings=[dict(ref_id='catalog.event',**{k:'unknown' for k in ('entity','concept','period','scope','unit','basis')})])
+                w._save(state,r)
+                before=state['input_hash']
+            with self.assertRaisesRegex(ValueError,'cannot remove referenced events'):
+                register_event_catalog(w,[],reason='must patch Claim before catalog removal')
+            with self.assertRaises(ValueError):
+                register_event_catalog(w,[{**event,'value':float('nan')}],reason='invalid candidate')
+            with w.queue.transaction() as state:
+                self.assertEqual(state['input_hash'],before)
+
+    def test_oversized_first_claim_does_not_starve_siblings_and_budget_is_resumable(self):
+        from .agent_reviews import configure_review_budget
+        with tempfile.TemporaryDirectory() as root:
+            r = seeded()
+            r.run.claims[0]['text'] = 'long evidence analysis ' * 6000
+            source = Path(root) / 'large.json'; save_checkpoint(r, source)
+            w = NativeReviewWorkflow.from_checkpoint(source, Path(root) / 'native')
+            accepted = []
+            for _ in range(20):
+                packet = NativeReviewWorkflow(w.directory).next()
+                if packet.get('blocked'):
+                    break
+                self.assertEqual(packet['kind'], 'atomic', packet)
+                self.assertNotIn('a', packet['items'])
+                accepted.extend(packet['items'])
+                w.submit(packet['packet_id'], {cid: response(cid, item) for cid,item in packet['items'].items()},
+                         'host/test', packet['input_hash'])
+            self.assertTrue(accepted)
+            self.assertEqual(packet['status'], 'blocked:review_context_budget')
+            self.assertIn('a', [x['claim_id'] for x in packet['oversized_items']])
+            changed = configure_review_budget(w, max_item_bytes=500000, max_packet_bytes=700000,
+                                             reason='operator approved larger review context')
+            self.assertEqual(changed['status'], 'review_budget_updated')
+            next_packet = NativeReviewWorkflow(w.directory).next()
+            self.assertIn('a', next_packet['items'])
+            self.assertFalse(set(accepted).intersection(next_packet['items']))
+
+    def test_cli_review_budget_flags_are_available_without_changing_claim_hash(self):
+        from .agent_cli import main
+        with tempfile.TemporaryDirectory() as root:
+            w = self.bootstrap(root)
+            with w.queue.transaction() as state:
+                before = state['input_hash']
+            self.assertEqual(main(['configure-reviews','--work-dir',str(w.directory),
+                '--review-batch-max-bytes','131072','--review-packet-max-bytes','262144',
+                '--reason','approved context budget']),0)
+            with w.queue.transaction() as state:
+                self.assertEqual(state['input_hash'],before)
+                self.assertEqual(w._load(state).review_batch_max_bytes,131072)
+                self.assertTrue(state['review_budget_changes'])
     def bootstrap(self, root, extra=False):
         runner = seeded()
         if extra:

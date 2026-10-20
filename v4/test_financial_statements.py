@@ -31,6 +31,34 @@ def run_for(rows, company="ZZZ"):
 
 
 class FinancialStatementTests(unittest.TestCase):
+    def test_source_declared_company_identity_joins_legacy_without_mutating_facts(self):
+        run=run_for([dict(fiscal_year=2030,parent_equity=70,consolidated_equity=80,
+            non_redeemable_nci=10,redeemable_nci=0)],company='Example Issuer Inc.')
+        augment_financial_statements(run,dict(facts=0,limitations=[]))
+        before=deepcopy(run.fact_store.to_dict())
+        rows=financial_statement_findings(run)
+        self.assertEqual({r['check_id']:r['status'] for r in rows if r['check_id'].endswith('_identity')},
+            dict(balance_sheet_identity='PASS',equity_attribution_identity='PASS'))
+        self.assertEqual(run.fact_store.to_dict(),before)
+
+    def test_equity_identity_is_independent_of_assets_and_liabilities_coverage(self):
+        run=run_for([dict(fiscal_year=2030,parent_equity=70,consolidated_equity=84,
+            non_redeemable_nci=10,redeemable_nci=0)])
+        run.fact_store=FactStore()
+        augment_financial_statements(run,dict(facts=0,limitations=[]))
+        rows=financial_statement_findings(run)
+        self.assertTrue(any(r['check_id']=='equity_attribution_identity' and r['status']=='FAIL' for r in rows),rows)
+        self.assertTrue(any(r['check_id']=='balance_sheet_identity_coverage' for r in rows),rows)
+
+    def test_scope_word_is_not_promoted_to_accounting_basis(self):
+        run=run_for([dict(fiscal_year=2030,parent_equity=70,consolidated_equity=80,
+            non_redeemable_nci=10,redeemable_nci=0)])
+        run.records[0].payload['financial_statement_metadata']['basis']='consolidated'
+        augment_financial_statements(run,dict(facts=0,limitations=[]))
+        rows=financial_statement_findings(run)
+        self.assertFalse(any(r['check_id']=='balance_sheet_identity' for r in rows))
+        self.assertTrue(any(r['check_id']=='financial_basis_scope_conflict' for r in rows),rows)
+
     def test_parent_equity_identity_handles_negative_nci_zero_redeemable_and_scale(self):
         cases = [
             ("A", 2028, 10_000_000, 2_000_000, -100_000, 0),

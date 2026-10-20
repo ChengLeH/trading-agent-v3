@@ -102,11 +102,8 @@ def calculation_findings(run):
         }
         if kind in operations:
             got = operations[kind]()
-            tolerance = meta.get("tolerance", 1e-4)
-            if not isinstance(tolerance, (int, float)) or not 0 <= tolerance <= 1e-4:
-                raise ValueError("invalid arithmetic tolerance")
-            if abs(got - c["value"]) > tolerance:
-                raise ValueError(f"{cid}: stored value differs from kernel result {got}")
+            from .precision import validate_calculation_value
+            validate_calculation_value(got, c['value'], meta)
         else:
             # Unsupported operations retain a visible limitation; never
             # claim deterministic proof. Semantic review receives the inputs.
@@ -244,7 +241,7 @@ class OrchestratorV4(Orchestrator):
                         for role, claims in grouped.items()}
         run.packets.clear()
 
-    def submit_batch(self, run_id, claims_by_role):
+    def submit_batch(self, run_id, claims_by_role, *, validate_events=True):
         run = self.runs[run_id]
         incoming = []
         for role, claims in claims_by_role.items():
@@ -265,6 +262,12 @@ class OrchestratorV4(Orchestrator):
         if set(sources).intersection(index):
             raise ValueError("claim/source ID collision")
         for c in incoming:
+            assertion = c['assertion']
+            if validate_events and assertion['kind'] == 'event':
+                event = run.events.get(assertion['event_ref'])
+                if event is None or event['is_aggregate'] != assertion['is_aggregate']:
+                    raise ClaimReferenceError(c, 'event_binding_mismatch', 'assertion.event_ref',
+                        [assertion['event_ref']], 'event assertion requires a registered matching event; register-events or repair assertion')
             unknown = set(c["refs"]) - sources.keys() - index.keys()
             if unknown:
                 raise ClaimReferenceError(c, "unknown_reference_ids", "refs", unknown, "unknown refs")
@@ -424,6 +427,10 @@ class OrchestratorV4(Orchestrator):
 
     def snapshot(self, run_id):
         snap = super().snapshot(run_id)
+        from .financial_statements import source_declarations
+        declarations = source_declarations(self.runs[run_id])
+        if declarations:
+            snap['source_declarations'] = declarations
         snap["events"] = self.runs[run_id].events
         snap['indicator_definitions'] = indicator_definitions(snap['facts'])
         snap['issuer_identity'] = [deepcopy(rec.meta['issuer_identity']) for rec in self.runs[run_id].records

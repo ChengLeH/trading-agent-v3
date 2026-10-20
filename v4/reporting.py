@@ -41,6 +41,8 @@ def render_report(snapshot):
                    sections=sections, claims=claims, facts=snapshot["facts"],
                    calcs=snapshot["calcs"], evidence=snapshot["evidence"],
                    events=snapshot.get("events", {}), trade=snapshot.get("trade", {}),
+                   source_declarations=snapshot.get('source_declarations', {}),
                    indicator_definitions=methods, issuer_identity=snapshot.get('issuer_identity', []), ingestion_diagnostics=snapshot.get('ingestion_diagnostics', []),
+                   verification=dict(status='unverified', delivery_ready=False, global_review_complete=False),
                    report_hash=digest(report), total_claims=len(claims))
     return dict(report_markdown=report, sidecar=sidecar)

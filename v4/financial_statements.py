@@ -43,6 +43,12 @@ def _diagnostic(record, section, row, status, check_id, reason, **extra):
                 section=section, row=row, reason=reason, **extra)
 
 
+def source_declarations(run):
+    return {rec.id: deepcopy(rec.meta['financial_statement_declarations'])
+            for rec in getattr(run, 'records', [])
+            if getattr(rec, 'meta', {}).get('financial_statement_declarations')}
+
+
 def extract_financial_statements(record):
     """Return explicit equity facts and source coverage diagnostics.
 
@@ -64,6 +70,7 @@ def extract_financial_statements(record):
                                 "financial_metadata and financial_statement_metadata disagree; using financial_statement_metadata")]
     else:
         findings = []
+    metadata = {**metadata, **getattr(record, 'meta', {}).get('financial_statement_declarations', {})}
     facts, coverage = [], []
     for section in ("income", "balance"):
         rows = payload.get(section, [])
@@ -94,6 +101,10 @@ def extract_financial_statements(record):
                     findings.append(_diagnostic(record, section, index, "WARN", "financial_field_section",
                         "equity attribution fields appear in the income statement section", fields=misplaced))
             declared_precision = row.get("precision", metadata.get("precision"))
+            declared_basis = row.get('basis', metadata.get('basis', 'unknown'))
+            if isinstance(declared_basis, str) and declared_basis.strip().casefold() in {'parent', 'consolidated', 'single_company', 'segment'}:
+                findings.append(_diagnostic(record, section, index, 'WARN', 'financial_basis_scope_conflict',
+                    'basis describes an accounting framework; declare scope separately, never infer gaap from a scope label'))
             if declared_precision is not None and (type(declared_precision) not in (int, float)
                                                     or not math.isfinite(declared_precision)
                                                     or declared_precision < 0):
@@ -223,15 +234,17 @@ def financial_statement_findings(run):
         diag = getattr(rec, "meta", {}).get("financial_statement_extraction", {})
         out.extend(deepcopy(diag.get("findings", [])))
     facts = run.fact_store.to_dict()
-    record_entity = {rec.id: getattr(rec, "subject_ticker", "") for rec in getattr(run, "records", []) if hasattr(rec, "id")}
     by_key = {}
     for fid, f in facts.items():
         if f.get("concept") in {"Assets", "Liabilities", *ALIASES.keys()}:
-            entity = f.get("entity") or record_entity.get(f.get("source_id"), "")
-            key = (entity, f.get("period"), f.get("unit"), f.get("basis"))
+            entity = f.get('entity') or _source_entity(run, f)
+            basis = f.get('basis')
+            if isinstance(basis, str):
+                basis = basis.strip().casefold()
+            key = (entity, f.get("period"), f.get("unit"), basis)
             by_key.setdefault(key, {}).setdefault(f["concept"], []).append((fid, f))
     for key, group in by_key.items():
-        if not key[0] or not key[2] or not key[3] or key[3] == "unknown":
+        if not key[0] or not key[2] or not key[3] or key[3] in {'unknown', 'parent', 'consolidated', 'single_company', 'segment'}:
             out.append(dict(status="WARN", check_id="balance_sheet_identity_coverage",
                 entity=key[0], period=key[1], reason="identity not evaluated: entity, unit, or accounting basis is unknown"))
             continue
@@ -249,11 +262,6 @@ def financial_statement_findings(run):
         consolidated = group.get("ConsolidatedEquity", [None])[0]
         nci = group.get("NonRedeemableNCI", [None])[0]
         redeemable = group.get("RedeemableNCI", [None])[0]
-        if not assets or not liabilities:
-            if assets or liabilities:
-                out.append(dict(status="WARN", check_id="balance_sheet_identity_coverage",
-                    entity=key[0], period=key[1], reason="identity not evaluated: Assets and Liabilities are not both available with matching unit and basis"))
-            continue
         if not redeemable:
             out.append(dict(status='WARN', check_id='balance_sheet_identity_coverage',
                 entity=key[0], period=key[1], reason='identity not evaluated: redeemable NCI is not provided; missing is not zero'))
@@ -272,6 +280,12 @@ def financial_statement_findings(run):
                 'ConsolidatedEquity = ParentEquity + NonRedeemableNCI' +
                 (' + RedeemableNCI' if inclusion == 'consolidated_equity' else ''),
                 'equity_attribution_identity'))
+        if not assets or not liabilities:
+            out.append(dict(status='WARN', check_id='balance_sheet_identity_coverage',
+                entity=key[0], period=key[1], basis=key[3],
+                available_components=sorted(group),
+                reason='identity not evaluated: Assets and Liabilities are not both available with matching entity, unit and basis'))
+            continue
         if consolidated and redeemable:
             components = [liabilities, consolidated] + ([redeemable] if inclusion == 'separate' else [])
             equation = 'Assets = Liabilities + ConsolidatedEquity' + (' + RedeemableNCI' if inclusion == 'separate' else '')
@@ -290,6 +304,30 @@ def financial_statement_findings(run):
             continue
         out.append(_identity_result(run, key, assets, components, equation, 'balance_sheet_identity'))
     return out
+
+
+def _source_entity(run, fact):
+    """Fill only a missing entity from its own typed source, never alias names.
+
+    Legacy builders omit entity. A declaration on that exact source/row also
+    governs its legacy components; an explicit fact entity is never replaced.
+    """
+    for rec in getattr(run, 'records', []):
+        if getattr(rec, 'id', None) != fact.get('source_id'):
+            continue
+        payload = getattr(rec, 'payload', {})
+        metadata = payload.get('financial_statement_metadata', payload.get('financial_metadata', {}))
+        metadata = metadata if isinstance(metadata, dict) else {}
+        metadata = {**metadata, **getattr(rec, 'meta', {}).get('financial_statement_declarations', {})}
+        index = _source_row_index(fact.get('source_pointer', ''))
+        rows = payload.get('balance', [])
+        row = rows[index] if isinstance(rows, list) and index is not None and index < len(rows) else {}
+        if isinstance(row, dict) and row.get('fiscal_year') == fact.get('fiscal_year'):
+            entity = row.get('entity') or metadata.get('entity')
+        else:
+            entity = metadata.get('entity')
+        return entity if isinstance(entity, str) and entity.strip() else getattr(rec, 'subject_ticker', '')
+    return ''
 
 
 def _coverage(run, fact):

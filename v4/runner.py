@@ -58,7 +58,9 @@ refs 的來源 ID 與 Claim ID 是不同類型：來源以 facts/calcs/evidence/
 所有提供的 binding 欄位 ref_id/entity/concept/period/scope/unit/basis 均必填；
 來源不具備的維度明寫 unknown，不得猜。保留原始 Fact 的 share_basis/effective_date 與 provenance。
 assertion 是結構化斷言，至少有 kind；若 kind=value，填 ref_id/value；
-若 kind=event，填 event_ref/is_aggregate，並在 refs 與 binding 中列出事件。
+若 kind=event，event_ref 只能選 events 目錄已註冊的 event_id，is_aggregate 必須與該事件相同；並在 refs 與 binding 中列出事件。
+一般新聞敘述不需要量化事件結構時可用 kind=text；evidence ID 不是 event_id，不得把所有新聞預設為 aggregate。
+需要新事件時由主 Agent 先 register-events 註冊結構化事件，不能自行假造目錄 ID。
 不允許 Markdown 成為正式狀態。text 僅作人類閱讀，所有後續角色依賴 Claim 物件。
 輸出 JSON object：{"claims":[{"claim_id":"角色.唯一ID","text":"完整論述",
 "claim_type":"source_fact|derived_fact|semantic_fact|interpretation|forecast|trade_assumption",
@@ -192,7 +194,10 @@ class PipelineRunnerV4:
 
     def _state(self):
         s = self.orch.snapshot(self.run_id)
+        from .financial_statements import source_declarations
+        declarations = source_declarations(self.run)
         return {**{k: s.get(k) for k in ("claims", "facts", "calcs", "evidence", "events", "trade", "as_of")},
+                **({'source_declarations': declarations} if declarations else {}),
                 "financial_review_contract": FINANCIAL_REVIEW_VERSION}
 
     def _hash(self):
@@ -501,7 +506,7 @@ class PipelineRunnerV4:
         self.status = "atomic"
         return dict(phase6_ready=True, blocked=False, next_action="prepare_phase6_atomic")
 
-    def prepare_phase6_atomic(self):
+    def prepare_phase6_atomic(self, *, enforce_budget=True):
         tasks = self._tasks()
         if not tasks:
             raise ValueError("cannot verify an empty claim graph")
@@ -512,19 +517,28 @@ class PipelineRunnerV4:
         requests = {cid: self._reference_review_request(tasks[cid], "atomic") for cid in pending}
         prompts = [(cid, request[0]) for cid, request in requests.items()]
         schemas = {cid: request[1] for cid, request in requests.items()}
-        self._check_review_budget(prompts, schemas)
+        if enforce_budget:
+            self._check_review_budget(prompts, schemas)
         return dict(atomic_prompts=prompts,
                     claim_count=len(pending), total_claim_count=len(tasks), binding_findings=findings,
                     response_contract=SEMANTIC_REVIEW_CONTRACT,
                     response_schemas=schemas)
 
     def _check_review_budget(self, prompts, schemas):
+        oversized = self._oversized_reviews(prompts, schemas)
+        if oversized:
+            row = oversized[0]
+            raise ValueError(f"review_context_too_large: {row['claim_id']} has {row['wire_bytes']} UTF-8 bytes; "
+                             f"budget={self.review_batch_max_bytes}; provide scoped structured evidence")
+
+    def _oversized_reviews(self, prompts, schemas):
+        oversized = []
         for cid, prompt in prompts:
             wire = structured_prompt(prompt, json.dumps(schemas[cid], ensure_ascii=False, separators=(",", ":")))
             size = len(wire.encode("utf-8"))
             if size > self.review_batch_max_bytes:
-                raise ValueError(f"review_context_too_large: {cid} has {size} UTF-8 bytes; "
-                                 f"budget={self.review_batch_max_bytes}; provide scoped structured evidence")
+                oversized.append(dict(claim_id=cid, wire_bytes=size, budget_bytes=self.review_batch_max_bytes))
+        return oversized
 
     def _review_requests(self, prompts, layer):
         tasks = self._tasks()
@@ -703,7 +717,7 @@ class PipelineRunnerV4:
             require_model_identity(receipt.get("model"))
         return tasks
 
-    def prepare_phase6_deep_review(self, claim_ids=None):
+    def prepare_phase6_deep_review(self, claim_ids=None, *, enforce_budget=True):
         tasks = self._require_atomic()
         eligible = [cid for cid in tasks if self.receipts[cid]["result"]["verdict"] != "PASS"]
         wanted = eligible if claim_ids is None else id_list(list(claim_ids), "deep claim IDs")
@@ -714,7 +728,8 @@ class PipelineRunnerV4:
             tasks[cid], "deep", first_review=self.receipts[cid]["result"]) for cid in wanted}
         prompts = [(cid, request[0]) for cid, request in requests.items()]
         schemas = {cid: request[1] for cid, request in requests.items()}
-        self._check_review_budget(prompts, schemas)
+        if enforce_budget:
+            self._check_review_budget(prompts, schemas)
         return dict(deep_prompts=prompts, deep_review_claim_ids=wanted,
                     response_contract=SEMANTIC_REVIEW_CONTRACT,
                     response_schemas=schemas)
@@ -936,7 +951,7 @@ class PipelineRunnerV4:
                     findings=deepcopy(self.pending_patch["findings"]),
                     allowed_claim_ids=list(self.pending_patch["ids"]))
 
-    def collect_phase6_revision(self, patches, *, include_dependents=False):
+    def collect_phase6_revision(self, patches, *, include_dependents=False, enforce_budget=True):
         if type(include_dependents) is not bool:
             raise ValueError("include_dependents must be boolean")
         pending = self.pending_patch
@@ -1006,7 +1021,7 @@ class PipelineRunnerV4:
         self.pending_patch = None
         self.status = self.run.stage = "atomic"
         self._persist()
-        return dict(revalidate_claim_ids=affected, **self.prepare_phase6_atomic())
+        return dict(revalidate_claim_ids=affected, **self.prepare_phase6_atomic(enforce_budget=enforce_budget))
 
     def _ready_for_global(self):
         self._require_complete_roles()
@@ -1383,6 +1398,8 @@ class PipelineRunnerV4:
         rendered["sidecar"].update(atomic_reviews=deepcopy(self.receipts), deep_reviews=deepcopy(self.deep_receipts),
                                     global_review=deepcopy(self.global_receipt), revision_history=deepcopy(self.history),
                                     deterministic_findings=findings)
+        rendered['sidecar']['verification'] = dict(status='complete', delivery_ready=True,
+            canonical_state_hash=self._hash(), global_review_complete=True)
         self.status = self.run.stage = "complete"
         self._persist()
         return {**rendered, "blocked": False, "status": "complete"}
@@ -1429,6 +1446,11 @@ class PipelineRunnerV4:
 
     def _execute_review_batch(self, client, prompts, collector, *, layer="atomic"):
         require_model_identity(client.identity)
+        tasks = self._tasks()
+        schemas = {cid:self._reference_review_schema(tasks[cid], layer) for cid,_ in prompts}
+        oversized = self._oversized_reviews(prompts, schemas)
+        excluded = {row['claim_id'] for row in oversized}
+        prompts = [(cid,prompt) for cid,prompt in prompts if cid not in excluded]
         for cid, _ in prompts:
             self._latest_review_sources[layer].pop(cid, None)
         for cid, _ in prompts:
@@ -1445,6 +1467,16 @@ class PipelineRunnerV4:
                 single_prompts = [(cid, prompt) for cid, prompt in prompts if cid in supplements]
                 batched_requests = [dict(request, _batched=True)
                                     for request in self._review_requests(batchable_prompts, layer)]
+                prompt_index = dict(prompts)
+                bounded = []
+                for request in batched_requests:
+                    wire = structured_prompt(request['prompt'], json.dumps(request['response_schema'],
+                        ensure_ascii=False, separators=(',', ':')))
+                    if len(wire.encode('utf-8')) > self.review_batch_max_bytes:
+                        single_prompts.extend((cid, prompt_index[cid]) for cid in request['claim_ids'])
+                    else:
+                        bounded.append(request)
+                batched_requests = bounded
             else:
                 single_prompts = prompts
             requests = batched_requests + [
@@ -1481,6 +1513,13 @@ class PipelineRunnerV4:
                     self._record_review_progress(received, client, layer, sources)
             if errors:
                 raise errors[0]
+            if oversized:
+                self.status = 'blocked:review_context_budget'
+                self._persist()
+                return dict(blocked=True, status=self.status, oversized_items=oversized,
+                    reason=f'review_context_too_large: {len(oversized)} items exceed the declared byte budget',
+                    accepted_claim_ids=sorted(self.receipts if layer == 'atomic' else self.deep_receipts),
+                    next_action='increase_review_byte_budget_or_reduce_structured_context')
             summary = collector(results, model_identity=client.identity)
             if not summary.get("needs_retry"):
                 return summary
@@ -1508,13 +1547,13 @@ class PipelineRunnerV4:
                 if cid in self._restored_receipt_ids["deep"] and receipt["model"] != deep_reviewer.identity:
                     self.deep_receipts.pop(cid, None)
             while True:
-                prepared = self.prepare_phase6_atomic()
+                prepared = self.prepare_phase6_atomic(enforce_budget=False)
                 summary = self._execute_review_batch(verifier, prepared["atomic_prompts"], self.collect_phase6_atomic)
                 if summary["blocked"]:
                     return summary
                 eligible = [cid for cid in summary["deep_review_claim_ids"] if cid not in self.deep_receipts]
                 if eligible:
-                    deep = self.prepare_phase6_deep_review(eligible)
+                    deep = self.prepare_phase6_deep_review(eligible, enforce_budget=False)
                     result = self._execute_review_batch(deep_reviewer, deep["deep_prompts"], self.collect_phase6_deep_review, layer="deep")
                     if result["blocked"]:
                         return result

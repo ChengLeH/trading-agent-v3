@@ -7,6 +7,48 @@ from .test_integration import seeded, claim
 
 
 class PrecisionContracts(unittest.TestCase):
+    def test_direct_driver_saves_small_review_siblings_before_budget_block(self):
+        from .test_integration import CloudDouble
+        r=seeded()
+        r.run.claims[0]['text']='large synthesis ' * 10000
+        client=CloudDouble()
+        outcome=r.execute_phase6(client,client,client,client)
+        self.assertEqual(outcome['status'],'blocked:review_context_budget',outcome)
+        self.assertTrue(r.receipts)
+        self.assertNotIn('a',r.receipts)
+        self.assertIn('a',[row['claim_id'] for row in outcome['oversized_items']])
+
+    def test_canonical_renderer_cannot_certify_a_report_without_global_receipt(self):
+        from .reporting import render_report
+        from .test_integration import review_all, global_verdict
+        r=seeded()
+        rendered=render_report(r.orch.snapshot(r.run_id))
+        self.assertFalse(rendered['sidecar']['verification']['delivery_ready'])
+        self.assertTrue(all(c['text'] in rendered['report_markdown'] for c in r.run.claims))
+        review_all(r)
+        with self.assertRaises(ValueError): r.finalize()
+        r.prepare_phase6_global_sweep()
+        r.collect_phase6_global_sweep(global_verdict(r), model_identity='host/global')
+        final=r.finalize()
+        self.assertEqual(final['sidecar']['verification']['status'],'complete')
+        self.assertTrue(final['sidecar']['verification']['global_review_complete'])
+
+    def test_arithmetic_precision_is_explicit_not_a_global_absolute_allowance(self):
+        from v3.facts import CalcStore
+        from .pipeline import calculation_findings
+        from types import SimpleNamespace
+        store=FactStore()
+        for fid,value in [('current',123.456),('prior',100)]:
+            store.add(Fact(fid,value,'USD','FY2030',concept='Revenue',source_id='fixture'))
+        def check(value, meta=None):
+            calcs=CalcStore();calcs.add('growth',value,'growth',['current','prior'],'RATIO',meta)
+            return calculation_findings(SimpleNamespace(fact_store=store,calc_store=calcs))
+        self.assertTrue(any(r['status']=='FAIL' for r in check(.23460)))
+        self.assertFalse(check(.23456))
+        self.assertFalse(check(.23,dict(output_rounding=dict(decimal_places=2,rounding='half_up'))))
+        self.assertTrue(any(r['status']=='FAIL' for r in check(.24,dict(output_rounding=dict(decimal_places=2,rounding='half_up')))))
+        self.assertTrue(any(r['status']=='FAIL' for r in check(.24,dict(tolerance=100))))
+
     def fixture(self, value=1234560, unit='USD'):
         store = FactStore()
         store.add(Fact('source.amount', value, unit, 'FY2025', concept='Revenue',
@@ -173,6 +215,46 @@ class SemanticContextContracts(unittest.TestCase):
 
 
 class FreshFinancialIntegration(unittest.TestCase):
+    def test_native_source_declaration_repairs_identity_without_rewriting_raw_source(self):
+        import tempfile
+        from .test_agent_reviews import NativeReviews
+        from .evidence_repair import declare_financial_source
+        from v3.sources import SourceRecord
+        from .financial_statements import augment_financial_statements, financial_statement_findings
+        with tempfile.TemporaryDirectory() as root:
+            w=NativeReviews().bootstrap(root)
+            payload=dict(income=[],balance=[dict(fiscal_year=2030,parent_equity=70,
+                consolidated_equity=80,nonredeemable_nci=10,redeemable_nci=0)],
+                financial_statement_metadata=dict(unit='USD',basis='consolidated',entity='Example Inc.',redeemable_nci_inclusion='separate'))
+            with w.queue.transaction() as state:
+                r=w._load(state)
+                rec=SourceRecord('filing','openbb_fundamentals','TEST',None,payload,'original-hash')
+                r.run.records.append(rec)
+                for concept,value in [('Assets',100),('Liabilities',20)]:
+                    r.run.fact_store.add(Fact(concept,value,'USD','FY2030',concept=concept,basis='gaap',
+                        source_id='filing',source_hash='original-hash'))
+                augment_financial_statements(r.run,dict(facts=0,limitations=[]))
+                w._save(state,r);before=state['input_hash']
+            harness=NativeReviews()
+            packet=harness._reach_global(w)
+            w.submit(packet['packet_id'],{next(iter(packet['items'])):harness._global_response(w)},
+                'host/global',packet['input_hash'])
+            self.assertEqual(w.next()['status'],'complete')
+            result=declare_financial_source(w,'filing',dict(basis='gaap'),reason='operator verified accounting framework')
+            self.assertNotEqual(result['after_hash'],before)
+            with w.queue.transaction() as state:
+                r=w._load(state)
+                self.assertEqual(r.run.records[0].payload,payload)
+                self.assertEqual(r.run.records[0].source_hash,'original-hash')
+                rows=financial_statement_findings(r.run)
+                self.assertTrue(any(x['check_id']=='balance_sheet_identity' and x['status']=='PASS' for x in rows),rows)
+                self.assertFalse(r.receipts)
+                self.assertIsNone(r.global_receipt)
+                self.assertIn('source_declarations',r._tasks()['a'].context)
+            self.assertEqual(w.next()['kind'],'atomic')
+            with self.assertRaises(ValueError):
+                declare_financial_source(w,'filing',dict(basis='consolidated'),reason='bad declaration')
+
     def test_new_fields_survive_real_adapter_and_reach_validation_and_packets(self):
         import json
         import tempfile

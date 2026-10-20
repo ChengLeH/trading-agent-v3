@@ -42,6 +42,14 @@ def main(argv=None):
     init.add_argument("--work-dir", required=True)
     init.add_argument('--role-prompt-budget-bytes', type=int, default=None,
                       help='advisory UTF-8 budget per role; never truncates source evidence')
+    init.add_argument('--review-batch-max-bytes', type=int, default=None)
+    init.add_argument('--review-packet-max-bytes', type=int, default=None)
+
+    budgets = sub.add_parser('configure-reviews', help='change review delivery byte limits on an existing run')
+    budgets.add_argument('--work-dir', required=True)
+    budgets.add_argument('--review-batch-max-bytes', type=int, default=None)
+    budgets.add_argument('--review-packet-max-bytes', type=int, default=None)
+    budgets.add_argument('--reason', required=True)
 
     nxt = sub.add_parser("next", help="show the current outstanding packet")
     nxt.add_argument("--work-dir", required=True)
@@ -98,6 +106,18 @@ def main(argv=None):
     evidence.add_argument("--manifest", required=True)
     evidence.add_argument("--reason", required=True)
 
+    events = sub.add_parser('register-events', help='replace the explicit typed event catalog; never infer from prose')
+    events.add_argument('--work-dir', required=True)
+    events.add_argument('--events', required=True, help='JSON array of the complete event catalog')
+    events.add_argument('--reason', required=True)
+
+    declaration = sub.add_parser('declare-financial-source', help='explicit source extraction defaults; never change raw values')
+    declaration.add_argument('--work-dir', required=True)
+    declaration.add_argument('--source-id', required=True)
+    declaration.add_argument('--entity')
+    declaration.add_argument('--basis')
+    declaration.add_argument('--reason', required=True)
+
     evidence_patch = sub.add_parser("repair-evidence", help="request Claim patches after new evidence and atomic review")
     evidence_patch.add_argument("--work-dir", required=True)
     evidence_patch.add_argument("--claim-id", action="append", required=True)
@@ -106,6 +126,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "init":
+            if any(v is not None and v < 1024 for v in
+                   (args.review_batch_max_bytes, args.review_packet_max_bytes)):
+                raise ValueError('review byte budgets must be >=1024')
             if args.role_prompt_budget_bytes is not None and args.role_prompt_budget_bytes < 1024:
                 raise ValueError('role prompt budget must be >=1024')
             if args.checkpoint is not None:
@@ -115,6 +138,10 @@ def main(argv=None):
                 if not source.is_file():
                     raise ValueError(f"checkpoint not found: {source}")
                 instance = NativeReviewWorkflow.from_checkpoint(source, args.work_dir)
+                if args.review_batch_max_bytes is not None or args.review_packet_max_bytes is not None:
+                    from .agent_reviews import configure_review_budget
+                    configure_review_budget(instance, max_item_bytes=args.review_batch_max_bytes,
+                        max_packet_bytes=args.review_packet_max_bytes, reason='declared at native init')
                 if args.role_prompt_budget_bytes is not None:
                     with instance.queue.transaction() as state:
                         state.setdefault('options', {})['role_prompt_budget_bytes'] = args.role_prompt_budget_bytes
@@ -125,16 +152,34 @@ def main(argv=None):
             if not source.is_file():
                 raise ValueError(f"manifest not found: {source}")
             instance = NativeReviewWorkflow.from_manifest(source, args.work_dir, ticker=args.ticker)
+            if args.review_batch_max_bytes is not None or args.review_packet_max_bytes is not None:
+                from .agent_reviews import configure_review_budget
+                configure_review_budget(instance, max_item_bytes=args.review_batch_max_bytes,
+                    max_packet_bytes=args.review_packet_max_bytes, reason='declared at native init')
             if args.role_prompt_budget_bytes is not None:
                 with instance.queue.transaction() as state:
                     state.setdefault('options', {})['role_prompt_budget_bytes'] = args.role_prompt_budget_bytes
             _emit(dict(ok=True, status="initialized", work_dir=str(args.work_dir),
                        source_manifest=str(source)))
             return 0
+        if args.command == 'configure-reviews':
+            from .agent_reviews import configure_review_budget
+            return _result_exit(configure_review_budget(NativeReviewWorkflow(args.work_dir),
+                max_item_bytes=args.review_batch_max_bytes, max_packet_bytes=args.review_packet_max_bytes,
+                reason=args.reason))
         if args.command == "restore-secondary":
             from .agent_dispatch import restore_secondary_availability
             changed = restore_secondary_availability(NativeReviewWorkflow(args.work_dir), args.identity, reason=args.reason)
             return _result_exit(dict(status="secondary_restored" if changed else "secondary_not_disabled", identity=args.identity))
+        if args.command == 'declare-financial-source':
+            from .evidence_repair import declare_financial_source
+            values = {k:v for k,v in dict(entity=args.entity,basis=args.basis).items() if v is not None}
+            return _result_exit(declare_financial_source(NativeReviewWorkflow(args.work_dir), args.source_id,
+                values, reason=args.reason))
+        if args.command == 'register-events':
+            from .evidence_repair import register_event_catalog
+            return _result_exit(register_event_catalog(NativeReviewWorkflow(args.work_dir),
+                json.loads(Path(args.events).read_text(encoding='utf-8')), reason=args.reason))
         if args.command == "add-evidence":
             from .evidence_repair import append_sources
             return _result_exit(append_sources(NativeReviewWorkflow(args.work_dir), args.manifest, reason=args.reason))

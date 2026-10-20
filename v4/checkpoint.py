@@ -291,7 +291,9 @@ def load_checkpoint(path, *, continue_verification=True):
     grouped = {}
     for c in state["claims"]:
         grouped.setdefault(c["author_role"], []).append(c)
-    r.orch.submit_batch(r.run_id, grouped)
+    # Legacy malformed event bindings remain loadable for explicit Claim
+    # repair; deterministic validation still blocks Global and delivery.
+    r.orch.submit_batch(r.run_id, grouped, validate_events=False)
     r.reference_supplements = {"atomic": {}, "deep": {}}
     supplements = data.get("reference_supplements", {"atomic": {}, "deep": {}})
     if not isinstance(supplements, dict) or set(supplements) != {"atomic", "deep"}:

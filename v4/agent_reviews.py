@@ -32,6 +32,32 @@ def _item_wire_bytes(prompt, schema):
     return len(wire.encode("utf-8"))
 
 
+def configure_review_budget(workflow, *, max_item_bytes=None, max_packet_bytes=None, reason):
+    """Change delivery limits without altering claims or accepted proof archives."""
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError('operator reason required')
+    changes = {k: v for k, v in dict(max_item_bytes=max_item_bytes, max_packet_bytes=max_packet_bytes).items() if v is not None}
+    if not changes or any(type(v) is not int or v < 1024 for v in changes.values()):
+        raise ValueError('provide at least one review byte budget >=1024')
+    with workflow.queue.transaction() as state:
+        runner = workflow._load(state)
+        before = dict(max_item_bytes=runner.review_batch_max_bytes,
+                      max_packet_bytes=workflow._options(state)[1])
+        if max_item_bytes is not None:
+            runner.review_batch_max_bytes = max_item_bytes
+        if max_packet_bytes is not None:
+            state.setdefault('options', {})['review_packet_max_bytes'] = max_packet_bytes
+        for packet in state.get('packets', {}).values():
+            if packet.get('kind') in REVIEW_KINDS and not packet.get('retired'):
+                packet.update(retired=True, retirement_reason='review_budget_changed')
+                if state.get('active_packet_id') == packet['packet_id']:
+                    state['active_packet_id'] = None
+        event = dict(before=before, after={**before, **changes}, reason=reason.strip())
+        state.setdefault('review_budget_changes', []).append(event)
+        workflow._save(state, runner)
+        return dict(status='review_budget_updated', **event)
+
+
 class NativeReviewWorkflow(NativeWorkflow):
     def _options(self, state):
         options = state.get("options", {})
@@ -48,19 +74,19 @@ class NativeReviewWorkflow(NativeWorkflow):
         tasks = runner._tasks()
         missing = [cid for cid in tasks if cid not in runner.receipts]
         if missing:
-            prepared = runner.prepare_phase6_atomic()
+            prepared = runner.prepare_phase6_atomic(enforce_budget=False)
             prompts = dict(prepared["atomic_prompts"])
             return "atomic", list(prompts), prompts, prepared["response_schemas"]
         deep_wanted = [cid for cid in tasks if runner.receipts[cid]["result"]["verdict"] != "PASS"
                        and cid not in runner.deep_receipts]
         if deep_wanted:
-            prepared = runner.prepare_phase6_deep_review(deep_wanted)
+            prepared = runner.prepare_phase6_deep_review(deep_wanted, enforce_budget=False)
             prompts = dict(prepared["deep_prompts"])
             return "deep", list(prompts), prompts, prepared["response_schemas"]
         return None, [], {}, {}
 
     def _issue_review_packet(self, state, runner, layer, prompts, schemas, size, cap):
-        items, used_bytes, oversized = {}, 0, None
+        items, used_bytes, oversized = {}, 0, []
         for cid in prompts:
             if len(items) >= size:
                 break
@@ -68,27 +94,30 @@ class NativeReviewWorkflow(NativeWorkflow):
             item = dict(prompt=prompts[cid], schema=deepcopy(schemas[cid]), review_context=context)
             if cid not in items:
                 item_bytes = _item_wire_bytes(item["prompt"], item["schema"])
-                if item_bytes > cap:
-                    oversized = (cid, item_bytes)
-                    break
+                if item_bytes > min(cap, runner.review_batch_max_bytes):
+                    oversized.append(dict(claim_id=cid, wire_bytes=item_bytes,
+                        budget_bytes=min(cap, runner.review_batch_max_bytes)))
+                    continue
                 if items and used_bytes + item_bytes > cap:
                     break
                 items[cid] = item
                 used_bytes += item_bytes
         if oversized and not items:
             return dict(blocked=True, status="blocked:review_context_budget", layer=layer,
-                        reason=(f"review_context_too_large: {oversized[0]} has {oversized[1]} UTF-8 bytes; "
+                        reason=(f"review_context_too_large: {len(oversized)} items exceed the declared context budget; "
                                 f"budget={cap}; no evidence or IDs were truncated"),
-                        claim_id=oversized[0], wire_bytes=oversized[1])
+                        oversized_items=oversized, next_action="configure-reviews_or_reduce_structured_context")
         packet_id = uuid4().hex
         state["packets"][packet_id] = dict(packet_id=packet_id, kind=layer,
                                            input_hash=state["input_hash"], items=items, received={})
         state["active_packet_id"] = packet_id
         return dict(status="reviews", packet_id=packet_id, kind=layer,
-                    input_hash=state["input_hash"], items=deepcopy(items))
+                    input_hash=state["input_hash"], items=deepcopy(items), oversized_items=oversized)
 
     def next(self):
         result = self._next()
+        result['delivery_ready'] = result.get('status') == 'complete' and not result.get('blocked')
+        result['verification_status'] = 'complete' if result['delivery_ready'] else 'incomplete'
         disclosure = self.execution_disclosure()
         events = disclosure['secondary_events']
         if events:
@@ -186,6 +215,12 @@ class NativeReviewWorkflow(NativeWorkflow):
         journal = RunJournal(self.directory)
         processed = state.get("processed_items", {})
         current_hash = runner._hash()
+        needs_global_replay = any(p.get('kind') == 'global' and p.get('input_hash') == current_hash
+            and (p['packet_id'] in state.get('global_outcomes', {}) or not p.get('retired'))
+            for p in state.get('packets', {}).values())
+        deterministic_blocked = False
+        if needs_global_replay:
+            _, deterministic_blocked = runner.orch.validate_stage(runner.run_id, 'final')
         for packet in state.get("packets", {}).values():
             if packet.get("kind") != "global":
                 continue
@@ -208,6 +243,8 @@ class NativeReviewWorkflow(NativeWorkflow):
                 # the repair collector already re-derived or invalidated its
                 # findings against the current canonical state.
                 continue
+            if deterministic_blocked:
+                continue  # old receipts remain audit evidence, never bypass a current invariant
             snapshot = state.get("global_receipt_snapshots", {}).get(packet["packet_id"])
             if (stored.get("status") == "revision" and isinstance(snapshot, dict)
                     and snapshot.get("input_hash") == current_hash):
@@ -231,7 +268,10 @@ class NativeReviewWorkflow(NativeWorkflow):
             runner.status = pending_status
         active = state.get("packets", {}).get(state.get("active_packet_id"))
         if active and active.get("kind") == "global" and not active.get("retired"):
-            if (runner.global_receipt is not None and runner.global_receipt.get('findings')
+            if deterministic_blocked:
+                active.update(retired=True, retirement_reason='deterministic_revalidation_required')
+                state['active_packet_id'] = None
+            elif (runner.global_receipt is not None and runner.global_receipt.get('findings')
                     and runner.pending_global is None):
                 # Older versions issued the last completion again after the
                 # round had closed. Preserve its candidate/audit, but do not
@@ -276,6 +316,20 @@ class NativeReviewWorkflow(NativeWorkflow):
 
     def _next_global(self, state, runner, active):
         """Advance the existing P6 runner using one durable JSON packet per sweep."""
+        deterministic, _ = runner.orch.validate_stage(runner.run_id, 'final')
+        source_failures = [deepcopy(f) for f in deterministic if f['status'] == 'FAIL' and not f.get('claim_id')]
+        if source_failures:
+            runner.status = runner.run.stage = 'blocked:deterministic'
+            self._save(state, runner)
+            return dict(status='blocked:deterministic', blocked=True, findings=source_failures,
+                        next_action='repair_source_or_calculation_before_global')
+        claim_failures = [dict(claim_id=f['claim_id'], category=f.get('check_id', f.get('dimension', 'binding')),
+            issue=f.get('reason', 'deterministic Claim validation failed'), evidence=deepcopy(f),
+            suggested_fix='Repair the structured assertion or register the required canonical evidence.',
+            resolution_route='claim_patch') for f in deterministic
+            if f['status'] == 'FAIL' and f.get('claim_id')]
+        if claim_failures:
+            return self._prepare_global_repair(state, runner, findings=claim_failures)
         semantic_findings = runner._claim_review_findings()
         if semantic_findings:
             return self._prepare_global_repair(state, runner, findings=semantic_findings)
@@ -530,7 +584,7 @@ class NativeReviewWorkflow(NativeWorkflow):
             RunJournal(self.directory).archive_external_submission(
                 runner, model=row["executor"], task_id=f"patch.{packet['packet_id']}",
                 prompt=packet["items"][PATCH_ROLE]["prompt"], response=deepcopy(row["response"]))
-            result = runner.collect_phase6_revision(deepcopy(row["response"]))
+            result = runner.collect_phase6_revision(deepcopy(row["response"]), enforce_budget=False)
         except (ValueError, TypeError, KeyError) as exc:
             failure = dict(packet_id=packet["packet_id"], executor=row["executor"],
                            reason=f"{type(exc).__name__}: {exc}")
@@ -765,12 +819,12 @@ class NativeReviewWorkflow(NativeWorkflow):
         processed = state.setdefault("processed_items", {})
         tasks = runner._tasks()
         if layer == "atomic":
-            prepared = runner.prepare_phase6_atomic()
+            prepared = runner.prepare_phase6_atomic(enforce_budget=False)
             prompts, _schemas = dict(prepared["atomic_prompts"]), prepared["response_schemas"]
         else:
             wanted = [cid for cid in tasks if runner.receipts[cid]["result"]["verdict"] != "PASS"
                       and cid not in runner.deep_receipts]
-            prepared = runner.prepare_phase6_deep_review(wanted)
+            prepared = runner.prepare_phase6_deep_review(wanted, enforce_budget=False)
             prompts, _schemas = dict(prepared["deep_prompts"]), prepared["response_schemas"]
         journal = RunJournal(self.directory)
         for cid in list(packet["received"]):
