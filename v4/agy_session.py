@@ -13,7 +13,7 @@ import tempfile
 import time
 from uuid import uuid4, UUID
 from .session_state import SessionState, validate_limits
-from .agy_protocol import is_stream_interruption, interrupted_json_response
+from .agy_protocol import is_stream_interruption, interrupted_json_response, classify_provider_failure, PROVIDER_ERROR_CODES, safe_provider_reference
 from .storage import write_json
 from .session_replay import abandon_session  # public, explicitly authorized escape hatch
 
@@ -27,10 +27,12 @@ class AntigravityError(RuntimeError):
                        "invalid_stream", "missing_init", "tool_policy_unverified", "workspace_unverified", "model_unverified",
                        "unexpected_tool_use", "permission_denied", "result_failed", "stream_interrupted", "unexpected_result",
                        "invalid_json", "unexpected_error", "session_pending", "session_busy",
-                       "session_binding_changed", "conversation_unverified", "continuation_exhausted", "delivery_unconfirmed"})
+                       "session_binding_changed", "conversation_unverified", "continuation_exhausted", "delivery_unconfirmed",
+                       "quota_exhausted", "rate_limited"})
 
     def __init__(self, code, *, retryable=False, exit_code=None, attempts=1, conversation_id=None,
-                 session_budget=None, request_context=None):
+                 session_budget=None, request_context=None, provider_error_code=None,
+                 provider_diagnostic=None, event_reference=None):
         if (not isinstance(code, str) or code not in self.CODES or type(retryable) is not bool
                 or (exit_code is not None and type(exit_code) is not int)
                 or type(attempts) is not int or attempts < 1):
@@ -57,6 +59,15 @@ class AntigravityError(RuntimeError):
                 or len(request_context["claim_ids"]) != len(set(request_context["claim_ids"]))):
             raise ValueError("invalid request diagnostics")
         self.session_budget, self.request_context = deepcopy(session_budget), deepcopy(request_context)
+        if (provider_error_code is not None and (not isinstance(provider_error_code, str) or provider_error_code not in PROVIDER_ERROR_CODES)):
+            raise ValueError("invalid provider error code")
+        if provider_diagnostic not in (None, "Individual quota reached"):
+            raise ValueError("invalid provider diagnostic")
+        if event_reference is not None and not safe_provider_reference(event_reference):
+            raise ValueError("invalid provider event reference")
+        self.provider_error_code = provider_error_code
+        self.provider_diagnostic = provider_diagnostic
+        self.event_reference = event_reference
         self.conversation_id = conversation_id
         self.code, self.retryable = code, retryable
         self.exit_code, self.attempts = exit_code, attempts
@@ -72,6 +83,12 @@ class AntigravityError(RuntimeError):
             result["session_budget"] = deepcopy(self.session_budget)
         if self.request_context is not None:
             result["request_context"] = deepcopy(self.request_context)
+        if self.provider_error_code is not None:
+            result["provider_error_code"] = self.provider_error_code
+        if self.provider_diagnostic is not None:
+            result["provider_diagnostic"] = self.provider_diagnostic
+        if self.event_reference is not None:
+            result["event_reference"] = self.event_reference
         if self.code == "continuation_exhausted":
             result["recovery_options"] = ["raise_same_session_limits", "explicitly_authorize_one_new_session"]
         return result
@@ -80,7 +97,10 @@ class AntigravityError(RuntimeError):
         return AntigravityError(self.code, retryable=self.retryable, exit_code=self.exit_code,
                                 attempts=self.attempts if attempts is None else attempts,
                                 conversation_id=self.conversation_id, session_budget=self.session_budget,
-                                request_context=self.request_context if request_context is None else request_context)
+                                request_context=self.request_context if request_context is None else request_context,
+                                provider_error_code=self.provider_error_code,
+                                provider_diagnostic=self.provider_diagnostic,
+                                event_reference=self.event_reference)
 
 
     def blocked_status(self, default):
@@ -130,6 +150,13 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
             if require_json and not state.get("json_required"):
                 store.save(json_required=True)
             store.recover_terminal(require_json=require_json)
+            if state.get("last_error") == "quota_exhausted":
+                safe = state.get("provider_failure", {})
+                raise AntigravityError(state["last_error"], retryable=False,
+                    conversation_id=state.get("conversation_id"),
+                    provider_error_code=safe.get("provider_error_code"),
+                    provider_diagnostic=safe.get("provider_diagnostic"),
+                    event_reference=safe.get("event_reference"))
             if state["status"] == "complete":
                 if not require_json:
                     return state["response"]
@@ -172,7 +199,7 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
                     raise AntigravityError("delivery_unconfirmed", conversation_id=cid)
                 if not resume:
                     raise AntigravityError("session_pending", conversation_id=cid)
-                if (state.get("last_error") not in {"timeout", "empty_response", "cli_exit", "cli_io_failed", "result_failed", "stream_interrupted", "invalid_json"}
+                if (state.get("last_error") not in {"timeout", "empty_response", "cli_exit", "cli_io_failed", "result_failed", "stream_interrupted", "invalid_json", "rate_limited"}
                         and not (state.get("last_error") is None and state.get("status") == "in_flight")
                         and not legacy_step):
                     raise AntigravityError("conversation_unverified", conversation_id=cid)
@@ -210,7 +237,12 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
                     store.save(status=prior_status, last_error=prior_error)
                     raise AntigravityError(exc.code, retryable=True,
                                            conversation_id=store.data.get("conversation_id")) from None
-                store.save(status="paused" if sent else "failed", last_error=exc.code)
+                changes = dict(status="paused" if sent else "failed", last_error=exc.code)
+                if exc.code in {"quota_exhausted", "rate_limited"}:
+                    details = exc.details()
+                    changes["provider_failure"] = {key: details[key] for key in
+                        ("provider_error_code", "provider_diagnostic", "event_reference") if key in details}
+                store.save(**changes)
                 if not sent and exc.code == "missing_init":
                     raise AntigravityError("missing_init", retryable=True) from None
                 if sent and exc.code == "stream_interrupted":
@@ -351,6 +383,11 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                 if step.get("step_type") == "error_message":
                     if permission_denied(json.dumps(step).encode()):
                         raise AntigravityError("permission_denied")
+                    classified = classify_provider_failure({"error": step.get("text", step.get("message")),
+                        "error_code": step.get("error_code"), "event_id": item.get("event_id")})
+                    if classified:
+                        code, safe = classified
+                        raise AntigravityError(code, retryable=code == "rate_limited", **safe)
                     # A typed application error is not stream corruption. The
                     # wrapper pauses this turn; only explicit, bounded same-CID
                     # continuation is allowed, not an automatic fresh request.
@@ -369,6 +406,10 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                     raise AntigravityError("invalid_stream")
                 if permission_denied(str(terminal.get("error", "")).encode("utf-8")):
                     raise AntigravityError("permission_denied")
+                classified = classify_provider_failure(terminal)
+                if classified:
+                    code, safe = classified
+                    raise AntigravityError(code, retryable=code == "rate_limited", **safe)
                 recovered = interrupted_json_response(terminal)
                 if is_stream_interruption(terminal) and recovered is None:
                     raise AntigravityError("stream_interrupted", retryable=True)

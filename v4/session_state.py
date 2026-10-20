@@ -10,7 +10,7 @@ from uuid import uuid4
 from .storage import write_json
 from .session_replay import lifecycle_lock, recover_authorized_replay
 from .response_json import normalize_json_response
-from .agy_protocol import is_stream_interruption, interrupted_json_response
+from .agy_protocol import is_stream_interruption, interrupted_json_response, classify_provider_failure
 
 
 def validate_limits(max_continuations=None, budget_seconds=None):
@@ -124,7 +124,7 @@ class SessionState:
             return None
 
     def recover_terminal(self, *, require_json=False):
-        if self.data.get("last_error") not in (None, "timeout", "cli_io_failed", "invalid_json", "continuation_exhausted", "result_failed", "stream_interrupted"):
+        if self.data.get("last_error") not in (None, "timeout", "cli_io_failed", "invalid_json", "continuation_exhausted", "result_failed", "stream_interrupted", "quota_exhausted", "rate_limited"):
             return False
         path = self.directory / "events.jsonl"
         if not path.exists():
@@ -138,6 +138,21 @@ class SessionState:
         rows = [r for r in rows if r.get("v4_attempt_id") == self.data.get("active_attempt_id")]
         terminal = [r for r in rows if r.get("event") == "result"]
         if not terminal:
+            for row in rows:
+                step = row.get("step_update", {})
+                if (not isinstance(step, dict) or step.get("step_type") in ("tool", "subagent")
+                        or any(k in step for k in ("tool_name", "tool_info", "subagent_info"))):
+                    raise ValueError("unsafe terminal stream")
+            for row in reversed(rows):
+                step = row.get("step_update", {})
+                if step.get("step_type") != "error_message":
+                    continue
+                classified = classify_provider_failure(dict(error_code=step.get("error_code"),
+                    error=step.get("text", step.get("message")), event_id=step.get("event_id", row.get("event_id"))))
+                if classified:
+                    failure, safe = classified
+                    self.save(status="paused", last_error=failure, provider_failure=safe)
+                    return False
             return False
         if len(terminal) != 1 or rows[-1] != terminal[0]:
             raise ValueError("ambiguous terminal stream")
@@ -152,6 +167,12 @@ class SessionState:
             if (not isinstance(step, dict) or step.get("step_type") in ("tool", "subagent")
                     or any(k in step for k in ("tool_name", "tool_info", "subagent_info"))):
                 raise ValueError("unsafe terminal stream")
+        provider_failure = classify_provider_failure(result)
+        if provider_failure:
+            failure, safe = provider_failure
+            self.save(status="paused", last_error=failure, turn_acknowledged=True,
+                      provider_failure=safe)
+            return False
         recovered = interrupted_json_response(result)
         if is_stream_interruption(result) and recovered is None:
             self.save(status="paused", last_error="stream_interrupted", turn_acknowledged=True)
@@ -172,6 +193,25 @@ class SessionState:
         # Append and fsync before exposing progress. Deltas alone are evidence;
         # only a complete validated terminal answer can become a result.
         import os
+        if value.get("event") == "result" and isinstance(value.get("result"), dict):
+            classified = classify_provider_failure(value["result"])
+            if classified:
+                failure, safe = classified
+                code = safe.get("provider_error_code")
+                value = dict(value)
+                value["result"] = dict(status="ERROR", error_code=code,
+                    error=safe.get("provider_diagnostic"), **({"event_id": safe["event_reference"]} if "event_reference" in safe else {}))
+        if value.get("event") == "step_update" and isinstance(value.get("step_update"), dict):
+            step = value["step_update"]
+            if step.get("step_type") == "error_message":
+                classified = classify_provider_failure({"error": step.get("text", step.get("message")),
+                    "error_code": step.get("error_code"), "event_id": value.get("event_id")})
+                if classified:
+                    _, safe = classified
+                    value = dict(value)
+                    value["step_update"] = dict(step_type="error_message",
+                        error_code=safe.get("provider_error_code"), text=safe.get("provider_diagnostic"),
+                        **({"event_id": safe["event_reference"]} if "event_reference" in safe else {}))
         received_at = datetime.now(timezone.utc).isoformat()
         with (self.directory / "events.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps({**value, "v4_attempt_id": self.data.get("active_attempt_id"),

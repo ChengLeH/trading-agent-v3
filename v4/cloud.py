@@ -131,6 +131,8 @@ class AntigravityCloudClient:
                     if not self.continue_pending:
                         raise exc.with_context(attempts=attempt + 1) from None
                     continue_session = True  # bounded transport retry in the same CID; back off below
+                if exc.code == "rate_limited":
+                    continue_session = True  # bounded same-CID retry; never starts a fresh request
                 if not exc.retryable:
                     raise exc.with_context(attempts=attempt + 1) from None
                 last_error = exc
@@ -146,7 +148,10 @@ class AntigravityCloudClient:
                                    retryable=last_error.retryable and last_error.code != "invalid_json",
                                    exit_code=last_error.exit_code, attempts=self.request_attempts,
                                    conversation_id=last_error.conversation_id, session_budget=last_error.session_budget,
-                                   request_context=last_error.request_context) from None
+                                   request_context=last_error.request_context,
+                                   provider_error_code=last_error.provider_error_code,
+                                   provider_diagnostic=last_error.provider_diagnostic,
+                                   event_reference=last_error.event_reference) from None
         with self._lock:
             self.calls.append(dict(transport="antigravity", requested_model=self.identity, served_model=None,
                                    agent_profile=AGENT_NAME, agent_policy_verified=True))
