@@ -24,6 +24,78 @@ class QuotaPolicy(unittest.TestCase):
         self.assertIsNone(classify_provider_failure({"error": "account is having a problem"}))
         self.assertIsNone(classify_provider_failure({"error": "unrelated prompt text"}))
 
+    def test_extended_diagnostic_matches_prefix_with_boundary_not_arbitrary_substring(self):
+        sentence = "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 81h4m50s."
+        for message in (sentence, "  INDIVIDUAL  quota\nreached. Resets in 2m.  ",
+                        "Individual quota reached: resets tomorrow", "Individual quota reached please retry later"):
+            with self.subTest(message=message):
+                failure = classify_provider_failure(dict(status="ERROR", error=message))
+                self.assertIsNotNone(failure)
+                self.assertEqual(failure[0], "quota_exhausted")
+                self.assertEqual(failure[1]["provider_diagnostic"], "Individual quota reached")
+        for message in ("Not Individual quota reached.", "Earlier log: Individual quota reached.",
+                        "Individual quota reachedness", "Individual quota reached_count=0",
+                        "Individual quota reached0", '"Individual quota reached" is an example'):
+            with self.subTest(message=message):
+                self.assertIsNone(classify_provider_failure(dict(status="ERROR", error=message)))
+        self.assertIsNone(classify_provider_failure(dict(status="SUCCESS", error=sentence)))
+        self.assertEqual(classify_provider_failure(dict(status="ERROR", error_code="rate_limit_exceeded",
+            error=sentence))[0], "rate_limited")
+
+    def test_full_quota_sentence_without_code_stops_client_and_survives_restart(self):
+        from .cloud import AntigravityCloudClient
+        import subprocess
+        sentence = "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 81h4m50s."
+        body = """
+init()
+sys.stdin.readline()
+emit(dict(event="step_update", step_update=dict(step_type="user_input", state="DONE")))
+emit(dict(event="result", result=dict(status="ERROR", error=%r)))
+""" % sentence
+        with tempfile.TemporaryDirectory() as root, cli_stub(body) as executable, \
+             patch("v4.cloud.sleep") as backoff, \
+             patch("v4.agy_session.subprocess.Popen", wraps=subprocess.Popen) as start:
+            client = AntigravityCloudClient("model", executable=executable, session_root=root,
+                timeout=5, request_attempts=3)
+            with self.assertRaises(AntigravityError) as caught:
+                client.complete("fixture prompt")
+            self.assertEqual(caught.exception.code, "quota_exhausted")
+            self.assertFalse(caught.exception.retryable)
+            self.assertEqual(start.call_count, 1)
+            backoff.assert_not_called()
+            state_path = next(Path(root).glob("*/session.json"))
+            self.assertEqual(json.loads(state_path.read_text())["last_error"], "quota_exhausted")
+            events = (state_path.parent / "events.jsonl").read_text()
+            self.assertIn("Individual quota reached", events)
+            self.assertNotIn("81h4m50s", events)
+            with self.assertRaises(AntigravityError) as resumed:
+                client.complete("fixture prompt")
+            self.assertEqual(resumed.exception.code, "quota_exhausted")
+            self.assertEqual(start.call_count, 1)
+
+    def test_pre_fix_full_sentence_event_recovers_before_exhausted_continuation_budget(self):
+        from .session_state import SessionState
+        from .agy_session import load_agent_profile
+        sentence = "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 81h4m50s."
+        with tempfile.TemporaryDirectory() as root:
+            store = SessionState(root, "model", "fixture prompt", load_agent_profile()[1])
+            with store.lock():
+                store.save(status="paused", active_attempt_id="old-attempt", request_sent=True,
+                    request_written=True, turn_acknowledged=True, last_error="continuation_exhausted",
+                    continuations=2, max_continuations=2,
+                    conversation_id="11111111-1111-4111-8111-111111111111")
+            # Legacy event bytes predate normalization; do not pass them through event().
+            (Path(root) / "events.jsonl").write_text(json.dumps(dict(event="result",
+                result=dict(status="ERROR", error=sentence), v4_attempt_id="old-attempt")) + "\n")
+            with patch("v4.agy_session.subprocess.Popen") as start, self.assertRaises(AntigravityError) as caught:
+                run_session("/unused/agy", "model", "fixture prompt", 5, session_dir=root, resume=True)
+            self.assertEqual(caught.exception.code, "quota_exhausted")
+            self.assertFalse(caught.exception.retryable)
+            start.assert_not_called()
+            saved = json.loads((Path(root) / "session.json").read_text())
+            self.assertEqual(saved["continuations"], 2)
+            self.assertEqual(saved["provider_failure"]["provider_diagnostic"], "Individual quota reached")
+
     def test_terminal_quota_is_durable_and_never_continued_or_retried(self):
         body = '''
 init()

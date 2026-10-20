@@ -30,15 +30,20 @@ def classify_provider_failure(result):
         diagnostic = result.get("message")
     if not isinstance(diagnostic, str):
         diagnostic = ""
-    if failure is None and diagnostic.casefold().strip() == "individual quota reached":
+    canonical_diagnostic = "Individual quota reached"
+    prefix = canonical_diagnostic.casefold()
+    normalized = " ".join(diagnostic.casefold().split())
+    suffix = normalized[len(prefix):]
+    quota_diagnostic = normalized.startswith(prefix) and (not suffix or suffix[0] in " .:;!?")
+    if failure is None and quota_diagnostic:
         failure = "quota_exhausted"
     if failure is None:
         return None
     metadata = {}
     if code and (code in _QUOTA_CODES or code in _RATE_CODES):
         metadata["provider_error_code"] = code
-    if diagnostic.casefold().strip() == "individual quota reached":
-        metadata["provider_diagnostic"] = "Individual quota reached"
+    if quota_diagnostic:
+        metadata["provider_diagnostic"] = canonical_diagnostic
     reference = result.get("event_id", result.get("request_id"))
     if isinstance(reference, str) and safe_provider_reference(reference):
         metadata["event_reference"] = reference
