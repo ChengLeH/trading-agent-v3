@@ -91,6 +91,29 @@ else:
 class InterruptedTerminalResponse(unittest.TestCase):
     ERROR = 'The stream was interrupted. Please continue the task you were working on.'
 
+    def test_interruption_format_variants_recover_live_and_saved_answers(self):
+        for error in ('  THE stream was interrupted! Please continue.  ',
+                      'The stream\nwas interrupted. Please continue the task you were working on!'):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as root, cli_stub(self.body('{"done":true}', error=error)) as exe:
+                self.assertEqual(json.loads(run_session(exe, 'model', 'request', 3,
+                    session_dir=root, require_json=True)), {'done': True})
+                path = Path(root) / 'session.json'
+                state = json.loads(path.read_text())
+                state.update(status='paused', last_error='continuation_exhausted', continuations=2, max_continuations=2)
+                path.write_text(json.dumps(state))
+                with patch('v4.agy_session.subprocess.Popen') as start:
+                    self.assertEqual(json.loads(run_session(exe, 'model', 'request', 3,
+                        session_dir=root, resume=True, require_json=True)), {'done': True})
+                start.assert_not_called()
+
+    def test_interruption_code_precedes_text_but_unknown_errors_are_not_success(self):
+        from .agy_protocol import interrupted_json_response
+        self.assertEqual(interrupted_json_response(dict(status='ERROR', error_code='stream_interrupted',
+            error='provider changed wording', response='{}')), '{}')
+        for code, error in [('permission_denied', self.ERROR), ('new_error', self.ERROR),
+                            (None, 'Not the stream was interrupted.'), (None, 'Quoted: ' + self.ERROR)]:
+            self.assertIsNone(interrupted_json_response(dict(status='ERROR',error_code=code,error=error,response='{}')))
+
     def body(self, response, *, status='ERROR', error=None, suffix=''):
         terminal = dict(status=status, error=self.ERROR if error is None else error, response=response, error_code=None)
         return 'init()\nsys.stdin.readline()\nemit(dict(event="step_update",step_update=dict(step_type="user_input",state="DONE")))\nemit(' + repr(dict(event='result', result=terminal)) + ')\n' + suffix

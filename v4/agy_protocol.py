@@ -51,9 +51,18 @@ def classify_provider_failure(result):
 
 
 def is_stream_interruption(result):
-    """Recognize one CLI diagnostic, never inspect Claim or response prose."""
-    return (result.get("status") == "ERROR" and result.get("error_code") is None
-            and result.get("error") == "The stream was interrupted. Please continue the task you were working on.")
+    """Recognize the error envelope; response prose never selects recovery."""
+    if not isinstance(result, dict) or result.get('status') != 'ERROR':
+        return False
+    code = result.get('error_code')
+    if code is not None:
+        return isinstance(code, str) and code.strip().casefold() == 'stream_interrupted'
+    text = result.get('error')
+    if not isinstance(text, str):
+        return False
+    text = ' '.join(text.casefold().split())
+    prefix = 'the stream was interrupted'
+    return text.startswith(prefix) and (len(text) == len(prefix) or text[len(prefix)] in ' .:;!?')
 
 
 def interrupted_json_response(result):

@@ -397,6 +397,27 @@ sys.stderr.flush()
                 self.assertNotIn("secret", str(caught.exception))
                 sleep.assert_not_called()
 
+    def test_error_metadata_cannot_override_structured_failure_code(self):
+        for code, expected in [('rate_limit_exceeded', 'rate_limited'),
+                               ('permission_denied', 'permission_denied')]:
+            step = dict(step_type='error_message', text='provider diagnostic changed', error_code=code,
+                debug_hint='example: permission that headless mode cannot prompt for')
+            body = 'init()\nsys.stdin.readline()\nemit(' + repr(dict(event='step_update', step_update=step)) + ')\n'
+            with tempfile.TemporaryDirectory() as root, cli_stub(body) as exe:
+                with self.assertRaises(AntigravityError) as caught:
+                    run_session(exe, 'model', 'request', 3, session_dir=root)
+                self.assertEqual(caught.exception.code, expected)
+
+    def test_permission_diagnostic_in_nonerror_fields_does_not_trigger(self):
+        step = dict(step_type='error_message', text='temporary provider failure',
+                    debug_hint='permission that headless mode cannot prompt for')
+        body = 'init()\nsys.stdin.readline()\nemit(' + repr(dict(event='step_update', step_update=step)) + ')\n'
+        with tempfile.TemporaryDirectory() as root, cli_stub(body) as exe:
+            with self.assertRaises(AntigravityError) as caught:
+                run_session(exe, 'model', 'request', 3, session_dir=root)
+            self.assertEqual(caught.exception.code, 'session_pending')
+            self.assertEqual(json.loads((Path(root) / 'session.json').read_text())['last_error'], 'result_failed')
+
     def test_tool_or_subagent_event_aborts_even_with_successful_looking_result(self):
         for step in (dict(step_type="tool", tool_name="run_command"),
                      dict(step_type="agent_response", tool_info={}), dict(subagent_info={})):

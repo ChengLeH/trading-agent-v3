@@ -110,8 +110,19 @@ class AntigravityError(RuntimeError):
 
 
 def permission_denied(diagnostic):
-    # Match a CLI protocol diagnostic, never claim/finding/source prose.
-    return b"permission that headless mode cannot prompt for" in diagnostic.lower()
+    # Only callers with a typed error/legacy notice may pass an envelope.
+    # Bytes are the separate CLI stderr channel, never a serialized event.
+    if isinstance(diagnostic, dict):
+        code = diagnostic.get('error_code')
+        if code is not None:
+            return isinstance(code, str) and code.strip().casefold() == 'permission_denied'
+        diagnostic = diagnostic.get('error', diagnostic.get('text', diagnostic.get('message', '')))
+    if isinstance(diagnostic, bytes):
+        diagnostic = diagnostic.decode('utf-8', errors='replace')
+    if not isinstance(diagnostic, str):
+        return False
+    text = ' '.join(diagnostic.casefold().split())
+    return 'permission that headless mode cannot prompt for' in text
 
 
 def load_agent_profile():
@@ -172,7 +183,7 @@ def run_session(executable, model, prompt, timeout, response_schema=None, *, ses
             if repair_json and not state["request_sent"]:
                 raise AntigravityError("conversation_unverified")
             legacy_step = store.interrupted_application_step()
-            if legacy_step and permission_denied(json.dumps(legacy_step).encode()):
+            if legacy_step and permission_denied(legacy_step):
                 raise AntigravityError("permission_denied", conversation_id=state.get("conversation_id"))
             if (not state["request_sent"] and state.get("last_error") in
                     {"invalid_stream", "tool_policy_unverified", "workspace_unverified", "model_unverified",
@@ -381,7 +392,7 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                         key in step for key in ("tool_name", "tool_info", "subagent_info")):
                     raise AntigravityError("unexpected_tool_use")
                 if step.get("step_type") == "error_message":
-                    if permission_denied(json.dumps(step).encode()):
+                    if permission_denied(step):
                         raise AntigravityError("permission_denied")
                     classified = classify_provider_failure({"error": step.get("text", step.get("message")),
                         "error_code": step.get("error_code"), "event_id": item.get("event_id")})
@@ -404,7 +415,7 @@ def _run_session(executable, model, prompt, timeout, response_schema=None, *, st
                 terminal = item.get("result")
                 if not isinstance(terminal, dict):
                     raise AntigravityError("invalid_stream")
-                if permission_denied(str(terminal.get("error", "")).encode("utf-8")):
+                if permission_denied(terminal):
                     raise AntigravityError("permission_denied")
                 classified = classify_provider_failure(terminal)
                 if classified:
