@@ -64,9 +64,11 @@ class EvidenceRequestContracts(unittest.TestCase):
         saved = deepcopy(request)
         changed = deepcopy(claims)
         changed[0]['text'] = 'Revenue was 12.'
+        removed = changed[1:]
 
         self.assertFalse(is_request_stale(request, claims))
         self.assertTrue(is_request_stale(request, changed))
+        self.assertTrue(is_request_stale(request, removed))
         next_log, repeated = ensure_evidence_request(log, self.finding(), changed)
         self.assertEqual(repeated, saved)
         self.assertEqual(next_log, log)
