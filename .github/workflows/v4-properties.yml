@@ -1,0 +1,44 @@
+name: V4 property tests
+on:
+  pull_request:
+    paths: ['v3/**', 'v4/**', 'requirements-dev.txt', '.github/workflows/v4-properties.yml']
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Property test budget
+        type: choice
+        options: [ci, explore]
+        default: ci
+  schedule:
+    - cron: '23 19 * * *'
+jobs:
+  properties:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Bounded CI or nightly exploration
+        timeout-minutes: 12
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_PROFILE: ${{ inputs.profile }}
+        shell: bash
+        run: |
+          mkdir -p property-artifacts
+          profile=ci
+          if [[ "$EVENT_NAME" == schedule ]]; then profile=explore; fi
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$REQUESTED_PROFILE" == explore ]]; then profile=explore; fi
+          python -m v4.property_tests --profile "$profile" 2>&1 | tee property-artifacts/results.log
+      - name: Preserve minimal failure candidates and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4-property-candidates-${{ github.run_id }}
+          path: |
+            property-artifacts/
+            .hypothesis/examples/
+          retention-days: 14

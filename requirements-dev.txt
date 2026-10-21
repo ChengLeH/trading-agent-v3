@@ -1,0 +1,3 @@
+# Property tests only; production and existing unittest discovery need neither.
+hypothesis==6.170.5
+sortedcontainers==2.4.0
