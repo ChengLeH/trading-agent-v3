@@ -88,24 +88,8 @@ def append_sources(workflow, manifest_path, *, reason):
             shadow.evidence_store.add(EvidencePacket(**raw))
         shadow.events.update(deepcopy(added_run.events))
         runner.orch.runs[runner.run_id] = shadow
-        carry = deepcopy(runner.deferred_global_findings)
-        if runner.pending_patch:
-            carry.extend(deepcopy(runner.pending_patch['findings']))
-        by_id = {f.get('finding_id') or 'recovery.' + digest(f): f for f in carry}
-        for fid, finding in by_id.items():
-            finding.setdefault('finding_id', fid)
-        runner.deferred_global_findings = list(by_id.values())
-        runner.pending_patch = runner.pending_global = runner.global_receipt = runner.global_review_progress = None
-        runner.pending_atomic = runner.pending_deep = None
-        runner.reference_supplements = {'atomic': {}, 'deep': {}}
-        runner._tasks()
-        runner.status = runner.run.stage = 'atomic'
-        for packet in state.get('packets', {}).values():
-            if not packet.get('retired'):
-                packet.update(retired=True, retirement_reason='canonical_evidence_added')
-        state['active_packet_id'] = None
-        for key in ('patch_prompt', 'accepted_links', 'link_blocked', 'patch_blocked', 'review_blocked', 'global_blocked'):
-            state.pop(key, None)
+        _reopen_evidence_reviews(workflow, state, runner, 'canonical_evidence_added',
+                                 preserve_role_state=True)
         event = dict(source_ids=new_ids, canonical_refs=sorted(additions), reason=reason.strip(),
                      before_hash=before_hash, after_hash=runner._hash())
         state.setdefault('evidence_additions', []).append(event)
@@ -115,7 +99,7 @@ def append_sources(workflow, manifest_path, *, reason):
                     findings_resolved=False)
 
 
-def _reopen_evidence_reviews(workflow, state, runner, retirement_reason):
+def _reopen_evidence_reviews(workflow, state, runner, retirement_reason, *, preserve_role_state=False):
     """Preserve unresolved findings and archives while replacing their context."""
     carry = deepcopy(runner.deferred_global_findings)
     if runner.pending_patch:
@@ -134,8 +118,10 @@ def _reopen_evidence_reviews(workflow, state, runner, retirement_reason):
         if not packet.get('retired'):
             packet.update(retired=True, retirement_reason=retirement_reason)
     state['active_packet_id'] = None
-    for key in ('role_candidates', 'role_errors', 'group_error', 'patch_prompt', 'accepted_links',
-                'link_blocked', 'patch_blocked', 'review_blocked', 'global_blocked'):
+    keys = ('patch_prompt', 'accepted_links', 'link_blocked', 'patch_blocked', 'review_blocked', 'global_blocked')
+    if not preserve_role_state:
+        keys += ('role_candidates', 'role_errors', 'group_error')
+    for key in keys:
         state.pop(key, None)
 
 

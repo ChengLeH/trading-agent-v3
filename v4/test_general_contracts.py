@@ -162,6 +162,96 @@ class EvidenceRecoveryContracts(unittest.TestCase):
                 self.assertEqual(r.deferred_global_findings[0]['finding_id'],'gap.1')
                 self.assertIsNone(r.global_receipt)
 
+    def test_evidence_reopen_paths_preserve_their_cleanup_contracts(self):
+        import tempfile
+        from copy import deepcopy
+        from .evidence_repair import append_sources, declare_financial_source, register_event_catalog
+        from .test_agent_reviews import NativeReviews
+        from v3.facts import Fact
+        from v3.sources import SourceRecord
+
+        observations = {}
+        for path in ('sources', 'declarations', 'events'):
+            with tempfile.TemporaryDirectory() as root:
+                harness = NativeReviews()
+                workflow = harness.bootstrap(root)
+                if path == 'declarations':
+                    with workflow.queue.transaction() as state:
+                        runner = workflow._load(state)
+                        runner.run.records.append(SourceRecord('filing', 'openbb_fundamentals', 'TEST', None,
+                            dict(income=[], balance=[], financial_statement_metadata={}), 'original-hash'))
+                        workflow._save(state, runner)
+                elif path == 'events':
+                    with workflow.queue.transaction() as state:
+                        runner = workflow._load(state)
+                        runner.run.fact_store.add(Fact('source.amount', 5, 'USD', 'FY2026',
+                            entity='TEST', concept='quantity', source_id='fixture'))
+                        workflow._save(state, runner)
+                packet = harness._reach_global(workflow)
+                with workflow.queue.transaction() as state:
+                    runner = workflow._load(state)
+                    runner.deferred_global_findings = [dict(finding_id='kept.deferred', claim_ids=['a'], issue='deferred')]
+                    prior_receipt_ids = set(runner.receipts)
+                    workflow._save(state, runner)
+                    state['role_candidates'] = {'role': {'answer': 'keep-or-clear'}}
+                    state['role_errors'] = {'role': {'reason': 'fixture'}}
+                    state['group_error'] = {'reason': 'fixture'}
+                    state['active_packet_id'] = packet['packet_id']
+                    prior_packets = {pid: (row.get('retired'), row.get('retirement_reason'))
+                                     for pid, row in state.get('packets', {}).items()}
+
+                if path == 'sources':
+                    append_sources(workflow, self.manifest(root), reason='new source')
+                elif path == 'declarations':
+                    declare_financial_source(workflow, 'filing', {'basis': 'gaap'}, reason='declare basis')
+                else:
+                    register_event_catalog(workflow, [dict(event_id='catalog.event', date='2026-10-15',
+                        source_ref='source.amount', entity='TEST', concept='quantity', period='FY2026',
+                        unit='USD', basis='reported', scope='consolidated', value=5, is_aggregate=False)],
+                        reason='register event')
+
+                with workflow.queue.transaction() as state:
+                    runner = workflow._load(state)
+                    observations[path] = dict(
+                        carries=runner.deferred_global_findings,
+                        retired={pid: (row.get('retired'), row.get('retirement_reason'))
+                                 for pid, row in state.get('packets', {}).items()},
+                        prior_packets=prior_packets,
+                        active_packet=state.get('active_packet_id'),
+                        receipts=deepcopy(runner.receipts),
+                        deep_receipts=deepcopy(runner.deep_receipts),
+                        prior_receipt_ids=prior_receipt_ids,
+                        findings=runner.deferred_global_findings,
+                        role_keys={key: deepcopy(state[key]) for key in
+                                   ('role_candidates', 'role_errors', 'group_error') if key in state},
+                        pending=(runner.pending_patch, runner.pending_global, runner.global_review_progress,
+                                 runner.pending_atomic, runner.pending_deep, runner.reference_supplements),
+                    )
+
+        expected_findings = [dict(finding_id='kept.deferred', claim_ids=['a'], issue='deferred')]
+        for path, reason in (('sources', 'canonical_evidence_added'),
+                             ('declarations', 'financial_source_declarations_changed'),
+                             ('events', 'event_catalog_updated')):
+            observed = observations[path]
+            self.assertEqual(observed['carries'], expected_findings, path)
+            self.assertEqual(observed['findings'], expected_findings, path)
+            self.assertEqual(observed['active_packet'], None, path)
+            self.assertTrue(observed['retired'], path)
+            self.assertTrue(observed['prior_receipt_ids'], path)
+            for packet_id, prior in observed['prior_packets'].items():
+                after = observed['retired'][packet_id]
+                self.assertEqual(after, prior if prior[0] else (True, reason), (path, packet_id))
+            self.assertFalse(observed['receipts'], path)
+            self.assertFalse(observed['deep_receipts'], path)
+            self.assertTrue(all(value is None or value == {'atomic': {}, 'deep': {}}
+                                for value in observed['pending']), path)
+        role_values = {'role_candidates': {'role': {'answer': 'keep-or-clear'}},
+                       'role_errors': {'role': {'reason': 'fixture'}},
+                       'group_error': {'reason': 'fixture'}}
+        self.assertEqual(observations['sources']['role_keys'], role_values)
+        self.assertEqual(observations['declarations']['role_keys'], {})
+        self.assertEqual(observations['events']['role_keys'], {})
+
     def test_bad_subject_duplicate_source_and_empty_document_leave_state_unchanged(self):
         import tempfile
         from .test_agent_reviews import NativeReviews
