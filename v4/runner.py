@@ -196,8 +196,10 @@ class PipelineRunnerV4:
         s = self.orch.snapshot(self.run_id) if snapshot is None else snapshot
         from .financial_statements import source_declarations
         declarations = source_declarations(self.run)
+        lineage = getattr(self.run, "source_lineage", {})
         return {**{k: s.get(k) for k in ("claims", "facts", "calcs", "evidence", "events", "trade", "as_of")},
                 **({'source_declarations': declarations} if declarations else {}),
+                **({'source_lineage': deepcopy(lineage)} if lineage else {}),
                 "financial_review_contract": FINANCIAL_REVIEW_VERSION}
 
     def _hash(self, state=None):

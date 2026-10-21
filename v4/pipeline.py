@@ -9,6 +9,7 @@ from .schema import Claim, claim_index, descendants, digest
 from .bindings import validate_claim_bindings
 from .atomic_phase6 import build_atomic_tasks
 from .review_context import calculation_definitions, indicator_definitions
+from .source_lineage import normalize_source_lineage, validate_run_source_lineage
 from datetime import date
 from .financial_review import ingestion_diagnostics
 
@@ -444,8 +445,14 @@ class OrchestratorV4(Orchestrator):
         return report
 
     def start_run(self, subject, manifest):
+        lineage = normalize_source_lineage(manifest.get("source_lineage", {}))
         rid = super().start_run(subject, manifest)
         self.runs[rid].events = {}
+        self.runs[rid].source_lineage = {}
+        if lineage:
+            # Evidence IDs become resolvable only after ingestion. Keep the
+            # manifest declaration transient until deterministic validation.
+            self.runs[rid]._source_lineage_candidate = lineage
         if 'issuer_registry_path' in manifest:
             self.runs[rid].manifest['issuer_registry_path'] = manifest['issuer_registry_path']
         return rid
@@ -585,6 +592,18 @@ class OrchestratorV4(Orchestrator):
                          (check_source_identity, (run.manifest, [r for r in run.records if not isinstance(r, SourceError)]))):
             out.extend(f.to_dict() for f in fn(*args))
         sources = source_catalog(run)
+        lineage_candidate = getattr(run, "_source_lineage_candidate",
+                                    getattr(run, "source_lineage", {}))
+        if lineage_candidate:
+            try:
+                validated_lineage = validate_run_source_lineage(run, lineage_candidate)
+            except (TypeError, ValueError) as exc:
+                out.append(dict(status="FAIL", object_id="source_lineage",
+                    check_id="source_lineage", reason=str(exc)))
+            else:
+                run.source_lineage = validated_lineage
+                if hasattr(run, "_source_lineage_candidate"):
+                    del run._source_lineage_candidate
         for task in build_atomic_tasks(run):
             for ref in task.unresolved_refs:
                 out.append(dict(status="FAIL", claim_id=task.claim_id, check_id="reference_exists",
@@ -704,6 +723,9 @@ class OrchestratorV4(Orchestrator):
         snap['ingestion_diagnostics'] = ingestion_diagnostics(self.runs[run_id])
         snap["manifest"] = self.runs[run_id].manifest
         snap["trade_generated"] = getattr(self.runs[run_id], "trade_generated", ([], []))
+        lineage = getattr(self.runs[run_id], "source_lineage", {})
+        if lineage:
+            snap["source_lineage"] = deepcopy(lineage)
         return deepcopy(snap)
 
     def validate_final(self, run_id):

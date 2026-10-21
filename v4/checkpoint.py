@@ -11,6 +11,7 @@ from v3.sources import SourceRecord, SourceError
 from .runner import PipelineRunnerV4
 from .schema import digest
 from .financial_review import FINANCIAL_REVIEW_VERSION
+from .source_lineage import validate_run_source_lineage
 
 
 from .storage import write_json
@@ -286,6 +287,11 @@ def load_checkpoint(path, *, continue_verification=True):
     for rec in data["records"]:
         types = {"SourceRecord": SourceRecord, "SourceError": SourceError}
         run.records.append(types[rec["kind"]](**rec["value"]))
+    try:
+        run.source_lineage = validate_run_source_lineage(
+            run, state.get("source_lineage", {}))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid checkpoint source_lineage: {exc}") from None
     run.trade = state.get("trade", {})
     run.trade_generated = state.get("trade_generated", ([], []))
     grouped = {}
