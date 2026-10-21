@@ -15,6 +15,56 @@ def response(cid, item, status='PASS'):
 
 
 class NativeReviews(unittest.TestCase):
+    def test_next_and_submit_match_across_process_hash_seeds(self):
+        import os
+        import subprocess
+        import sys
+        from v3.facts import Fact
+
+        script = '''
+import json, sys
+from v4.agent_reviews import NativeReviewWorkflow
+from v4.review_context import calculation_definitions
+workflow = NativeReviewWorkflow(sys.argv[2])
+payload = json.load(sys.stdin)
+result = workflow.next() if sys.argv[1] == 'next' else workflow.submit(**payload)
+kinds = ['growth', 'fcf', 'margin', 'return_cc', 'volume_ratio', 'derived_pct',
+         'future_a', 'future_b', None]
+definitions = calculation_definitions({str(i): {'calc_type': kind} for i, kind in enumerate(kinds)})
+print(json.dumps(dict(result=result, serialized_definitions=json.dumps(definitions))))
+'''
+        with tempfile.TemporaryDirectory() as root:
+            runner = seeded()
+            for ref, value in [('now', 12), ('prior', 10)]:
+                runner.run.fact_store.add(Fact(ref, value, 'USD', 'FY2025', concept='fixture_metric',
+                                              source_id='fixture'))
+            calcs = [('growth', .2, 'RATIO'), ('fcf', 2, 'USD'), ('margin', 1.2, 'RATIO'),
+                     ('return_cc', .2, 'RATIO'), ('volume_ratio', 1.2, 'RATIO'), ('derived_pct', 16.67, 'PCT')]
+            for kind, value, unit in calcs:
+                runner.run.calc_store.add('calc.' + kind, value, kind,
+                    ['prior', 'now'] if kind == 'return_cc' else ['now', 'prior'], unit)
+            runner.run.claims[0]['refs'] = ['calc.' + kind for kind, _, _ in calcs]
+            runner.run.claims[0]['bindings'] = [dict(ref_id=ref,
+                **{dimension: 'unknown' for dimension in ('entity', 'concept', 'period', 'scope', 'unit', 'basis')})
+                for ref in runner.run.claims[0]['refs']]
+            source = Path(root) / 'source.json'
+            save_checkpoint(runner, source)
+            workflow = NativeReviewWorkflow.from_checkpoint(source, Path(root) / 'native')
+
+            def invoke(mode, seed, payload):
+                completed = subprocess.run([sys.executable, '-c', script, mode, str(workflow.directory)],
+                    input=json.dumps(payload), text=True, capture_output=True, check=True, timeout=20,
+                    cwd=Path(__file__).resolve().parents[1], env={**os.environ, 'PYTHONHASHSEED': seed})
+                return json.loads(completed.stdout)
+
+            prepared = invoke('next', '1', {})
+            packet = prepared['result']
+            submitted = invoke('submit', '2', dict(packet_id=packet['packet_id'],
+                responses={cid: response(cid, item) for cid, item in packet['items'].items()},
+                executor='host/cross-process', input_hash=packet['input_hash']))
+            self.assertFalse(submitted['result'].get('blocked'), submitted['result'])
+            self.assertEqual(prepared['serialized_definitions'], submitted['serialized_definitions'])
+
     def test_next_reuses_prepared_tasks_for_review_packet_context(self):
         from unittest.mock import patch
         import v4.runner as runner_module

@@ -106,8 +106,8 @@ CALCULATION_DEFINITIONS = {
 def calculation_definitions(calcs):
     kinds = {c.get('calc_type') for c in calcs.values()}
     definitions = {kind: dict(supported=True, **deepcopy(CALCULATION_DEFINITIONS[kind]))
-                   for kind in kinds if kind in CALCULATION_DEFINITIONS}
-    for kind in kinds - CALCULATION_DEFINITIONS.keys():
+                   for kind in sorted(kinds, key=str) if kind in CALCULATION_DEFINITIONS}
+    for kind in sorted(kinds - CALCULATION_DEFINITIONS.keys(), key=str):
         definitions[kind] = dict(supported=False, meaning='unknown',
             limitation=f'No calculation definition or kernel dispatch is registered for operation {kind!r}; its formula and output semantics are unknown.')
     return definitions
