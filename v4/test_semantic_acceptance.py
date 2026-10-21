@@ -49,6 +49,21 @@ class SemanticAcceptance(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "semantic verification"):
                     r.prepare_phase6_global_sweep()
 
+    def test_risk_conclusion_wording_variants_reach_the_same_semantic_review_layer(self):
+        statements = (
+            "在財報前採取 0% 部位是合乎我目前風險偏好的選擇。",
+            "僅憑 ATR 就斷定任何非零部位都不可能控制風險。",
+        )
+        for statement in statements:
+            with self.subTest(statement=statement):
+                r = seeded()
+                risk_claim = next(c for c in r.run.claims if c["author_role"] == "risk_manager")
+                risk_claim["text"] = statement
+
+                prompt = dict(r.prepare_phase6_atomic()["atomic_prompts"])[risk_claim["claim_id"]]
+
+                self.assertIn(statement, prompt)
+
     def test_binding_coverage_uses_actual_sources_even_for_interpretations(self):
         from .bindings import validate_claim_bindings
         from .test_atomic_phase6 import make_run

@@ -100,6 +100,21 @@ class ReviewContext(unittest.TestCase):
         self.assertFalse(runner.receipts)
         self.assertTrue(runner.pending_atomic)
 
+    def test_risk_role_and_atomic_review_receive_the_shared_risk_contract(self):
+        from .financial_review import FINANCIAL_REVIEW_CONTRACT, FINANCIAL_REVIEW_VERSION
+
+        runner = seeded()
+        risk_prompt = dict(runner._role_prompts(("risk_manager",)))["risk_manager"]
+        atomic = dict(runner.prepare_phase6_atomic()["atomic_prompts"])
+        risk_claim = next(claim for claim in runner.run.claims if claim["author_role"] == "risk_manager")
+        risk_claim_id = risk_claim["claim_id"]
+        risk_task = next(task for task in build_atomic_tasks(runner.run) if task.claim_id == risk_claim_id)
+
+        self.assertEqual(FINANCIAL_REVIEW_VERSION, "financial-evidence/5")
+        self.assertIn(FINANCIAL_REVIEW_CONTRACT, risk_prompt)
+        self.assertIn(FINANCIAL_REVIEW_CONTRACT, atomic[risk_claim_id])
+        self.assertEqual(risk_task.context["financial_review_contract"], FINANCIAL_REVIEW_VERSION)
+
     def test_external_archive_matches_normal_provenance_lookup(self):
         runner = seeded()
         with tempfile.TemporaryDirectory() as temp:

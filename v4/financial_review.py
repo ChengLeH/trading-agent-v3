@@ -1,5 +1,5 @@
 """Shared semantic obligations for existing LLM stages, not a new classifier."""
-FINANCIAL_REVIEW_VERSION = 'financial-evidence/4'
+FINANCIAL_REVIEW_VERSION = 'financial-evidence/5'
 FINANCIAL_REVIEW_CONTRACT = '''
 金融證據契約 financial-evidence/4：這些是語義核對責任，不是以字詞命中判錯。
 來源原始值、計算值與展示值須區分；assertion.value 保留 canonical 值。
@@ -24,6 +24,7 @@ GAAP P/E 算對不代表已證明便宜；淨利減營業利益不等於可直�
 判定 evidence_needed 時，須附 typed evidence_request 說明待確認命題及已知資料維度；未知維度留空，不從 finding 文字猜來源 ID。
 相同事實、限制與情境假設在下游若被轉成確定結論，須列 material finding；只影響行文且不改意思的提醒列 clarity_only。
 來源沿革是明示的 provenance 註記，不是程式認證的來源獨立性。逐一核對來源正文及其明示的 origin_id、derived_from、publisher 與證據引用；同一原始文件的轉載不得當成多份獨立佐證。不同網址、發布者或平台也不自動代表獨立；相同事件不代表同一來源。缺少沿革註記時獨立性為未知，不能推定為獨立或因此否決一項由單一來源支持的事實。只有 Claim 實際依賴「獨立佐證」時，才判斷來源能否支持該語義；來源數量本身不構成證據充分性門檻。
+風控結論須區分來源明載事實、程式計算、情境假設、使用者明示政策、當下投資決策與普遍必然性主張，並檢查結論範圍是否超出已證明的前提。選擇 WAIT 或 0% 部位可以是特定時點與風險偏好下的合理決策，但不等於證明所有非零部位都不可控或不存在其他可行方案。ATR、波動度或壓力情境可支持風險大小、停損距離與情境敏感度的分析，單獨不足以證明任何非零部位都不可能符合風險限制。若結論是「依本策略不得持倉」，須有實際明示的風險政策、風險預算、交易限制或足以推出該結論的前提，並將結論限定在該政策與假設內。不得替使用者發明最大部位、風險預算、事件禁令或 ATR 門檻；沒有明示時保留為未知。壓力測試與跳空風險是條件情境，不是必然結果；不得假設風險為零。措辭差異或同一組事實下存在多個合理政策選擇，不構成 finding；只有結論超出證據或明示約束時，沿用既有 material finding／clarity_only 分流。
 '''.strip()
 
 
