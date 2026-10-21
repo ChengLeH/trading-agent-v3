@@ -1,6 +1,7 @@
 """Pure rendering from canonical objects; no prose classification or cleanup."""
 import html
 import json
+from copy import deepcopy
 from urllib.parse import urlsplit
 from .schema import digest
 
@@ -57,11 +58,26 @@ def _citation_index(snapshot):
     declarations = snapshot.get("source_declarations", {})
     if not isinstance(declarations, dict):
         declarations = {}
+    lineage = snapshot.get("source_lineage", {})
+    if not isinstance(lineage, dict):
+        lineage = {}
     entries, keys = [], {}
     claim_numbers = {}
 
+    def lineage_rows(ref_ids):
+        rows, seen = [], set()
+        for ref_id in dict.fromkeys(value for value in ref_ids if isinstance(value, str) and value):
+            annotation = lineage.get(ref_id)
+            row = dict(ref_id=ref_id, status="declared" if isinstance(annotation, dict) else "unknown",
+                       annotation=deepcopy(annotation) if isinstance(annotation, dict) else {})
+            key = json.dumps(row, ensure_ascii=False, sort_keys=True)
+            if key not in seen:
+                rows.append(row)
+                seen.add(key)
+        return rows
+
     def add_source(source_id, *, url=None, span=None, pointer=None, published=None,
-                   accession=None, source_type=None, title=None):
+                   accession=None, source_type=None, title=None, lineage_ref_ids=()):
         lookup_source_id = source_id if isinstance(source_id, str) else ""
         display_source_id = _citation_field(lookup_source_id) or "unknown"
         span, pointer = _citation_field(span), _citation_field(pointer)
@@ -75,8 +91,11 @@ def _citation_index(snapshot):
             entries.append(dict(number=keys[key], source_id=display_source_id,
                 url=url, source_type=source_type or "", title=title or "",
                 spans=[], source_pointers=[], published_or_filing_time=published or "",
-                accession_or_version=accession or ""))
+                accession_or_version=accession or "", source_lineage=[]))
         item = entries[keys[key] - 1]
+        for row in lineage_rows([lookup_source_id, *lineage_ref_ids]):
+            if row not in item["source_lineage"]:
+                item["source_lineage"].append(row)
         for field, value in (("spans", span), ("source_pointers", pointer)):
             if value and value not in item[field]:
                 item[field].append(value)
@@ -126,7 +145,7 @@ def _citation_index(snapshot):
             return [add_source(source_id, url=url, span=span,
                 published=item.get("published_or_filing_time"),
                 source_type=item.get("source_type") or source.get("type"),
-                title=source.get("title") or source.get("name"))]
+                title=source.get("title") or source.get("name"), lineage_ref_ids=[ref])]
         if ref in events:
             source_ref = events[ref].get("source_ref")
             return resolve(source_ref, visited) if source_ref else []
@@ -195,6 +214,24 @@ def render_report(snapshot):
                 details.append("日期=" + _citation_markdown(entry["published_or_filing_time"]))
             if entry.get("accession_or_version"):
                 details.append("版本=" + _citation_markdown(entry["accession_or_version"]))
+            for relation in entry.get("source_lineage", []):
+                ref_label = _citation_markdown(relation.get("ref_id", "unknown"))
+                annotation = relation.get("annotation", {})
+                if relation.get("status") != "declared":
+                    details.append(f"來源沿革未知(ref={ref_label})")
+                    continue
+                declared = []
+                for field, label in (("origin_id", "原始文件"), ("derived_from", "明示轉引"),
+                                     ("publisher", "發布者"), ("reason", "註記理由")):
+                    value = annotation.get(field)
+                    if isinstance(value, list):
+                        value = ", ".join(_citation_markdown(item) for item in value)
+                    elif isinstance(value, str):
+                        value = _citation_markdown(value)
+                    if value:
+                        declared.append(f"{label}={value}")
+                details.append("來源沿革為資料註記、未獨立驗證(ref=" + ref_label + "): "
+                               + ("; ".join(declared) if declared else "僅有未驗證註記"))
             lines.append(f"[{entry['number']}] {rendered} — " + "; ".join(details))
         lines.append("")
     report = "\n".join(lines)
@@ -203,6 +240,7 @@ def render_report(snapshot):
                    calcs=snapshot["calcs"], evidence=snapshot["evidence"],
                    events=snapshot.get("events", {}), trade=snapshot.get("trade", {}),
                    source_declarations=snapshot.get('source_declarations', {}),
+                   source_lineage=deepcopy(snapshot.get("source_lineage", {})),
                    citations=citations, claim_citations=claim_citations,
                    indicator_definitions=methods, issuer_identity=snapshot.get('issuer_identity', []), ingestion_diagnostics=snapshot.get('ingestion_diagnostics', []),
                    verification=dict(status='unverified', delivery_ready=False, global_review_complete=False),

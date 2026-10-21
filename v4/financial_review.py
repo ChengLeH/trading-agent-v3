@@ -1,7 +1,7 @@
 """Shared semantic obligations for existing LLM stages, not a new classifier."""
-FINANCIAL_REVIEW_VERSION = 'financial-evidence/2'
+FINANCIAL_REVIEW_VERSION = 'financial-evidence/3'
 FINANCIAL_REVIEW_CONTRACT = '''
-金融證據契約 financial-evidence/1：這些是語義核對責任，不是以字詞命中判錯。
+金融證據契約 financial-evidence/3：這些是語義核對責任，不是以字詞命中判錯。
 來源原始值、計算值與展示值須區分；assertion.value 保留 canonical 值。
 可另附 assertion.presentation={value,unit,decimal_places,rounding:half_up|half_even} 明示換單位與捨入。
 合理四捨五入或不同抓取時點造成的小差異，若來源、時間與精度足以解釋，不列重大錯誤；
@@ -22,6 +22,7 @@ GAAP P/E 算對不代表已證明便宜；淨利減營業利益不等於可直�
 目前提供的證據沒有資料，只能說本次證據未提供；不能推成公司沒有披露或事件沒有發生。
 缺資料時縮小主張或標 evidence_needed，讓主 Agent 補入可追溯來源；不得編數或刪真正因果依賴。
 相同事實、限制與情境假設在下游若被轉成確定結論，須列 material finding；只影響行文且不改意思的提醒列 clarity_only。
+來源沿革是明示的 provenance 註記，不是程式認證的來源獨立性。逐一核對來源正文及其明示的 origin_id、derived_from、publisher 與證據引用；同一原始文件的轉載不得當成多份獨立佐證。不同網址、發布者或平台也不自動代表獨立；相同事件不代表同一來源。缺少沿革註記時獨立性為未知，不能推定為獨立或因此否決一項由單一來源支持的事實。只有 Claim 實際依賴「獨立佐證」時，才判斷來源能否支持該語義；來源數量本身不構成證據充分性門檻。
 '''.strip()
 
 

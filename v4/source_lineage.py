@@ -107,3 +107,21 @@ def validate_run_source_lineage(run, value):
     return validate_source_lineage(value, source_ids=source_ids,
                                    evidence_owners=evidence_owners,
                                    fingerprints=fingerprints)
+
+
+def project_source_lineage(lineage, referenced_ids):
+    """Return only declared lineage reachable from a review's explicit refs."""
+    normalized = normalize_source_lineage(lineage)
+    pending = list(dict.fromkeys(ref for ref in referenced_ids
+                                 if isinstance(ref, str) and ref))
+    included = set()
+    while pending:
+        ref_id = pending.pop()
+        if ref_id in included:
+            continue
+        included.add(ref_id)
+        annotation = normalized.get(ref_id)
+        if annotation is not None:
+            pending.extend(annotation.get("derived_from", []))
+            pending.extend(annotation.get("evidence_refs", []))
+    return {ref_id: deepcopy(normalized[ref_id]) for ref_id in normalized if ref_id in included}

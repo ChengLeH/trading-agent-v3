@@ -5,12 +5,67 @@ import tempfile
 import unittest
 
 from v3.sources import AdapterRegistry, SourceRecord
+from v3.evidence import EvidencePacket
+from v3.facts import Fact
+from .atomic_phase6 import build_atomic_tasks
 from .checkpoint import load_checkpoint, save_checkpoint
 from .pipeline import OrchestratorV4
+from .reporting import render_report
 from .test_integration import seeded
 
 
 class SourceLineage(unittest.TestCase):
+    def test_atomic_context_includes_only_lineage_reachable_from_claim_refs(self):
+        runner = seeded()
+        runner.run.fact_store.add(Fact(fact_id="fact.revenue", value=12, unit="USD",
+            period="FY2025", concept="Revenue", source_id="source.finance", source_pointer="income.revenue"))
+        claim = next(row for row in runner.run.claims if row["claim_id"] == "a")
+        claim["refs"] = ["fact.revenue"]
+        runner.run.source_lineage = {
+            "source.finance": {"origin_id": "filing-v1", "evidence_refs": ["evidence.origin"]},
+            "evidence.origin": {"origin_id": "original-release-v1"},
+            "source.unrelated": {"origin_id": "unrelated-v1"},
+        }
+
+        task = next(row for row in build_atomic_tasks(runner.run) if row.claim_id == "a")
+
+        self.assertEqual(task.context["source_lineage"], {
+            "source.finance": {"origin_id": "filing-v1", "evidence_refs": ["evidence.origin"]},
+            "evidence.origin": {"origin_id": "original-release-v1"},
+        })
+        self.assertNotIn("source.unrelated", task.review_dict()["context"]["source_lineage"])
+
+    def test_global_review_gets_full_lineage_and_lineage_never_certifies_independence(self):
+        runner = seeded()
+        runner.run.source_lineage = {
+            "source.one": {"origin_id": "same-document"},
+            "source.two": {"origin_id": "same-document"},
+        }
+        global_state = runner._global_review_state()
+
+        self.assertEqual(global_state["source_lineage"], runner.run.source_lineage)
+        self.assertNotIn("independent", json.dumps(global_state["source_lineage"]).lower())
+
+    def test_report_discloses_declared_and_unknown_lineage_safely(self):
+        runner = seeded()
+        runner.run.evidence_store.add(EvidencePacket(evidence_id="evidence.news",
+            claim_candidate="A reported fact.", source_id="source.news", source_type="news_json",
+            source_span="https://news.test/story"))
+        next(row for row in runner.run.claims if row["claim_id"] == "a")["refs"] = ["evidence.news"]
+        runner.run.source_lineage = {
+            "source.news": {"origin_id": "origin-v1", "reason": "Declared <script> [text]."},
+        }
+
+        rendered = render_report(runner.orch.snapshot(runner.run_id))
+
+        self.assertEqual(rendered["sidecar"]["source_lineage"], runner.run.source_lineage)
+        citation = rendered["sidecar"]["citations"][0]
+        statuses = {row["ref_id"]: row["status"] for row in citation["source_lineage"]}
+        self.assertEqual(statuses, {"source.news": "declared", "evidence.news": "unknown"})
+        self.assertIn("來源沿革為資料註記、未獨立驗證", rendered["report_markdown"])
+        self.assertIn("來源沿革未知", rendered["report_markdown"])
+        self.assertNotIn("<script>", rendered["report_markdown"])
+
     def test_reposts_share_declared_origin_and_bundle_evidence_can_differ(self):
         from .source_lineage import normalize_source_lineage, validate_source_lineage
 

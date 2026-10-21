@@ -21,6 +21,7 @@ from .semantic_contracts import (REFERENCE_INSTRUCTIONS, EVIDENCE_INSTRUCTIONS, 
                                  semantic_review_schema, review_ref_ids, require_text)
 
 from .financial_review import FINANCIAL_REVIEW_CONTRACT, FINANCIAL_REVIEW_VERSION, ingestion_diagnostics
+from .source_lineage import project_source_lineage
 
 CATALOG_DETAIL_MAX_BYTES = 4096
 
@@ -201,6 +202,13 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
         definitions = _local_calculation_definitions(local_claims, resolved)
         indicators = indicator_definitions({ref: item['value'] for ref, item in resolved.items()
                                              if item['kind'] == 'fact'})
+        lineage_refs = set(resolved)
+        lineage_refs.update(item["value"].get("source_id") for item in resolved.values()
+                            if item.get("kind") in {"fact", "evidence"}
+                            and isinstance(item.get("value"), dict)
+                            and item["value"].get("source_id"))
+        source_lineage = project_source_lineage(
+            getattr(run, "source_lineage", {}), lineage_refs)
         tasks.append(AtomicTask(
             claim_id=cid,
             claim=deepcopy(claim),
@@ -211,6 +219,7 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
                      **({'source_declarations': declarations} if declarations else {}),
                      **({"calculation_definitions": definitions} if definitions else {}),
                      **({'indicator_definitions': indicators} if indicators else {}),
+                     **({'source_lineage': source_lineage} if source_lineage else {}),
                      "evidence_scope": deepcopy(evidence_scope),
                      "trade": deepcopy(getattr(run, "trade", {}))
                      if claim.get("author_role") in {"trader", "risk_manager"} else {}},
