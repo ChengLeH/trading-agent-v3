@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from v3.evidence import EvidencePacket
 from v3.facts import Fact
 from .atomic_phase6 import build_atomic_tasks
@@ -59,10 +60,45 @@ class ReviewContext(unittest.TestCase):
         self.assertEqual(definition['meaning'], 'simple_close_to_close_return')
         task = next(t for t in build_atomic_tasks(runner.run) if t.claim_id == c['claim_id'])
         self.assertEqual(task.context['calculation_definitions']['return_cc'], definition)
+        self.assertEqual(task.review_dict()['resolved_refs']['calc.return']['value']['input_refs'],
+                         ['fact.previous', 'fact.current'])
+        self.assertEqual(task.review_dict()['resolved_refs']['fact.previous']['value']['concept'], 'Close')
+        self.assertEqual(task.review_dict()['resolved_refs']['fact.current']['value']['period'], '2026-10-16')
         other = next(t for t in build_atomic_tasks(runner.run) if t.claim_id == 'independent')
         self.assertNotIn('calculation_definitions', other.context)
         self.assertEqual(runner._global_review_state()['calculation_definitions']['return_cc'], definition)
         self.assertEqual(runner.run.calc_store.to_dict(), before)
+
+    def test_atomic_calculation_definitions_exclude_unrelated_transitive_ancestor(self):
+        runner = seeded()
+        for ref, value in [('fact.previous', 100), ('fact.current', 90)]:
+            runner.run.fact_store.add(Fact(fact_id=ref, value=value, unit='USD',
+                                           period='2026-10-16', concept='Close',
+                                           source_id='fixture', source_pointer=ref, source_hash='fixture'))
+        runner.run.calc_store.add('calc.ancestor_return', -.1, 'return_cc',
+                                  ['fact.previous', 'fact.current'], 'RATIO', {})
+        runner.run.claims[0]['refs'] = ['calc.ancestor_return']
+        child = next(claim for claim in runner.run.claims if claim['claim_id'] == 'c')
+        task = next(task for task in build_atomic_tasks(runner.run) if task.claim_id == child['claim_id'])
+
+        review = task.review_dict()
+
+        self.assertEqual(child['dependencies'], ['b'])
+        self.assertEqual(review['dependency_claims'], [
+            next(claim for claim in runner.run.claims if claim['claim_id'] == 'b')])
+        self.assertEqual(review['resolved_refs'], {})
+        self.assertNotIn('calculation_definitions', review['context'])
+
+    def test_financial_contract_version_change_invalidates_existing_atomic_receipts(self):
+        runner = seeded()
+        review_all(runner)
+        self.assertTrue(runner.receipts)
+
+        with patch('v4.atomic_phase6.FINANCIAL_REVIEW_VERSION', 'financial-evidence/test-next'):
+            runner.prepare_phase6_atomic()
+
+        self.assertFalse(runner.receipts)
+        self.assertTrue(runner.pending_atomic)
 
     def test_external_archive_matches_normal_provenance_lookup(self):
         runner = seeded()

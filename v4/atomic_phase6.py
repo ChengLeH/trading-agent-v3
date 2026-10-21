@@ -104,6 +104,33 @@ def _evidence_scope(run, facts, calcs, evidence, events):
                 source_records_hash=digest(sorted(records, key=lambda r: r["id"])))
 
 
+def _local_calculation_definitions(claims, resolved):
+    """Describe only calculations reachable from the reviewed Claim and its direct parents."""
+    calculations, visited = {}, set()
+
+    def visit(ref):
+        if ref in visited:
+            return
+        visited.add(ref)
+        item = resolved.get(ref)
+        if not item:
+            return
+        value = item["value"]
+        if item["kind"] == "calc":
+            calculations[ref] = value
+            for input_ref in value.get("input_refs", []):
+                visit(input_ref)
+        elif item["kind"] == "event":
+            visit(value["source_ref"])
+            if value.get("aggregate_ref"):
+                visit(value["aggregate_ref"])
+
+    for claim in claims:
+        for ref in claim.get("refs", []) + claim.get("fact_refs", []):
+            visit(ref)
+    return calculation_definitions(calculations)
+
+
 def build_atomic_tasks(run) -> List[AtomicTask]:
     """Create one small review task per claim from explicit refs only."""
 
@@ -169,8 +196,9 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
         for dep in claim.get("dependencies", []):
             dependency(dep)
 
-        definitions = calculation_definitions({ref: item["value"] for ref, item in resolved.items()
-                                               if item["kind"] == "calc"})
+        direct = set(claim.get("dependencies", []))
+        local_claims = [claim] + [parent for parent in deps if parent["claim_id"] in direct]
+        definitions = _local_calculation_definitions(local_claims, resolved)
         indicators = indicator_definitions({ref: item['value'] for ref, item in resolved.items()
                                              if item['kind'] == 'fact'})
         tasks.append(AtomicTask(
