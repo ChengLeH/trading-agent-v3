@@ -217,7 +217,23 @@ class NativeReviewWorkflow(NativeWorkflow):
         journal = RunJournal(self.directory)
         processed = state.get("processed_items", {})
         current_hash = runner._hash()
+
+        def current_epoch(packet):
+            context = packet.get("global_context")
+            return (isinstance(context, dict)
+                    and context.get("verification_epoch") == runner._verification_epoch)
+
+        def raw_global_proof(packet):
+            role = next(iter(packet["items"]))
+            row = packet.get("received", {}).get(role)
+            if not isinstance(row, dict) or not {"executor", "response"} <= row.keys():
+                return None
+            return journal.response_provenance(
+                runner, SimpleNamespace(identity=row["executor"]), role,
+                packet["items"][role]["prompt"], row["response"])
+
         needs_global_replay = any(p.get('kind') == 'global' and p.get('input_hash') == current_hash
+            and current_epoch(p)
             and (p['packet_id'] in state.get('global_outcomes', {}) or not p.get('retired'))
             for p in state.get('packets', {}).values())
         deterministic_blocked = False
@@ -228,13 +244,14 @@ class NativeReviewWorkflow(NativeWorkflow):
         if (not pending_patch and not deterministic_blocked
                 and not runner.deferred_global_findings):
             has_open_global = any(packet.get("kind") == "global" and not packet.get("retired")
-                                  and packet.get("input_hash") == current_hash
+                                  and packet.get("input_hash") == current_hash and current_epoch(packet)
                                   for packet in state.get("packets", {}).values())
             if not has_open_global:
                 for packet in reversed(list(state.get("packets", {}).values())):
                     stored = state.get("global_outcomes", {}).get(packet.get("packet_id"))
                     snapshot = state.get("global_receipt_snapshots", {}).get(packet.get("packet_id"))
                     if (packet.get("kind") != "global" or packet.get("input_hash") != current_hash
+                            or not current_epoch(packet)
                             or not isinstance(stored, dict) or stored.get("status") != "verified"
                             or not isinstance(snapshot, dict) or snapshot.get("input_hash") != current_hash
                             or snapshot.get("findings") != []
@@ -249,18 +266,19 @@ class NativeReviewWorkflow(NativeWorkflow):
                             or snapshot.get("history_hash") != digest(runner.history)):
                         continue
                     require_model_identity(snapshot.get("model"))
+                    proofs_complete = True
                     for candidate in state.get("packets", {}).values():
                         outcome = state.get("global_outcomes", {}).get(candidate.get("packet_id"))
                         if (candidate.get("kind") != "global" or candidate.get("input_hash") != current_hash
+                                or not current_epoch(candidate)
                                 or not isinstance(outcome, dict)
                                 or outcome.get("status") == "blocked:global_contract"):
                             continue
-                        candidate_role = next(iter(candidate["items"]))
-                        candidate_row = candidate.get("received", {}).get(candidate_role)
-                        if candidate_row is None or journal.response_provenance(
-                                runner, SimpleNamespace(identity=candidate_row["executor"]), candidate_role,
-                                candidate["items"][candidate_role]["prompt"], candidate_row["response"]) is None:
-                            raise ValueError("global packet has no verified raw response archive")
+                        if raw_global_proof(candidate) is None:
+                            proofs_complete = False
+                            break
+                    if not proofs_complete:
+                        continue
                     runner.global_receipt = deepcopy(snapshot)
                     runner.pending_global = None
                     runner.global_review_progress = None
@@ -268,7 +286,7 @@ class NativeReviewWorkflow(NativeWorkflow):
                     restored_final_global = packet["packet_id"]
                     break
         for packet in state.get("packets", {}).values():
-            if packet.get("kind") != "global":
+            if packet.get("kind") != "global" or not current_epoch(packet):
                 continue
             role = next(iter(packet["items"]))
             row = packet.get("received", {}).get(role)
@@ -279,11 +297,9 @@ class NativeReviewWorkflow(NativeWorkflow):
             if stored is None or stored.get("status") == "blocked:global_contract":
                 continue
             # An accepted outcome always stays bound to its verified raw archive.
-            proof = journal.response_provenance(
-                runner, SimpleNamespace(identity=row["executor"]), role,
-                packet["items"][role]["prompt"], row["response"])
+            proof = raw_global_proof(packet)
             if proof is None:
-                raise ValueError("global packet has no verified raw response archive")
+                raise ValueError(f"global packet {packet['packet_id']} has no verified raw response archive")
             if packet["input_hash"] != current_hash:
                 # A sweep accepted for a superseded graph version is history;
                 # the repair collector already re-derived or invalidated its
@@ -316,7 +332,10 @@ class NativeReviewWorkflow(NativeWorkflow):
             runner.status = pending_status
         active = state.get("packets", {}).get(state.get("active_packet_id"))
         if active and active.get("kind") == "global" and not active.get("retired"):
-            if deterministic_blocked:
+            if not current_epoch(active):
+                active.update(retired=True, retirement_reason='verification_epoch_changed')
+                state['active_packet_id'] = None
+            elif deterministic_blocked:
                 active.update(retired=True, retirement_reason='deterministic_revalidation_required')
                 state['active_packet_id'] = None
             elif (runner.global_receipt is not None and runner.global_receipt.get('findings')
@@ -334,6 +353,29 @@ class NativeReviewWorkflow(NativeWorkflow):
                     if not self._matches_global(runner, active, request):
                         raise ValueError("pending global packet mismatches canonical request")
         linked = state.get("accepted_links")
+        if linked is not None and linked.get("input_hash") == current_hash:
+            linked_epoch = linked.get("verification_epoch")
+            if linked_epoch is None:
+                source_epochs = set()
+                for packet_id, snapshot in state.get("global_receipt_snapshots", {}).items():
+                    packet = state["packets"].get(packet_id, {})
+                    context = packet.get("global_context", {})
+                    if not isinstance(snapshot, dict) or not isinstance(context, dict):
+                        continue
+                    if (snapshot.get("input_hash") == current_hash
+                            and digest(snapshot.get("findings")) == linked.get("source_hash")
+                            and context.get("verification_epoch")):
+                        source_epochs.add(context["verification_epoch"])
+                if len(source_epochs) == 1:
+                    linked_epoch = next(iter(source_epochs))
+            if linked_epoch != runner._verification_epoch:
+                state.setdefault("historical_links", []).append(deepcopy(state.pop("accepted_links")))
+                deferred = {f["finding_id"]: deepcopy(f) for f in runner.deferred_global_findings}
+                for finding in linked["findings"]:
+                    deferred.setdefault(finding["finding_id"], deepcopy(finding))
+                runner.deferred_global_findings = list(deferred.values())
+                self._save(state, runner)
+                linked = None
         if linked is not None and linked.get("input_hash") == current_hash:
             packet = state["packets"].get(linked.get("packet_id"))
             if packet is None or packet.get("kind") != "link":
@@ -511,6 +553,7 @@ class NativeReviewWorkflow(NativeWorkflow):
                 active = state["packets"].get(state.get("active_packet_id"))
                 if (active and active.get("kind") == "link" and not active.get("retired")
                         and active["input_hash"] == state["input_hash"]
+                        and active.get("verification_epoch") == runner._verification_epoch
                         and active["items"][LINK_ROLE]["prompt"] == prompt):
                     if LINK_ROLE not in active["received"]:
                         self._save(state, runner)
@@ -524,11 +567,13 @@ class NativeReviewWorkflow(NativeWorkflow):
                         state["active_packet_id"] = None
                 for stale in state["packets"].values():
                     if (stale.get("kind") == "link" and not stale.get("retired")
-                            and stale["items"][LINK_ROLE]["prompt"] != prompt):
+                            and (stale["items"][LINK_ROLE]["prompt"] != prompt
+                                 or stale.get("verification_epoch") != runner._verification_epoch)):
                         stale["retired"] = True
                 packet_id = uuid4().hex
                 state["packets"][packet_id] = dict(
                     packet_id=packet_id, kind="link", input_hash=state["input_hash"],
+                    verification_epoch=runner._verification_epoch,
                     unrouted_finding_ids=[finding.get("finding_id")
                                           for finding in prepared.get("unrouted_findings", [])],
                     items={LINK_ROLE: dict(prompt=prompt)}, received={})
@@ -774,7 +819,8 @@ class NativeReviewWorkflow(NativeWorkflow):
         """Validate and archive one semantic Claim mapping, without claiming PASS."""
         role = LINK_ROLE
         if (packet.get("kind") != "link" or packet.get("retired")
-                or packet["input_hash"] != state["input_hash"]):
+                or packet["input_hash"] != state["input_hash"]
+                or packet.get("verification_epoch") != runner._verification_epoch):
             raise ValueError("stale or retired finding linker packet")
         row = packet.get("received", {}).get(role)
         if row is None:
@@ -804,6 +850,7 @@ class NativeReviewWorkflow(NativeWorkflow):
                 prompt=prompt, response=deepcopy(row["response"]))
             state["accepted_links"] = dict(
                 input_hash=state["input_hash"], source_hash=digest(original),
+                verification_epoch=runner._verification_epoch,
                 packet_id=packet["packet_id"], findings=resolved,
                 executor=row["executor"], response=deepcopy(row["response"]))
         except (ValueError, TypeError, KeyError) as exc:

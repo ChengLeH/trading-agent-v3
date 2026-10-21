@@ -671,6 +671,46 @@ class NativeGlobalFindingsPatch(NativeReviews):
         answer['findings'] = [finding]
         return workflow.submit(packet['packet_id'], {role: answer}, 'host/same', packet['input_hash'])
 
+    def test_epoch_reset_retires_accepted_links_and_preserves_findings_for_new_review(self):
+        from copy import deepcopy
+        from uuid import uuid4
+        for legacy in (False, True):
+            with self.subTest(legacy_link=legacy), tempfile.TemporaryDirectory() as root:
+                workflow = self.bootstrap(root)
+                finding = dict(unresolved=True, issue='Unmapped fixture claim', evidence='fixture',
+                               suggested_fix='Find the actual target and repair it.')
+                self._global_with_findings(workflow, finding)
+                link = workflow.next()
+                result = workflow.submit(link['packet_id'], {'finding_linker': [dict(
+                    finding_index=0, claim_ids=['a'], unresolved=False, reason='Target is a.')]},
+                    'host/linker', link['input_hash'])
+                self.assertEqual(result['status'], 'linked', result)
+                with workflow.queue.transaction() as state:
+                    runner = workflow._load(state)
+                    if legacy:
+                        state['accepted_links'].pop('verification_epoch', None)
+                        runner = workflow._load(state)
+                        self.assertIsNotNone(runner.global_receipt)
+                    original_links = deepcopy(state['accepted_links'])
+                    runner._verification_epoch = uuid4().hex
+                    workflow._save(state, runner)
+                resumed = NativeReviewWorkflow(workflow.directory)
+                self.assertEqual(resumed.next()['kind'], 'atomic')
+                with resumed.queue.transaction() as state:
+                    self.assertNotIn('accepted_links', state)
+                    self.assertEqual(state['historical_links'][-1], original_links)
+                    runner = resumed._load(state)
+                    self.assertTrue({f['finding_id'] for f in original_links['findings']} <=
+                                    {f['finding_id'] for f in runner.deferred_global_findings})
+                new_global = self._reach_global(resumed)
+                response = self._global_response(resumed)
+                response['findings'] = [finding]
+                resumed.submit(new_global['packet_id'], {next(iter(new_global['items'])): response},
+                               'host/global', new_global['input_hash'])
+                new_link = resumed.next()
+                self.assertEqual(new_link['kind'], 'link', new_link)
+                self.assertNotEqual(new_link['packet_id'], link['packet_id'])
+
     def test_unrouted_global_finding_links_then_patches_then_revalidates(self):
         with tempfile.TemporaryDirectory() as root:
             workflow = self.bootstrap(root)

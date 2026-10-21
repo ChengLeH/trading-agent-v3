@@ -91,6 +91,83 @@ class GlobalEvidenceResolutions(unittest.TestCase):
             target_reviews=reviewed,
         )
 
+    def _completed_resolution_workflow(self, root):
+        workflow = self._bootstrap(root)
+        packet = self._reach_global(workflow)
+        response = self._native_global_response(workflow)
+        response['findings'] = [self._finding(['b'])]
+        workflow.submit(packet['packet_id'], {next(iter(packet['items'])): response},
+                        'host/global', packet['input_hash'])
+        with workflow.queue.transaction() as state:
+            runner = workflow._load(state)
+            finding_id = runner.deferred_global_findings[0]['finding_id']
+            runner.prepare_phase6_revision_v4([dict(claim_id='b', issue='Narrow the proposition',
+                evidence='Current source supports only a narrower statement.', suggested_fix='Revise b.')])
+            runner.collect_phase6_revision([dict(claim_id='b', text='The supported narrower proposition.')])
+            workflow._save(state, runner)
+        packet = self._reach_global(workflow)
+        response = self._native_global_response(workflow)
+        response['resolved_external_findings'] = [self._claim_revised_row(finding_id, ['b'], [
+            dict(claim_id='b', status='resolved', reason='The revised target is supported.')])]
+        result = workflow.submit(packet['packet_id'], {next(iter(packet['items'])): response},
+                                 'host/global', packet['input_hash'])
+        self.assertEqual(result['status'], 'verified', result)
+        return workflow, packet['packet_id']
+
+    def test_old_epoch_packet_without_received_row_does_not_poison_current_recovery(self):
+        from copy import deepcopy
+        from uuid import uuid4
+        with tempfile.TemporaryDirectory() as root:
+            workflow, final_id = self._completed_resolution_workflow(root)
+            with workflow.queue.transaction() as state:
+                historical = deepcopy(state['packets'][final_id])
+                historical['packet_id'] = uuid4().hex
+                historical['global_context']['verification_epoch'] = uuid4().hex
+                historical['received'] = {}
+                state['packets'][historical['packet_id']] = historical
+                state['global_outcomes'][historical['packet_id']] = deepcopy(state['global_outcomes'][final_id])
+            for _ in range(2):
+                self.assertEqual(NativeReviewWorkflow(workflow.directory).next()['status'], 'complete')
+
+    def test_current_epoch_missing_received_row_or_archive_still_requires_raw_proof(self):
+        for missing in ('received', 'archive'):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as root:
+                workflow, final_id = self._completed_resolution_workflow(root)
+                with workflow.queue.transaction() as state:
+                    packet = state['packets'][final_id]
+                    role = next(iter(packet['items']))
+                    response = packet['received'][role]['response']
+                    if missing == 'received':
+                        packet['received'] = {}
+                if missing == 'archive':
+                    paths = [path for path in (workflow.directory / 'responses' / 'archive').glob('*.json')
+                             if json.loads(path.read_text())['response'] == response]
+                    self.assertTrue(paths)
+                    for path in paths:
+                        path.unlink()
+                with self.assertRaisesRegex(ValueError, f'{final_id}.*verified raw response archive'):
+                    NativeReviewWorkflow(workflow.directory).next()
+
+    def test_new_epoch_requires_new_global_instead_of_restoring_old_resolution(self):
+        from uuid import uuid4
+        for active in (False, True):
+            with self.subTest(old_packet_active=active), tempfile.TemporaryDirectory() as root:
+                workflow, final_id = self._completed_resolution_workflow(root)
+                with workflow.queue.transaction() as state:
+                    runner = workflow._load(state)
+                    runner._verification_epoch = uuid4().hex
+                    workflow._save(state, runner)
+                    if active:
+                        state['packets'][final_id]['retired'] = False
+                        state['active_packet_id'] = final_id
+                packet = self._reach_global(NativeReviewWorkflow(workflow.directory))
+                self.assertEqual(packet['kind'], 'global')
+                self.assertNotEqual(packet['packet_id'], final_id)
+                if active:
+                    with workflow.queue.transaction() as state:
+                        self.assertEqual(state['packets'][final_id]['retirement_reason'],
+                                         'verification_epoch_changed')
+
     def test_claim_revised_requires_all_targets_and_relevant_history(self):
         runner = seeded()
         review_all(runner)
