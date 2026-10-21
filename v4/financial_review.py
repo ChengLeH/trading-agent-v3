@@ -1,7 +1,7 @@
 """Shared semantic obligations for existing LLM stages, not a new classifier."""
 FINANCIAL_REVIEW_VERSION = 'financial-evidence/5'
 FINANCIAL_REVIEW_CONTRACT = '''
-金融證據契約 financial-evidence/4：這些是語義核對責任，不是以字詞命中判錯。
+金融證據契約 financial-evidence/5：這些是語義核對責任，不是以字詞命中判錯。
 來源原始值、計算值與展示值須區分；assertion.value 保留 canonical 值。
 可另附 assertion.presentation={value,unit,decimal_places,rounding:half_up|half_even} 明示換單位與捨入。
 合理四捨五入或不同抓取時點造成的小差異，若來源、時間與精度足以解釋，不列重大錯誤；

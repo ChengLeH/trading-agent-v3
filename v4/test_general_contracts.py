@@ -292,6 +292,10 @@ class EvidenceRecoveryContracts(unittest.TestCase):
 
 
 class SemanticContextContracts(unittest.TestCase):
+    def test_financial_contract_text_names_the_current_version(self):
+        from .financial_review import FINANCIAL_REVIEW_CONTRACT, FINANCIAL_REVIEW_VERSION
+        self.assertIn(FINANCIAL_REVIEW_VERSION, FINANCIAL_REVIEW_CONTRACT)
+
     def test_financial_obligations_reach_roles_atomic_deep_patch_and_global(self):
         from .runner import ROLE_CONTRACT
         from .financial_review import FINANCIAL_REVIEW_CONTRACT, FINANCIAL_REVIEW_VERSION
