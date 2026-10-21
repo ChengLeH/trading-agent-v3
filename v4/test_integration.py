@@ -504,8 +504,8 @@ class Integration(unittest.TestCase):
     def test_typed_calculation_dag_and_mismatch(self):
         from .pipeline import calculation_findings
         r = seeded()
-        for fid, value in (("start", 10), ("end", 20)):
-            r.run.fact_store.add(Fact(fid, value, "USD", "2026", concept="Amount", source_id="fixture"))
+        for fid, value, period in (("start", 10, "2025"), ("end", 20, "2026")):
+            r.run.fact_store.add(Fact(fid, value, "USD", period, concept="Amount", source_id="fixture"))
         r.run.calc_store.add("first", 1.0, "growth", ["end", "start"])
         r.run.calc_store.add("second", 19.0, "fcf", ["end", "first"])
         self.assertFalse(any(f["status"] == "FAIL" for f in calculation_findings(r.run)))

@@ -11,6 +11,8 @@ import math
 
 from v3.facts import Fact, FactStore
 from .precision import number
+from .financial_data import (statement_metadata, period_dimensions, source_unit,
+                             disambiguate_fact_ids)
 
 
 ALIASES = {
@@ -21,7 +23,14 @@ ALIASES = {
 }
 KNOWN_INPUT_FIELDS = {key for aliases in ALIASES.values() for key in aliases} | {
     "fiscal_year", "fiscal_period", "unit", "currency", "basis", "precision",
-    "equity_attribution", "statement_scope", "entity", "redeemable_nci_inclusion",
+    "equity_attribution", "statement_scope", "scope", "entity", "share_basis",
+    "redeemable_nci_inclusion", "period", "period_type", "period_coverage",
+    "start", "end", "start_date", "end_date", "period_start", "period_end",
+    "effective_date", "observation_date", "published_or_filing_time", "filing_date",
+    "published_date", "available_date", "accepted_at", "accession_or_version",
+    "accession_number", "accession", "version", "scale", "unit_scale",
+    "debt_components_complete", "current_portion_in_short_term_debt", "total_debt",
+    "reported_total_debt",
 }
 KNOWN_INPUT_FIELDS |= {
     # Existing deterministic V3 statement adapter fields. Coverage reports
@@ -70,7 +79,7 @@ def extract_financial_statements(record):
                                 "financial_metadata and financial_statement_metadata disagree; using financial_statement_metadata")]
     else:
         findings = []
-    metadata = {**metadata, **getattr(record, 'meta', {}).get('financial_statement_declarations', {})}
+    metadata = statement_metadata(record)
     facts, coverage = [], []
     for section in ("income", "balance"):
         rows = payload.get(section, [])
@@ -85,12 +94,18 @@ def extract_financial_statements(record):
                 continue
             year = row.get("fiscal_year")
             fiscal_period = row.get("fiscal_period", "FY")
-            period = f"FY{year}" if fiscal_period == "FY" else f"FY{year}-{fiscal_period}"
             if type(year) is not int or not isinstance(fiscal_period, str) or not fiscal_period:
                 findings.append(_diagnostic(record, section, index, "WARN", "financial_period_unknown",
                     "row lacks a valid fiscal year or period",
                     fields=sorted(k for k, v in row.items() if v is not None)))
                 continue
+            try:
+                period_dims = period_dimensions(row, section, metadata)
+            except (ValueError, TypeError) as exc:
+                findings.append(_diagnostic(record, section, index, "WARN", "financial_period_unknown",
+                                            str(exc)))
+                continue
+            period = period_dims['period']
             explicit = {k: v for k, v in row.items() if k not in KNOWN_INPUT_FIELDS and v is not None}
             produced = []
             values = {}
@@ -126,9 +141,7 @@ def extract_financial_statements(record):
                                                 f"conflicting explicit aliases for {concept}", fields=present))
                     continue
                 value = row[present[0]]
-                unit = row.get("unit", metadata.get("unit"))
-                currency = row.get("currency", metadata.get("currency"))
-                unit = unit or (currency if currency else None)
+                unit = source_unit(row, metadata, None)
                 basis = row.get("basis", metadata.get("basis", "unknown"))
                 if not unit:
                     findings.append(_diagnostic(record, section, index, "WARN", "financial_unit_unknown",
@@ -136,17 +149,22 @@ def extract_financial_statements(record):
                     continue
                 fact_id = _fact_id(concept, period, record.id)
                 fact = Fact(fact_id, value, unit, period,
+                    start=period_dims['start'], end=period_dims['end'],
                     fiscal_year=year, fiscal_period=fiscal_period, concept=concept, basis=basis,
                     scope="parent" if concept == "ParentEquity" else "consolidated",
                     source_id=record.id, source_pointer=f"{section}[{index}].{present[0]}",
                     source_hash=record.source_hash,
-                    entity=row.get("entity", metadata.get("entity", record.subject_ticker or "")))
+                    accession_or_version=period_dims['accession_or_version'],
+                    effective_date=str(period_dims['effective_date'] or ''),
+                    entity=row.get("entity", metadata.get("entity", record.subject_ticker or "")),
+                    period_type=period_dims['period_type'], period_coverage=period_dims['period_coverage'],
+                    published_or_filing_time=str(period_dims['published_or_filing_time'] or ''))
                 facts.append(fact); produced.append(concept); values[concept] = fact
             if section == "balance" and row.get("total_equity") is not None:
                 attribution = row.get("equity_attribution", metadata.get("equity_attribution"))
                 if attribution in ("parent", "consolidated"):
                     concept = "ParentEquity" if attribution == "parent" else "ConsolidatedEquity"
-                    unit = row.get("unit", metadata.get("unit")) or row.get("currency", metadata.get("currency"))
+                    unit = source_unit(row, metadata, None)
                     value = row["total_equity"]
                     if type(value) not in (int, float) or not math.isfinite(value) or not unit:
                         findings.append(_diagnostic(record, section, index, "WARN", "financial_value_invalid",
@@ -157,10 +175,15 @@ def extract_financial_statements(record):
                     elif concept not in values:
                         fact_id = _fact_id(concept, period, record.id)
                         fact = Fact(fact_id, value, unit, period, fiscal_year=year,
+                            start=period_dims['start'], end=period_dims['end'],
                             fiscal_period=fiscal_period, concept=concept, basis=row.get("basis", metadata.get("basis", "unknown")),
                             scope=attribution, source_id=record.id,
                             source_pointer=f"{section}[{index}].total_equity", source_hash=record.source_hash,
-                            entity=row.get("entity", metadata.get("entity", record.subject_ticker or "")))
+                            accession_or_version=period_dims['accession_or_version'],
+                            effective_date=str(period_dims['effective_date'] or ''),
+                            entity=row.get("entity", metadata.get("entity", record.subject_ticker or "")),
+                            period_type=period_dims['period_type'], period_coverage=period_dims['period_coverage'],
+                            published_or_filing_time=str(period_dims['published_or_filing_time'] or ''))
                         facts.append(fact); produced.append(concept); values[concept] = fact
                 else:
                     findings.append(_diagnostic(record, section, index, "WARN", "equity_attribution_unknown",
@@ -172,7 +195,11 @@ def extract_financial_statements(record):
                                  period=period,
                                  produced_concepts=produced, unmapped_fields=sorted(explicit),
                                  precision=declared_precision,
-                                 redeemable_nci_inclusion=row.get("redeemable_nci_inclusion", metadata.get("redeemable_nci_inclusion"))))
+                                 redeemable_nci_inclusion=row.get("redeemable_nci_inclusion", metadata.get("redeemable_nci_inclusion")),
+                                 period_type=period_dims['period_type'], period_coverage=period_dims['period_coverage'],
+                                 start=period_dims['start'], end=period_dims['end'],
+                                 published_or_filing_time=period_dims['published_or_filing_time'],
+                                 accession_or_version=period_dims['accession_or_version']))
     return facts, dict(section="financial_statements", source_id=record.id,
                        source_hash=record.source_hash, coverage=coverage, findings=findings)
 
@@ -203,6 +230,7 @@ def augment_financial_statements(run, report):
     """Attach adapter facts/diagnostics after the existing V3 build."""
     additions = [(rec, *extract_financial_statements(rec)) for rec in run.records
                  if getattr(rec, "type", None) == "openbb_fundamentals"]
+    disambiguate_fact_ids(additions)
     source_ids = {rec.id for rec, _, _ in additions}
     existing = run.fact_store.to_dict()
     owned = set(ALIASES)
@@ -222,6 +250,7 @@ def augment_financial_statements(run, report):
         diagnostics.append(deepcopy(diagnostic))
         report["facts"] += len(facts) - len(removed)
         report["limitations"].extend(f["reason"] for f in diagnostic["findings"])
+        report["limitations"].extend(diagnostic.get("limitations", []))
     report["financial_statement_coverage"] = diagnostics
     report["financial_statement_findings"] = financial_statement_findings(run)
     return report
@@ -233,6 +262,8 @@ def financial_statement_findings(run):
     for rec in getattr(run, "records", []):
         diag = getattr(rec, "meta", {}).get("financial_statement_extraction", {})
         out.extend(deepcopy(diag.get("findings", [])))
+        normalized = getattr(rec, "meta", {}).get("financial_data_extraction", {})
+        out.extend(deepcopy(normalized.get("findings", [])))
     facts = run.fact_store.to_dict()
     by_key = {}
     for fid, f in facts.items():

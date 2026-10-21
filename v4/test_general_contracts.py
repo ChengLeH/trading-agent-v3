@@ -38,8 +38,10 @@ class PrecisionContracts(unittest.TestCase):
         from .pipeline import calculation_findings
         from types import SimpleNamespace
         store=FactStore()
-        for fid,value in [('current',123.456),('prior',100)]:
-            store.add(Fact(fid,value,'USD','FY2030',concept='Revenue',source_id='fixture'))
+        for fid,value,period in [('current',123.456,'FY2030'),('prior',100,'FY2029')]:
+            store.add(Fact(fid,value,'USD',period,concept='Revenue',entity='TEST',
+                           basis='gaap',scope='consolidated',share_basis='not_applicable',
+                           source_id='fixture'))
         def check(value, meta=None):
             calcs=CalcStore();calcs.add('growth',value,'growth',['current','prior'],'RATIO',meta)
             return calculation_findings(SimpleNamespace(fact_store=store,calc_store=calcs))

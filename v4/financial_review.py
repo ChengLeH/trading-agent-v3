@@ -28,5 +28,6 @@ def ingestion_diagnostics(run):
     """Typed adapter diagnostics, including explicit coverage gaps."""
     from copy import deepcopy
     return [deepcopy(rec.meta[key]) for rec in getattr(run, 'records', [])
-            for key in ('cash_flow_extraction', 'financial_statement_extraction')
+            for key in ('cash_flow_extraction', 'financial_statement_extraction',
+                        'financial_data_extraction', 'market_data_extraction')
             if getattr(rec, 'meta', {}).get(key)]

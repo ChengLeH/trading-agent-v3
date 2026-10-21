@@ -35,6 +35,11 @@ class Fact:
     effective_date: str = ""              # YYYY-MM-DD; required for latest/current FACTs
     # --- entity binding (was entity_period_consistency checker, removed 2026-10-16) ---
     entity: str = ""                      # e.g. "OpenAI", "MBZUAI"; "" if not entity-specific
+    # Additive V4 canonical dimensions. Existing V3 builders keep their
+    # behavior; callers that do not declare these values retain safe defaults.
+    period_type: str = "unknown"           # instant | duration | rolling | unknown
+    period_coverage: str = "unknown"       # annual | single_period | year_to_date | rolling | point_in_time | unknown
+    published_or_filing_time: str = ""     # when this value became publicly available
 
     def identity_key(self) -> str:
         """Metric identity for cross-report consistency (spec §16)."""
@@ -42,7 +47,17 @@ class Fact:
                          self.basis, self.scope, self.share_basis])
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        # Keep V3's serialized schema stable when callers leave the additive
+        # V4 dimensions at their defaults. V4 facts with declared metadata
+        # persist those fields through the same canonical store.
+        if self.period_type == "unknown":
+            data.pop("period_type")
+        if self.period_coverage == "unknown":
+            data.pop("period_coverage")
+        if not self.published_or_filing_time:
+            data.pop("published_or_filing_time")
+        return data
 
 
 class FactStore:

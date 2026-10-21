@@ -16,10 +16,13 @@ def number(value):
 
 def unit(value):
     text = value.strip()
-    scales = {'thousand': Decimal(1000), 'million': Decimal(1000000), 'billion': Decimal(1000000000)}
+    scales = {'thousand': Decimal(1000), 'thousands': Decimal(1000),
+              'million': Decimal(1000000), 'millions': Decimal(1000000),
+              'billion': Decimal(1000000000), 'billions': Decimal(1000000000)}
     pieces = text.split()
-    if len(pieces) == 2 and len(pieces[0]) == 3 and pieces[0].isupper() and pieces[1] in scales:
-        return pieces[0], scales[pieces[1]]
+    scale = pieces[1].casefold() if len(pieces) == 2 else None
+    if len(pieces) == 2 and len(pieces[0]) == 3 and pieces[0].isupper() and scale in scales:
+        return pieces[0], scales[scale]
     if len(text) == 3 and text.isascii() and text.isupper() and text not in {'PCT'}:
         return text, Decimal(1)
     if text.casefold() == 'shares':
@@ -35,7 +38,9 @@ def known_unit(value):
     text = value.strip()
     currency = text.split()[0] if text.split() else ''
     if len(currency) == 3 and currency.isascii() and currency.isalpha() and currency.isupper():
-        return len(text.split()) == 1 or text.split()[1:] in [['thousand'], ['million'], ['billion']]
+        return (len(text.split()) == 1 or
+                (len(text.split()) == 2 and text.split()[1].casefold() in {
+                    'thousand', 'thousands', 'million', 'millions', 'billion', 'billions'}))
     if text.endswith('_PER_SHARE'):
         prefix = text.removesuffix('_PER_SHARE')
         return len(prefix) == 3 and prefix.isascii() and prefix.isalpha() and prefix.isupper()
@@ -46,6 +51,14 @@ def period(value):
     text = value.strip().upper()
     # Lexical grammar applies only to an explicit typed period field. No
     # dates or meanings are inferred from Claim prose or publication dates.
+    if text.startswith('FY'):
+        body = text[2:].strip(' -')
+        parts = body.replace('_', '-').split('-')
+        if len(parts) == 1 and len(parts[0]) == 4 and parts[0].isascii() and parts[0].isdigit():
+            return 'FY' + parts[0]
+        if (len(parts) == 2 and len(parts[0]) == 4 and parts[0].isascii()
+                and parts[0].isdigit() and parts[1] in {'Q1','Q2','Q3','Q4','H1','H2','YTD','TTM'}):
+            return parts[0] + '-' + parts[1]
     fiscal = text.removeprefix('FY').strip(' -') if text.startswith('FY') else text.removesuffix('FY').strip(' -') if text.endswith('FY') else ''
     if len(fiscal) == 4 and fiscal.isascii() and fiscal.isdigit():
         return 'FY' + fiscal

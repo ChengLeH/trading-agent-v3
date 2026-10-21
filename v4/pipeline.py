@@ -63,6 +63,147 @@ def validate_trade_claim(claims, trade):
         raise ValueError("canonical trade_plan Claim differs from derived trade state")
 
 
+def _known(value):
+    return value not in (None, "", "unknown", "UNKNOWN")
+
+
+def _calculation_dimensions(calc, facts, calcs):
+    """Check only dimensions a typed operation requires to be compatible."""
+    kind, refs, meta = calc["calc_type"], calc.get("input_refs", []), calc.get("meta", {})
+    inputs = []
+    for ref in refs:
+        if ref in facts:
+            inputs.append(facts[ref])
+        elif ref in calcs:
+            prior = calcs[ref]
+            inherited = dict(prior.get("meta", {}), unit=prior.get("unit", ""),
+                             period=prior.get("meta", {}).get("period", "unknown"))
+            inputs.append(inherited)
+        else:
+            return "missing calculation input", []
+    warnings = []
+    if kind in {"growth", "cagr", "fcf", "margin", "return_cc", "volume_ratio",
+                "derived_pct", "ev", "per_share", "risk_reward", "position_risk"}:
+        for dimension in ("entity",):
+            values = [row.get(dimension) for row in inputs]
+            known = [value for value in values if _known(value)]
+            if len(set(known)) > 1:
+                return f"input dimension mismatch for {dimension}: {known}", warnings
+            if len(known) != len(values):
+                warnings.append(f"input {dimension} is not fully declared")
+
+    def same_value(dimension, selected=inputs):
+        values = [row.get(dimension) for row in selected]
+        known = [value.strip().casefold() if isinstance(value, str) else value
+                 for value in values if _known(value)]
+        if len(set(known)) > 1:
+            return f"input dimension mismatch for {dimension}: {known}"
+        if known and len(known) != len(values):
+            warnings.append(f"input {dimension} is not fully declared")
+        return None
+
+    def same_unit(selected=inputs):
+        from .precision import unit, known_unit
+        parsed = []
+        unknown = False
+        for row in selected:
+            value = row.get("unit", "")
+            if not isinstance(value, str) or not value.strip() or not known_unit(value):
+                unknown = True
+                continue
+            parsed.append(unit(value))
+        if len({item[0] for item in parsed}) > 1:
+            return "input dimension mismatch for unit family"
+        if len({item[1] for item in parsed}) > 1:
+            return "input dimension mismatch for unit scale; explicit conversion is required"
+        if unknown or len(parsed) != len(selected):
+            warnings.append("input unit is not fully declared")
+        return None
+
+    def same_period(selected=inputs):
+        return same_value("period", selected)
+
+    def same_period_shape(selected=inputs):
+        for dimension in ("period_type", "period_coverage"):
+            mismatch = same_value(dimension, selected)
+            if mismatch:
+                return mismatch
+        return None
+
+    def same_basis_scope(selected=inputs):
+        for dimension in ("basis", "scope", "share_basis"):
+            mismatch = same_value(dimension, selected)
+            if mismatch:
+                return mismatch
+        return None
+
+    error = None
+    if kind in {"fcf", "margin", "volume_ratio"}:
+        error = same_unit() or same_period() or same_period_shape() or same_basis_scope()
+    elif kind in {"growth", "cagr"}:
+        error = same_unit() or same_period_shape() or same_basis_scope()
+        if not error and len(inputs) >= 2:
+            concepts = [row.get("concept") for row in inputs]
+            declared = [value for value in concepts if _known(value)]
+            if len(set(declared)) > 1:
+                error = f"input dimension mismatch for concept: {declared}"
+            periods = [row.get("period") for row in inputs]
+            known_periods = [value for value in periods if _known(value)]
+            if len(known_periods) >= 2 and known_periods[0] == known_periods[1]:
+                error = "growth inputs must represent distinct periods"
+            years = [row.get("fiscal_year") for row in inputs]
+            if (not error and kind == "cagr" and len(years) >= 2
+                    and all(type(year) is int for year in years)
+                    and type(meta.get("years")) in (int, float)
+                    and abs((years[1] - years[0]) - meta["years"]) > 1e-9):
+                error = "CAGR years do not match input fiscal-year interval"
+    elif kind == "return_cc":
+        error = same_unit() or same_value("basis")
+        if not error and len(inputs) >= 2:
+            left, right = inputs[0].get("effective_date"), inputs[1].get("effective_date")
+            if left and right:
+                try:
+                    if date.fromisoformat(left[:10]) >= date.fromisoformat(right[:10]):
+                        error = "close-to-close inputs are not in chronological order"
+                except (ValueError, TypeError):
+                    warnings.append("close-to-close observation dates are not parseable")
+    elif kind == "derived_pct":
+        error = same_unit()
+    elif kind == "ev":
+        error = same_unit()
+        if not error:
+            periods = [row.get("period") for row in inputs]
+            known_periods = [value for value in periods if _known(value)]
+            if len(set(known_periods)) > 1 and not meta.get("time_policy"):
+                error = "EV inputs span observation periods without an explicit time_policy"
+    elif kind == "per_share":
+        error = same_basis_scope()
+        if not error and len(inputs) >= 2:
+            from .precision import known_unit
+            for row, key in zip(inputs[:2], ("total_unit", "shares_unit")):
+                declared = meta.get(key)
+                actual = row.get("unit")
+                if declared and actual and known_unit(declared) and known_unit(actual):
+                    from .precision import unit
+                    if unit(declared) != unit(actual):
+                        error = f"per-share {key} does not match its canonical input"
+                        break
+    elif kind == "risk_reward":
+        error = same_unit(inputs[:3]) if len(inputs) >= 3 else None
+        if not error:
+            error = (same_period(inputs[:3]) or same_period_shape(inputs[:3])
+                     or same_value("basis", inputs[:3])) if len(inputs) >= 3 else None
+    elif kind == "position_risk":
+        error = same_unit(inputs[:2]) if len(inputs) >= 2 else None
+        if not error and len(inputs) >= 3:
+            error = same_value("basis", inputs[:2])
+        if not error and len(inputs) >= 3:
+            unit = inputs[2].get("unit")
+            if _known(unit) and str(unit).upper() not in {"PERCENT", "PCT", "%"}:
+                error = "position_risk position input must be a percentage"
+    return error, list(dict.fromkeys(warnings))
+
+
 def calculation_findings(run):
     """Recompute typed operations using V3's pure finance kernel."""
     facts, calcs = run.fact_store.to_dict(), run.calc_store.to_dict()
@@ -85,6 +226,12 @@ def calculation_findings(run):
             else:
                 raise ValueError(f"missing calculation input: {ref}")
         meta, kind = c.get("meta", {}), c["calc_type"]
+        mismatch, dimension_warnings = _calculation_dimensions(c, facts, calcs)
+        for reason in dimension_warnings:
+            out.append(dict(status="WARN", object_id=cid, check_id="calculation_inputs",
+                            reason=reason))
+        if mismatch:
+            raise ValueError(mismatch)
         operations = {
             "fcf": lambda: K.calc_fcf(*vals),
             "growth": lambda: K.calc_growth(*vals),
@@ -121,6 +268,65 @@ def calculation_findings(run):
     return out
 
 
+def freshness_findings(run):
+    """Apply only the freshness tolerance explicitly supplied for this run."""
+    facts = run.fact_store.to_dict()
+    calcs = run.calc_store.to_dict()
+    try:
+        as_of = date.fromisoformat(run.manifest.get("as_of", "")[:10])
+    except (ValueError, TypeError, AttributeError):
+        return [dict(status="FAIL", object_id="as_of", check_id="freshness_policy",
+                     reason="freshness checks require an ISO analysis date")]
+    tolerance = run.manifest.get("freshness_tolerance_days")
+    if tolerance is not None and (type(tolerance) is not int or tolerance < 0):
+        return [dict(status="FAIL", object_id="freshness_tolerance_days",
+                     check_id="freshness_policy",
+                     reason="freshness_tolerance_days must be a nonnegative integer")]
+    current = [(fid, fact) for fid, fact in facts.items()
+               if fid.endswith((".latest", ".current"))]
+    if not current:
+        return []
+    if tolerance is None:
+        return [dict(status="WARN", object_id="freshness_tolerance_days",
+            check_id="freshness_policy",
+            reason="freshness policy is not declared; latest/current dates are reported without an inferred age limit")]
+    out = []
+
+    def check_date(object_id, row, *, source_ref=None):
+        effective = row.get("effective_date")
+        if not effective:
+            out.append(dict(status="FAIL", object_id=object_id, check_id="freshness",
+                reason="latest/current data has no explicit effective_date",
+                **({"ref_id": source_ref} if source_ref else {})))
+            return
+        try:
+            observed = date.fromisoformat(effective[:10])
+        except (ValueError, TypeError):
+            out.append(dict(status="FAIL", object_id=object_id, check_id="freshness",
+                reason="latest/current effective_date is invalid"))
+            return
+        age = (as_of - observed).days
+        if age < 0:
+            out.append(dict(status="FAIL", object_id=object_id, check_id="freshness",
+                reason="latest/current observation is after the analysis date"))
+        elif age > tolerance:
+            out.append(dict(status="FAIL", object_id=object_id, check_id="freshness",
+                reason=f"latest/current observation is {age} calendar days old; declared tolerance is {tolerance}"))
+
+    for fid, fact in current:
+        check_date(fid, fact)
+    # A latest/current calculation inherits the freshness obligation from all
+    # canonical fact inputs; historical calculations and annual statements do not.
+    for cid, calc in calcs.items():
+        if not cid.endswith((".latest", ".current")):
+            continue
+        for ref in calc.get("input_refs", []):
+            fact = facts.get(ref)
+            if fact is not None and fact.get("effective_date"):
+                check_date(cid, fact, source_ref=ref)
+    return out
+
+
 class OrchestratorV4(Orchestrator):
     def require_issuer_identity(self, run_id):
         from .issuer_identity import verify_issuer, IssuerIdentityError
@@ -138,47 +344,97 @@ class OrchestratorV4(Orchestrator):
         yielding an incorrect period for a correctly sourced revenue Claim.
         This V4-only correction preserves V3 behavior and all source facts.
         """
-        from .cash_flow import build_with_cash_flow
-        report = build_with_cash_flow(self, run_id, super().build_facts)
         run = self.runs[run_id]
+        from .cash_flow import build_with_cash_flow
+        from .market_data import normalize_market_record, annotate_market_facts
+        from .financial_data import augment_financial_facts, prepare_legacy_builder_view
+        original_records = run.records
+        builder_records = deepcopy(original_records)
+        legacy_limitations = prepare_legacy_builder_view(builder_records)
+        market_diagnostics = []
+        for rec in builder_records:
+            if getattr(rec, "type", None) == "openbb_ohlcv":
+                rec.payload, diagnostic = normalize_market_record(rec, run.manifest)
+                if not hasattr(rec, "meta"):
+                    rec.meta = {}
+                rec.meta["market_data_extraction"] = diagnostic
+                market_diagnostics.append(diagnostic)
+            elif getattr(rec, "type", None) == "openbb_fundamentals":
+                payload = deepcopy(rec.payload)
+                for section in ("income", "balance"):
+                    rows = payload.get(section, [])
+                    if isinstance(rows, list):
+                        payload[section] = [row for row in rows if isinstance(row, dict)
+                            and str(row.get("fiscal_period", "FY")).strip().upper() == "FY"]
+                # V4's typed cash-flow adapter owns every duration period.
+                payload["cash_flow"] = []
+                rec.payload = payload
+        run.records = builder_records
+        try:
+            report = build_with_cash_flow(self, run_id, super().build_facts,
+                                          source_records=original_records)
+        finally:
+            run.records = original_records
+        report["limitations"].extend(legacy_limitations)
+        original_by_id = {getattr(rec, "id", None): rec for rec in original_records}
+        for diagnostic in market_diagnostics:
+            source_record = original_by_id.get(diagnostic["source_id"])
+            if source_record is not None:
+                if not hasattr(source_record, "meta"):
+                    source_record.meta = {}
+                source_record.meta["market_data_extraction"] = deepcopy(diagnostic)
         from .financial_statements import augment_financial_statements
         from .evidence_repair import augment_documents
         augment_financial_statements(run, report)
+        augment_financial_facts(run, report)
         augment_documents(run, report)
+        if market_diagnostics:
+            annotate_market_facts(run, market_diagnostics)
+            report["market_data_coverage"] = deepcopy(market_diagnostics)
+            report["limitations"].extend(line for diagnostic in market_diagnostics
+                                         for line in diagnostic["limitations"])
         if not any(getattr(rec, "type", None) == "openbb_fundamentals"
                    for rec in run.records):
             return report
-        revenue = {}
+        revenue_by_year = {}
         for fid, row in run.fact_store.to_dict().items():
             year = row.get("fiscal_year")
             if (row.get("concept") == "Revenue" and type(year) is int
-                    and fid == f"fact.Revenue.FY{year}"
+                    and row.get("fiscal_period", "FY") == "FY"
                     and type(row.get("value")) in (float, int)
                     and row["value"]):
-                revenue[year] = (fid, row["value"])
+                revenue_by_year.setdefault(year, []).append((fid, row["value"]))
+        # A period with multiple source versions is retained in FACT, but is
+        # not silently selected as an input to a single representative growth
+        # calculation.
+        revenue = {year: rows[0] for year, rows in revenue_by_year.items()
+                   if len(rows) == 1}
         years = sorted(revenue)
-        if len(years) < 2:
-            return report
         corrected = {}
         for start, end in zip(years, years[1:]):
+            if end - start != 1:
+                continue
             corrected[f"calc.rev_growth.FY{end}"] = (
                 K.calc_growth(revenue[end][1], revenue[start][1]), "growth",
                 [revenue[end][0], revenue[start][0]], "RATIO", {})
-        start, end = years[0], years[-1]
-        corrected["calc.cagr.rev"] = (
-            K.calc_cagr(revenue[start][1], revenue[end][1], end - start), "cagr",
-            [revenue[start][0], revenue[end][0]], "RATIO",
-            {"years": float(end - start)})
+        if len(years) >= 2:
+            start, end = years[0], years[-1]
+            corrected["calc.cagr.rev"] = (
+                K.calc_cagr(revenue[start][1], revenue[end][1], end - start), "cagr",
+                [revenue[start][0], revenue[end][0]], "RATIO",
+                {"years": float(end - start)})
         existing = run.calc_store.to_dict()
-        if all(cid in existing and
-               (existing[cid]["value"], existing[cid]["calc_type"],
-                existing[cid]["input_refs"], existing[cid]["unit"],
-                existing[cid]["meta"]) == vals
-               for cid, vals in corrected.items()):
+        managed = {cid for cid in existing
+                   if cid.startswith("calc.rev_growth.FY") or cid == "calc.cagr.rev"}
+        if managed == set(corrected) and all(
+                (existing[cid]["value"], existing[cid]["calc_type"],
+                 existing[cid]["input_refs"], existing[cid]["unit"],
+                 existing[cid]["meta"]) == vals
+                for cid, vals in corrected.items()):
             return report
         replacement = CalcStore()
         for cid, row in existing.items():
-            if cid not in corrected and not cid.startswith("calc.rev_growth.FY"):
+            if cid not in managed:
                 replacement.add(cid, row["value"], row["calc_type"],
                                 row["input_refs"], row["unit"], row["meta"])
         for cid, row in corrected.items():
@@ -368,6 +624,16 @@ class OrchestratorV4(Orchestrator):
                 except (ValueError, TypeError):
                     out.append(dict(status="FAIL", object_id=ref, check_id="date_schema",
                                     reason="invalid explicit source observation date"))
+            available = source.get("published_or_filing_time")
+            if available:
+                try:
+                    if date.fromisoformat(available[:10]) > as_of:
+                        out.append(dict(status="FAIL", object_id=ref, check_id="as_of_availability",
+                            reason="source was published or filed after the analysis date"))
+                except (ValueError, TypeError):
+                    out.append(dict(status="FAIL", object_id=ref, check_id="date_schema",
+                        reason="invalid explicit publication/filing date"))
+        out.extend(freshness_findings(run))
         member_totals = {}
         for e in run.events.values():
             aggregate_ref = e.get("aggregate_ref")
