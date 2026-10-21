@@ -507,7 +507,9 @@ class PipelineRunnerV4:
         return dict(phase6_ready=True, blocked=False, next_action="prepare_phase6_atomic")
 
     def prepare_phase6_atomic(self, *, enforce_budget=True):
-        tasks = self._tasks()
+        return self._prepare_phase6_atomic(self._tasks(), enforce_budget=enforce_budget)
+
+    def _prepare_phase6_atomic(self, tasks, *, enforce_budget=True):
         if not tasks:
             raise ValueError("cannot verify an empty claim graph")
         pending = {cid: digest(t.to_dict()) for cid, t in tasks.items() if cid not in self.receipts}
@@ -540,21 +542,22 @@ class PipelineRunnerV4:
                 oversized.append(dict(claim_id=cid, wire_bytes=size, budget_bytes=self.review_batch_max_bytes))
         return oversized
 
-    def _review_requests(self, prompts, layer):
-        tasks = self._tasks()
+    def _review_requests(self, prompts, layer, *, tasks=None):
+        tasks = self._tasks() if tasks is None else tasks
         requests = pack_review_requests([tasks[cid] for cid, _ in prompts], batch_size=self.review_batch_size,
                                     max_bytes=self.review_batch_max_bytes, verification_epoch=self._verification_epoch,
                                     layer=layer, first_reviews={cid: r["result"] for cid, r in self.receipts.items()})
         return requests
 
     def prepare_phase6_atomic_batches(self):
-        prepared = self.prepare_phase6_atomic()
+        tasks = self._tasks()
+        prepared = self._prepare_phase6_atomic(tasks)
         if any(cid in self.reference_supplements["atomic"] for cid, _ in prepared["atomic_prompts"]):
             requests = [dict(request_id=cid, claim_ids=[cid], prompt=prompt,
                              response_schema=prepared["response_schemas"][cid])
                         for cid, prompt in prepared["atomic_prompts"]]
         else:
-            requests = self._review_requests(prepared["atomic_prompts"], "atomic")
+            requests = self._review_requests(prepared["atomic_prompts"], "atomic", tasks=tasks)
         self._pending_batch_requests = requests
         return {**prepared, "review_batches": requests, "request_count": len(requests)}
 
@@ -709,8 +712,8 @@ class PipelineRunnerV4:
         self._persist()
         return {**combined, "blocked": False, "needs_deep_review": bool(suspicious), "deep_review_claim_ids": suspicious}
 
-    def _require_atomic(self):
-        tasks = self._tasks()
+    def _require_atomic(self, tasks=None):
+        tasks = self._tasks() if tasks is None else tasks
         if not tasks or set(tasks) != set(self.receipts):
             raise ValueError("all current claims require semantic verification")
         for receipt in self.receipts.values():
@@ -718,7 +721,11 @@ class PipelineRunnerV4:
         return tasks
 
     def prepare_phase6_deep_review(self, claim_ids=None, *, enforce_budget=True):
-        tasks = self._require_atomic()
+        return self._prepare_phase6_deep_review(self._require_atomic(), claim_ids,
+                                                enforce_budget=enforce_budget)
+
+    def _prepare_phase6_deep_review(self, tasks, claim_ids=None, *, enforce_budget=True):
+        tasks = self._require_atomic(tasks)
         eligible = [cid for cid in tasks if self.receipts[cid]["result"]["verdict"] != "PASS"]
         wanted = eligible if claim_ids is None else id_list(list(claim_ids), "deep claim IDs")
         if not wanted or set(wanted) - set(eligible):
@@ -735,13 +742,14 @@ class PipelineRunnerV4:
                     response_schemas=schemas)
 
     def prepare_phase6_deep_review_batches(self, claim_ids=None):
-        prepared = self.prepare_phase6_deep_review(claim_ids)
+        tasks = self._require_atomic()
+        prepared = self._prepare_phase6_deep_review(tasks, claim_ids)
         if any(cid in self.reference_supplements["deep"] for cid, _ in prepared["deep_prompts"]):
             requests = [dict(request_id=cid, claim_ids=[cid], prompt=prompt,
                              response_schema=prepared["response_schemas"][cid])
                         for cid, prompt in prepared["deep_prompts"]]
         else:
-            requests = self._review_requests(prepared["deep_prompts"], "deep")
+            requests = self._review_requests(prepared["deep_prompts"], "deep", tasks=tasks)
         self._pending_deep_batch_requests = requests
         return {**prepared, "review_batches": requests, "request_count": len(requests)}
 
@@ -1418,8 +1426,8 @@ class PipelineRunnerV4:
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             return dict(pool.map(one, prompts))
 
-    def _record_review_progress(self, received, client, layer, response_sources=None):
-        tasks = self._tasks()
+    def _record_review_progress(self, received, client, layer, response_sources=None, *, tasks=None):
+        tasks = self._tasks() if tasks is None else tasks
         pending = self.pending_atomic if layer == "atomic" else self.pending_deep
         if any(cid not in pending or cid not in tasks or pending[cid] != digest(tasks[cid].to_dict()) for cid in received):
             raise ValueError("review state changed while request was in flight")
@@ -1459,14 +1467,13 @@ class PipelineRunnerV4:
                 raise ValueError("reference supplement model differs from original review")
         first_attempt = True
         while True:
-            tasks = self._tasks()
             supplements = self.reference_supplements[layer]
             batched_requests, single_prompts = [], []
             if first_attempt and self.review_batch_size > 1:
                 batchable_prompts = [(cid, prompt) for cid, prompt in prompts if cid not in supplements]
                 single_prompts = [(cid, prompt) for cid, prompt in prompts if cid in supplements]
                 batched_requests = [dict(request, _batched=True)
-                                    for request in self._review_requests(batchable_prompts, layer)]
+                                    for request in self._review_requests(batchable_prompts, layer, tasks=tasks)]
                 prompt_index = dict(prompts)
                 bounded = []
                 for request in batched_requests:
@@ -1510,7 +1517,7 @@ class PipelineRunnerV4:
                             queued.cancel()  # still collect and persist running siblings
                         continue
                     results.update(received)
-                    self._record_review_progress(received, client, layer, sources)
+                    self._record_review_progress(received, client, layer, sources, tasks=tasks)
             if errors:
                 raise errors[0]
             if oversized:

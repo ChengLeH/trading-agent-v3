@@ -15,6 +15,46 @@ def response(cid, item, status='PASS'):
 
 
 class NativeReviews(unittest.TestCase):
+    def test_next_reuses_prepared_tasks_for_review_packet_context(self):
+        from unittest.mock import patch
+        import v4.runner as runner_module
+
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / 'original.json'
+            save_checkpoint(seeded(), source)
+            workflow = NativeReviewWorkflow.from_checkpoint(source, Path(root) / 'native')
+
+            original_builder = runner_module.build_atomic_tasks
+            build_count = []
+
+            def counted_builder(run):
+                build_count.append(None)
+                return original_builder(run)
+
+            with patch('v4.runner.build_atomic_tasks', side_effect=counted_builder):
+                packet = workflow.next()
+
+            self.assertEqual(packet.get('kind'), 'atomic', packet)
+            self.assertEqual(packet.get('status'), 'reviews', packet)
+            self.assertLessEqual(len(build_count), 4, build_count)
+
+            build_count.clear()
+            with patch('v4.runner.build_atomic_tasks', side_effect=counted_builder):
+                resumed_packet = workflow.next()
+            self.assertEqual(resumed_packet.get('packet_id'), packet['packet_id'])
+            self.assertLessEqual(len(build_count), 4, build_count)
+
+            with workflow.queue.transaction() as state:
+                reference = workflow._load(state)
+            tasks = reference._tasks()
+            prepared = reference._prepare_phase6_atomic(tasks, enforce_budget=False)
+            prompts = dict(prepared['atomic_prompts'])
+            for claim_id, item in packet['items'].items():
+                self.assertEqual(item['prompt'], prompts[claim_id])
+                self.assertEqual(item['schema'], prepared['response_schemas'][claim_id])
+                self.assertEqual(item['review_context'],
+                                 reference.review_context_for('atomic', [claim_id], tasks=tasks))
+
     def test_older_global_receipt_cannot_hide_new_deterministic_failure_or_block_diagnostics(self):
         from unittest.mock import patch
         from v3.facts import Fact
