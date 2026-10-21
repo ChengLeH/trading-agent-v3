@@ -115,3 +115,57 @@ class IndicatorMethodContext(unittest.TestCase):
         self.assertEqual(snapshot['facts'][fact.fact_id]['value'],58.12)
         fact.source_pointer = 'external.unknown_method'
         self.assertEqual(indicator_definitions(runner.run.fact_store.to_dict()),{})
+
+
+class CalculationDefinitionRegistry(unittest.TestCase):
+    def test_registry_covers_dispatched_operations_and_marks_unknown_types(self):
+        from .review_context import calculation_definitions
+
+        kinds = {
+            'fcf', 'growth', 'return_cc', 'ev', 'volume_ratio', 'derived_pct',
+            'cagr', 'margin', 'per_share', 'weighted_cost', 'risk_reward',
+            'position_risk',
+        }
+        calcs = {f'calc.{kind}': {'calc_type': kind} for kind in kinds}
+        calcs['calc.future'] = {'calc_type': 'future_kernel'}
+
+        definitions = calculation_definitions(calcs)
+
+        self.assertEqual(set(definitions), kinds | {'future_kernel'})
+        self.assertTrue(all(definitions[kind]['supported'] for kind in kinds))
+        self.assertEqual(definitions['return_cc']['input_order'],
+                         ['previous_close', 'current_close'])
+        self.assertEqual(definitions['return_cc']['meaning'],
+                         'simple_close_to_close_return')
+        self.assertIn('log', definitions['return_cc']['restrictions'].lower())
+        self.assertEqual(definitions['ev']['input_order'],
+                         ['market_cap', 'total_debt', 'cash_and_equivalents',
+                          'short_term_investments'])
+        self.assertEqual(definitions['derived_pct']['input_order'],
+                         ['reference', 'value'])
+        self.assertEqual(definitions['growth']['output_unit'], 'RATIO')
+        self.assertEqual(definitions['derived_pct']['output_unit'], 'PCT')
+        self.assertEqual(definitions['cagr']['input_order'],
+                         ['start_value', 'end_value'])
+        self.assertIn('years', definitions['cagr']['meta_parameters'])
+        self.assertIn('actual elapsed-year interval',
+                      definitions['cagr']['restrictions'])
+        self.assertIn('num_basis', definitions['margin']['meta_parameters'])
+        self.assertEqual(definitions['per_share']['output_unit'], 'USD_PER_SHARE')
+        self.assertEqual(definitions['fcf']['input_order'],
+                         ['operating_cash_flow', 'capex'])
+        self.assertIn('abs(capex)', definitions['fcf']['formula'])
+        self.assertIn('positive CapEx is treated as an outflow',
+                      definitions['fcf']['restrictions'])
+        self.assertIn('negative CapEx is already signed as an outflow',
+                      definitions['fcf']['restrictions'])
+        self.assertEqual(definitions['weighted_cost']['input_order'], [])
+        self.assertIn('tranches', definitions['weighted_cost']['meta_parameters'])
+        self.assertEqual(definitions['weighted_cost']['meta_input_order'],
+                         ['tranches[].price', 'tranches[].weight'])
+        self.assertIn('position_pct', definitions['position_risk']['input_order'])
+        self.assertEqual(definitions['position_risk']['output_unit'], 'PERCENT')
+        self.assertIn('10 means 10%', definitions['position_risk']['restrictions'])
+        self.assertFalse(definitions['future_kernel']['supported'])
+        self.assertNotIn('formula', definitions['future_kernel'])
+        self.assertTrue(definitions['future_kernel']['limitation'])
