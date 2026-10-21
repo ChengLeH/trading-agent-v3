@@ -192,16 +192,16 @@ class PipelineRunnerV4:
             raise ValueError("prepare a run first")
         return self.orch.runs[self.run_id]
 
-    def _state(self):
-        s = self.orch.snapshot(self.run_id)
+    def _state(self, snapshot=None):
+        s = self.orch.snapshot(self.run_id) if snapshot is None else snapshot
         from .financial_statements import source_declarations
         declarations = source_declarations(self.run)
         return {**{k: s.get(k) for k in ("claims", "facts", "calcs", "evidence", "events", "trade", "as_of")},
                 **({'source_declarations': declarations} if declarations else {}),
                 "financial_review_contract": FINANCIAL_REVIEW_VERSION}
 
-    def _hash(self):
-        return digest(self._state())
+    def _hash(self, state=None):
+        return digest(self._state() if state is None else state)
 
     def _resolution_state_hash(self, finding):
         ids = self._finding_claim_ids(finding)
@@ -221,20 +221,23 @@ class PipelineRunnerV4:
         return dict(trusted=True, source_ids=source_ids, claim_hashes=claim_hashes,
                     transport_attempt_ids=sorted(row["attempt_id"] for row in attempts))
 
-    def _transport_recovery_candidates(self, findings):
+    def _transport_recovery_candidates(self, findings, *, received_attempts=None, task_hashes=None):
         if not self.journal or not callable(getattr(self.journal, "received_attempts", None)):
             return []
         routes = [f for f in findings if f.get("resolution_route") == "transport_recovery"]
         if not routes:
             return []
         claims = claim_index(self.run.claims)
-        task_hashes = {task.claim_id: digest(task.to_dict()) for task in build_atomic_tasks(self.run)}
+        if task_hashes is None:
+            task_hashes = {task.claim_id: digest(task.to_dict()) for task in build_atomic_tasks(self.run)}
+        if received_attempts is None:
+            received_attempts = self.journal.received_attempts(self.run_id)
         candidates = {}
         for finding in routes:
             baseline = finding.get("resolution_baseline", {})
             prior_attempts = set(baseline.get("transport_attempt_ids", []))
             targets = set(self._finding_claim_ids(finding))
-            for record in self.journal.received_attempts(self.run_id):
+            for record in received_attempts:
                 attempt_id = record["attempt_id"]
                 if attempt_id in prior_attempts:
                     continue
@@ -249,9 +252,11 @@ class PipelineRunnerV4:
                                                   layer=review.get("layer") if isinstance(review, dict) else "role")
         return list(candidates.values())
 
-    def _role_redeliberation_candidates(self, findings):
+    def _role_redeliberation_candidates(self, findings, *, received_attempts=None):
         if not self.journal or not callable(getattr(self.journal, "received_attempts", None)):
             return []
+        if received_attempts is None:
+            received_attempts = self.journal.received_attempts(self.run_id)
         claims = claim_index(self.run.claims)
         output = []
         for finding in findings:
@@ -262,7 +267,7 @@ class PipelineRunnerV4:
                 continue
             prior_attempts = set(baseline.get("transport_attempt_ids", []))
             targets = set(self._finding_claim_ids(finding))
-            for record in self.journal.received_attempts(self.run_id):
+            for record in received_attempts:
                 attempt_id = record.get("attempt_id")
                 role = record.get("task_id")
                 if (attempt_id in prior_attempts or role not in ROLES
@@ -292,8 +297,9 @@ class PipelineRunnerV4:
                                        claim_ids=sorted(matched)))
         return output
 
-    def _external_resolution_candidates(self, findings):
-        state = self._state()
+    def _external_resolution_candidates(self, findings, *, state=None, task_hashes=None,
+                                       received_attempts=None):
+        state = self._state() if state is None else state
         source_ids = {key for bucket in ("facts", "calcs", "evidence", "events")
                       for key in state.get(bucket, {})}
         claim_hashes = {claim["claim_id"]: digest(claim) for claim in self.run.claims}
@@ -310,10 +316,12 @@ class PipelineRunnerV4:
                 old_hashes = baseline.get("claim_hashes", {})
                 row["changed_claim_ids"] = sorted(cid for cid, current_hash in claim_hashes.items()
                                                    if old_hashes.get(cid) != current_hash)
-                row["role_redeliberation_records"] = self._role_redeliberation_candidates([finding])
+                row["role_redeliberation_records"] = self._role_redeliberation_candidates(
+                    [finding], received_attempts=received_attempts)
             elif route == "transport_recovery":
                 row["transport_attempt_ids"] = sorted(candidate["attempt_id"] for candidate in
-                    self._transport_recovery_candidates([finding]))
+                    self._transport_recovery_candidates([finding], received_attempts=received_attempts,
+                                                        task_hashes=task_hashes))
             else:
                 row["requires_human_action"] = route == "human_decision"
             output.append(row)
@@ -324,7 +332,7 @@ class PipelineRunnerV4:
         return [{key: deepcopy(value) for key, value in finding.items() if key not in internal}
                 for finding in self.deferred_global_findings]
 
-    def _tasks(self):
+    def _tasks(self, *, snapshot=None, state=None):
         self.orch.require_issuer_identity(self.run_id)
         tasks = {t.claim_id: t for t in build_atomic_tasks(self.run)}
         task_hashes = {cid: digest(t.to_dict()) for cid, t in tasks.items()}
@@ -335,7 +343,8 @@ class PipelineRunnerV4:
         for cid in list(self.deep_receipts):
             if cid not in tasks or self.deep_receipts[cid]["input_hash"] != task_hashes[cid]:
                 self.deep_receipts.pop(cid, None)
-        if self.global_receipt and self.global_receipt["input_hash"] != self._hash():
+        if self.global_receipt and self.global_receipt["input_hash"] != self._hash(
+                state=self._state(snapshot) if state is None else state):
             self.global_receipt = None
         return tasks
 
@@ -1031,9 +1040,9 @@ class PipelineRunnerV4:
         self._persist()
         return dict(revalidate_claim_ids=affected, **self.prepare_phase6_atomic(enforce_budget=enforce_budget))
 
-    def _ready_for_global(self):
+    def _ready_for_global(self, tasks=None):
         self._require_complete_roles()
-        self._require_atomic()
+        self._require_atomic(tasks)
         if self.pending_patch:
             raise ValueError("pending claim repairs must be resolved before global sweep or delivery")
         if self._claim_review_findings():
@@ -1052,9 +1061,13 @@ class PipelineRunnerV4:
             raise ValueError(f"incomplete role generation; missing {sorted(missing)}; restart role generation from manifest")
 
     def prepare_phase6_global_sweep(self):
-        self._ready_for_global()
+        snapshot = self.orch.snapshot(self.run_id)
+        state = self._state(snapshot)
+        tasks = self._tasks(snapshot=snapshot, state=state)
+        self._ready_for_global(tasks)
+        state_hash = self._hash(state)
         validate_revision_history(self.run.claims, self.history)
-        if (self.history and self.history[-1].get("after_hash") == self._hash()
+        if (self.history and self.history[-1].get("after_hash") == state_hash
                 and self.global_receipt is None and self.pending_global is None):
             # Migrate an old checkpoint's duplicate pre-patch judgments to the
             # existing historical recheck queue. Object history, not prose
@@ -1062,7 +1075,7 @@ class PipelineRunnerV4:
             retired = self.history[-1].get("invalidated_global_findings", [])
             self.deferred_global_findings = [f for f in self.deferred_global_findings
                 if f.get("resolution_route", "claim_patch") != "claim_patch" or f not in retired]
-        rendered = render_report(self.orch.snapshot(self.run_id))
+        rendered = render_report(snapshot)
         history = [{"claim_changes": [dict(claim_id=change["claim_id"],
                     before={k: v for k, v in change["before"].items() if v != change["after"].get(k)},
                     after={k: v for k, v in change["after"].items() if v != change["before"].get(k)})
@@ -1078,7 +1091,7 @@ class PipelineRunnerV4:
                 'deferred_global_findings 是前次全局掃描留下、尚待本輪確認的問題；逐項核對目前狀態。'
                 '已由新證據或修訂解決的項目應省略；仍成立的項目要保留原 finding_id，並更新其理由及處理路徑。')
         if self.pending_global and "review" in self.pending_global:
-            if (self.pending_global["input_hash"] != self._hash()
+            if (self.pending_global["input_hash"] != state_hash
                     or self.pending_global["history_hash"] != digest(self.history)):
                 raise ValueError("stale partial global review; accepted rows cannot be reused")
             status = self._global_coverage_status()
@@ -1087,6 +1100,15 @@ class PipelineRunnerV4:
             target_ids = status["missing_dependency_claim_ids"][:self.global_dependency_batch_size]
             self.pending_global["target_claim_ids"] = target_ids
             self.status = "global_dependency_completion"
+            global_state = self._global_review_state(state=state, snapshot=snapshot)
+            received_attempts = self._received_attempts()
+            task_hashes = {cid: digest(task.to_dict()) for cid, task in tasks.items()}
+            transport_records = self._transport_recovery_candidates(
+                self.deferred_global_findings, received_attempts=received_attempts,
+                task_hashes=task_hashes)
+            external_candidates = self._external_resolution_candidates(
+                self.deferred_global_findings, state=state, task_hashes=task_hashes,
+                received_attempts=received_attempts)
             return ("global_dependency_completion", json_prompt(
                 SINGLE_REVIEW_INSTRUCTIONS + FINANCIAL_REVIEW_CONTRACT +
                 '先前全局跨章掃描已完成，本次只回傳 target_claim_ids 所列的 dependency_reviews，'
@@ -1100,19 +1122,28 @@ class PipelineRunnerV4:
                 'required_dependencies 可指向 state.claims 的任何合法前提，不能指自己或後續結論。',
                 dict(review_scope="dependency_completion", target_claim_ids=target_ids,
                      coverage_round=self.pending_global["coverage_round"] + 1,
-                     verification_epoch=self._verification_epoch, state=self._global_review_state(),
-                     transport_recovery_records=self._transport_recovery_candidates(self.deferred_global_findings),
-                     external_resolution_candidates=self._external_resolution_candidates(self.deferred_global_findings),
+                     verification_epoch=self._verification_epoch, state=global_state,
+                     transport_recovery_records=transport_records,
+                     external_resolution_candidates=external_candidates,
                      original_findings=self.pending_global["review"]["response"]["findings"],
                      original_resolved_external_findings=self.pending_global["review"]["response"].get(
                          "resolved_external_findings", []),
-                     canonical_state_hash=self._hash(), history_hash=digest(self.history),
+                     canonical_state_hash=state_hash, history_hash=digest(self.history),
                      history=history), compact=True))
         self.global_receipt = None  # a fresh sweep cannot inherit an earlier clean receipt
-        self.pending_global = dict(input_hash=self._hash(), report_hash=rendered["sidecar"]["report_hash"],
+        self.pending_global = dict(input_hash=state_hash, report_hash=rendered["sidecar"]["report_hash"],
                                    history_hash=digest(self.history), coverage_round=0, completed_batches=0,
                                    target_claim_ids=[c["claim_id"] for c in self.run.claims][:self.global_dependency_batch_size])
         self.status = "global"
+        global_state = self._global_review_state(state=state, snapshot=snapshot)
+        received_attempts = self._received_attempts()
+        task_hashes = {cid: digest(task.to_dict()) for cid, task in tasks.items()}
+        transport_records = self._transport_recovery_candidates(
+            self.deferred_global_findings, received_attempts=received_attempts,
+            task_hashes=task_hashes)
+        external_candidates = self._external_resolution_candidates(
+            self.deferred_global_findings, state=state, task_hashes=task_hashes,
+            received_attempts=received_attempts)
         return ("global_consistency_reviewer", json_prompt(
             SINGLE_REVIEW_INSTRUCTIONS + FINANCIAL_REVIEW_CONTRACT +
             '執行最終全局 LLM 一致性掃描：跨章矛盾、stale state、修正未傳遞、互斥交易規則。'
@@ -1149,23 +1180,30 @@ class PipelineRunnerV4:
             '其餘 ID 的排程由外部程式處理，本次不輸出它們的依賴審查列。'
             '{claim_id,required_dependencies:[精確Claim ID],unresolved:false,reason:簡短語義理由}。無依賴也要回空陣列及理由，勿複述原文。'
             '無法對應時 claim_ids=[] 且 unresolved=true；若處理路徑是 Claim 修補才交 semantic linker 定位。',
-            dict(review_scope="global_consistency", verification_epoch=self._verification_epoch, state=self._global_review_state(),
+            dict(review_scope="global_consistency", verification_epoch=self._verification_epoch, state=global_state,
                  target_claim_ids=self.pending_global["target_claim_ids"],
-                 transport_recovery_records=self._transport_recovery_candidates(self.deferred_global_findings),
-                 external_resolution_candidates=self._external_resolution_candidates(self.deferred_global_findings),
-                 report_hash=rendered["sidecar"]["report_hash"], canonical_state_hash=self._hash(),
+                 transport_recovery_records=transport_records,
+                 external_resolution_candidates=external_candidates,
+                 report_hash=rendered["sidecar"]["report_hash"], canonical_state_hash=state_hash,
                  history=history, deferred_global_findings=self._prompt_deferred_findings(),
                  history_hash=digest(self.history)), compact=True))
 
-    def _global_review_state(self):
+    def _global_review_state(self, *, state=None, snapshot=None):
         # Keep each canonical source passage once: global factual corrections
         # need the evidence, not just another Claim's account of that evidence.
         # Rendered Markdown and full session transcripts remain excluded.
-        state = self._state()
+        state = self._state(snapshot) if state is None else state
         state["calculation_definitions"] = calculation_definitions(state.get("calcs", {}))
         state['indicator_definitions'] = indicator_definitions(state.get('facts', {}))
-        state['ingestion_diagnostics'] = self.orch.snapshot(self.run_id).get('ingestion_diagnostics', [])
+        if snapshot is None:
+            snapshot = self.orch.snapshot(self.run_id)
+        state['ingestion_diagnostics'] = snapshot.get('ingestion_diagnostics', [])
         return state
+
+    def _received_attempts(self):
+        if not self.journal or not callable(getattr(self.journal, "received_attempts", None)):
+            return []
+        return self.journal.received_attempts(self.run_id)
 
     def _global_coverage_status(self):
         response = self.pending_global["review"]["response"]
