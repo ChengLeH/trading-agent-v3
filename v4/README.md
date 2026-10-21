@@ -350,9 +350,9 @@ Native 載入時仍核對原始 response archive，重演已接受的 Global pac
 
 更新後重新啟動 driver，再於原 Native work-dir 呼叫 next；不必清空工作目錄或重跑已接受的 dependency batches。請先備份整個 work-dir。若原始 archive 遺失、內容不符或真正有未完成補審，仍會明確拒絕或派出尚缺的工作；不能只靠序列化快照跳過驗證。這項修復針對 Native 工作目錄的 global_outcomes/packets/archives，僅剩獨立 checkpoint 的狀態不等同於保有完整 Native 證據。
 
-### 泛化金融證據契約與恢復（financial-evidence/1）
+### 泛化金融證據契約與恢復（financial-evidence/5）
 
-角色、atomic、deep、Claim patch 與 Global 共用同一份金融證據契約；沒有新增模型層。
+角色、atomic、deep、Claim patch、Global 與外部 finding 結案共用同一份金融證據契約；沒有新增模型層。
 發布日／事件日／共識彙整日分開，季度 EPS 不與股價目標混比；估值必須繼承盈餘品質限制。
 極端情境可以保留，但不得當作基準預測，也不會硬套收購現金／借款比例或自動扣掉賣方出售款。
 「本次未提供證據」不代表「公司未披露」。Python 不讀金融 prose 做語義路由。
@@ -392,16 +392,23 @@ python -m v4.agent_cli next --work-dir RUN
 新增 manifest 必須保持原 subject/as_of，使用全新 source IDs，路徑相對該 manifest；
 支援原有 adapter，`generic_text` 全文也會進 canonical EvidenceStore。
 來源或 Fact/Calc/Evidence ID 衝突會拒絕，既有數據不可被默默覆寫。
-原 findings、修補次數與歷史保留；新增文件本身不算問題已解決。
-Claim 修補後仍重驗 descendants 與 Global；`evidence_needed` 必須有新來源及實際 Claim 引用才能結案。
+原 findings、修補次數與歷史保留；新增文件本身不算問題已解決。Claim 修補後仍重驗受影響 Claim、dependency descendants 與 Global。
+`evidence_needed` finding 可由兩種有證據的方式結案：`new_evidence` 必須引用新加入 canonical state、且實際綁定每個 finding target 的來源；`claim_revised` 必須使用原 finding 明列的所有 target，並由 Global 語義審查逐一確認，不能只靠新增來源或手動文字變更。
+`claim_revised` 還要求相關 target 或其已宣告因果前提有可追溯的修訂紀錄，並具備 target 的新 atomic 與必要 deep 收據。逐 target 的部分審查會持久保存，續跑只補缺漏 target；只有全部 target 都有新鮮審查且判為 resolved 才能結案。改標籤、刪引用、加免責句或改無關文字不能解除 finding。
 本契約版本參與 task/state 雜湊；舊契約收據不會冒充新檢查結果。
 
 `semantic_acceptance_cases.json` 提供日期、指標、估值、情境、證據缺口與近似數值的成對語義案例。
 其 expected labels 是驗收規格，**不是已跑過的真實模型成績**；離線回歸不代表實際模型永遠能判對。
 
-升級 financial-evidence/1 時，舊版收據與未完成的 Global 補審不作新版合格證明。
-舊 pending patch 的 findings、輪次與原始候選留存；未提交的舊角色包退役並保留候選／原始回覆紀錄，重新發出新契約工作包。
-已提交的 Claim、來源與修補歷史保留，恢復後先完成新版語義驗證；不需清空 run 或手改 hash。
+升級到 financial-evidence/5 時，舊版 atomic/deep/global 收據與未完成的 Global 補審不作新版合格證明。Native work-dir 會保留已提交的 Claim、來源、修補輪次、歷史、原始回覆 archive 與 session 紀錄；舊的活動工作包退役，並依新契約重新派送必需驗證。舊 pending patch 的 findings 會保留並轉入 deferred findings，不會被當成已解決。
+
+升級前先備份整個 Native work-dir。續跑時保留 `agent-state.json`、`checkpoint.json`、`responses/archive/` 與 `sessions/`，不要只搬 `checkpoint.json`、手改 hash 或清空目錄。重新啟動後透過正式入口取得新工作包：
+
+```sh
+python -m v4.agent_cli next --work-dir RUN
+```
+
+每個新工作包仍須以原 `packet_id`、`input_hash` 提交；已保存的有效工作紀錄會保留，只有不符合新契約的收據需要重新驗證。
 
 ### Native 審查與來源修復入口
 

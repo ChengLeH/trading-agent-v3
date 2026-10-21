@@ -176,6 +176,38 @@ class NativeReviews(unittest.TestCase):
         source = Path(root) / 'original.json'; save_checkpoint(runner, source)
         return NativeReviewWorkflow.from_checkpoint(source, Path(root) / 'native')
 
+    def test_financial_contract_upgrade_retires_old_packet_and_reissues_review(self):
+        from contextlib import ExitStack
+        from unittest.mock import patch
+
+        previous_contract = 'financial-evidence/4'
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / 'legacy.json'
+            work_dir = Path(root) / 'native'
+            with ExitStack() as stack:
+                for module in ('runner', 'atomic_phase6', 'agent_workflow', 'checkpoint'):
+                    stack.enter_context(patch(f'v4.{module}.FINANCIAL_REVIEW_VERSION', previous_contract))
+                save_checkpoint(seeded(), source)
+                legacy = NativeReviewWorkflow.from_checkpoint(source, work_dir)
+                old_packet = legacy.next()
+
+            self.assertEqual(old_packet['kind'], 'atomic', old_packet)
+            resumed = NativeReviewWorkflow(work_dir)
+            current_packet = resumed.next()
+            self.assertEqual(current_packet['kind'], 'atomic', current_packet)
+            self.assertNotEqual(current_packet['packet_id'], old_packet['packet_id'])
+            self.assertEqual(set(current_packet['items']), set(old_packet['items']))
+            self.assertNotEqual(current_packet['input_hash'], old_packet['input_hash'])
+
+            with resumed.queue.transaction() as state:
+                upgrade = state['contract_upgrades'][-1]
+                self.assertEqual(upgrade['previous_contract'], previous_contract)
+                self.assertEqual(upgrade['current_contract'], 'financial-evidence/5')
+                self.assertTrue(state['packets'][old_packet['packet_id']]['retired'])
+                self.assertEqual(state['packets'][old_packet['packet_id']]['retirement_reason'],
+                                 'financial_review_contract_upgraded')
+                self.assertEqual(state['financial_review_contract'], 'financial-evidence/5')
+
     def test_nonpass_reviews_issue_patch_then_revalidate_descendants(self):
         with tempfile.TemporaryDirectory() as root:
             workflow = self.bootstrap(root)
