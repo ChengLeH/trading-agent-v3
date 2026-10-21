@@ -835,8 +835,7 @@ class PipelineRunnerV4:
         deferred = {row.get("finding_id"): deepcopy(row) for row in self.deferred_global_findings
                     if row.get("finding_id")}
         for finding in claim_findings:
-            if finding.get("resolution_route") == "evidence_needed":
-                deferred.setdefault(finding["finding_id"], deepcopy(finding))
+            deferred.setdefault(finding["finding_id"], deepcopy(finding))
         self.deferred_global_findings = list(deferred.values())
         findings = self._review_findings()
         self.status = "revision" if findings else "global"
@@ -912,6 +911,7 @@ class PipelineRunnerV4:
                 "stale": is_request_stale(record, claims)})
         if not requests:
             return None
+        self.status = "evidence_recovery"
         self._persist()
         return dict(status="evidence_recovery", blocked=False, delivery_ready=False,
                     evidence_requests=requests,
@@ -1704,6 +1704,12 @@ class PipelineRunnerV4:
                     else:
                         self.status = "blocked:deterministic"
                         return dict(blocked=True, reason="source or calculation repair required", findings=failures)
+                deep_evidence_work = self.prepare_evidence_work(findings)
+                if deep_evidence_work:
+                    return {**deep_evidence_work,
+                            "findings": self._diagnostic_findings(
+                                [f for f in findings if f.get("resolution_route") == "evidence_needed"]),
+                            "next_action": "add_evidence_or_repair_evidence"}
                 if not findings:
                     while True:
                         prepared_global = self.prepare_phase6_global_sweep()
@@ -1735,9 +1741,16 @@ class PipelineRunnerV4:
                     external = [f for f in findings
                                 if f.get("resolution_route", "claim_patch") != "claim_patch"]
                     if external:
-                        patchable = [f for f in findings if f not in external]
-                        self.deferred_global_findings = deepcopy(external)
+                        self.deferred_global_findings = deepcopy(findings)
                         self._persist()
+                        evidence_work = self.prepare_evidence_work(external)
+                        if evidence_work:
+                            return {**evidence_work,
+                                    "findings": self._diagnostic_findings(external),
+                                    "rejected_external_resolutions": deepcopy(
+                                        result.get("rejected_external_resolutions", [])),
+                                    "next_action": "add_evidence_or_repair_evidence"}
+                        patchable = [f for f in findings if f not in external]
                         if not patchable:
                             self.status = "blocked:resolution_required"
                             self._persist()

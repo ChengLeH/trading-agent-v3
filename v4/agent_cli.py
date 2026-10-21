@@ -104,7 +104,15 @@ def main(argv=None):
     evidence = sub.add_parser("add-evidence", help="append new canonical sources without overwriting existing IDs")
     evidence.add_argument("--work-dir", required=True)
     evidence.add_argument("--manifest", required=True)
+    evidence.add_argument("--request-id", help="link the imported sources to one exact evidence request")
     evidence.add_argument("--reason", required=True)
+
+    search_result = sub.add_parser("record-evidence-search", help="record a search attempt without resolving its finding")
+    search_result.add_argument("--work-dir", required=True)
+    search_result.add_argument("--request-id", required=True)
+    search_result.add_argument("--outcome", required=True, choices=("found", "not_found", "unavailable"))
+    search_result.add_argument("--query", default="")
+    search_result.add_argument("--details", default="")
 
     events = sub.add_parser('register-events', help='replace the explicit typed event catalog; never infer from prose')
     events.add_argument('--work-dir', required=True)
@@ -121,6 +129,7 @@ def main(argv=None):
     evidence_patch = sub.add_parser("repair-evidence", help="request Claim patches after new evidence and atomic review")
     evidence_patch.add_argument("--work-dir", required=True)
     evidence_patch.add_argument("--claim-id", action="append", required=True)
+    evidence_patch.add_argument("--request-id", help="bind the repair to one exact evidence request")
     evidence_patch.add_argument("--reason", required=True)
 
     args = parser.parse_args(argv)
@@ -182,10 +191,16 @@ def main(argv=None):
                 json.loads(Path(args.events).read_text(encoding='utf-8')), reason=args.reason))
         if args.command == "add-evidence":
             from .evidence_repair import append_sources
-            return _result_exit(append_sources(NativeReviewWorkflow(args.work_dir), args.manifest, reason=args.reason))
+            return _result_exit(append_sources(NativeReviewWorkflow(args.work_dir), args.manifest,
+                reason=args.reason, request_id=args.request_id))
+        if args.command == "record-evidence-search":
+            from .evidence_repair import record_evidence_search
+            return _result_exit(record_evidence_search(NativeReviewWorkflow(args.work_dir), args.request_id,
+                args.outcome, query=args.query, details=args.details))
         if args.command == "repair-evidence":
             from .evidence_repair import prepare_evidence_patch
-            return _result_exit(prepare_evidence_patch(NativeReviewWorkflow(args.work_dir), args.claim_id, reason=args.reason))
+            return _result_exit(prepare_evidence_patch(NativeReviewWorkflow(args.work_dir), args.claim_id,
+                reason=args.reason, request_id=args.request_id))
         if args.command == "next":
             payload = NativeReviewWorkflow(args.work_dir).next()
             if args.prompt_files and payload.get('kind') == 'roles':

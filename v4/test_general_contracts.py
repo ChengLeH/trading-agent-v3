@@ -113,9 +113,16 @@ class EvidenceRecoveryContracts(unittest.TestCase):
         return manifest
 
     def test_new_evidence_preserves_findings_reopens_reviews_then_patches_and_global(self):
-        import tempfile
+        import contextlib, io, json, tempfile
+        from .agent_cli import main
         from .test_agent_reviews import NativeReviews, response
-        from .evidence_repair import append_sources, prepare_evidence_patch
+
+        def cli(*args):
+            output=io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code=main(list(args))
+            return code,json.loads(output.getvalue())
+
         with tempfile.TemporaryDirectory() as root:
             workflow=NativeReviews().bootstrap(root)
             NativeReviews()._reach_global(workflow)
@@ -123,11 +130,17 @@ class EvidenceRecoveryContracts(unittest.TestCase):
                 r=workflow._load(state)
                 finding=dict(finding_id='gap.1',claim_ids=['a'],resolution_route='evidence_needed',
                     issue='No financing source supplied',evidence='fixture',suggested_fix='add filing',
-                    resolution_reason='missing document',resolution_baseline=r._resolution_baseline())
+                    resolution_reason='missing document',resolution_baseline=r._resolution_baseline(),
+                    evidence_request=dict(proposition='Find the financing source.'))
                 r.deferred_global_findings=[finding]
+                work=r.prepare_evidence_work([finding])
+                request_id=work['evidence_requests'][0]['request_id']
                 workflow._save(state,r)
                 before_hash=r._hash(); old_claims=deepcopy(r.run.claims); rounds=r.revision_round
-            added=append_sources(workflow,self.manifest(root),reason='Main Agent supplied filing')
+            code,added=cli('add-evidence','--work-dir',str(workflow.directory),
+                '--manifest',str(self.manifest(root)),'--request-id',request_id,
+                '--reason','Main Agent supplied filing')
+            self.assertEqual(code,0,added)
             self.assertFalse(added['findings_resolved'])
             self.assertNotEqual(added['after_hash'],before_hash)
             with workflow.queue.transaction() as state:
@@ -136,9 +149,13 @@ class EvidenceRecoveryContracts(unittest.TestCase):
                 self.assertEqual(r.revision_round,rounds)
                 self.assertEqual(r.deferred_global_findings[0]['finding_id'],'gap.1')
                 self.assertFalse(r.receipts)
+                self.assertEqual(r.evidence_requests[0]['submitted_source_ids'],['filing.new'])
                 self.assertIn('No forecast is provided.',next(iter(r.run.evidence_store.to_dict().values()))['claim_candidate'])
-            with self.assertRaisesRegex(ValueError,'semantic verification'):
-                prepare_evidence_patch(workflow,['a'],reason='Reassess financing')
+            code,waiting=cli('repair-evidence','--work-dir',str(workflow.directory),
+                '--claim-id','a','--request-id',request_id,'--reason','Reassess financing')
+            self.assertEqual(code,0,waiting)
+            self.assertEqual(waiting['status'],'reviews_pending')
+            self.assertEqual(waiting['layer'],'atomic')
             # Complete mandatory verification on the changed evidence scope.
             for _ in range(10):
                 packet=workflow.next()
@@ -146,7 +163,10 @@ class EvidenceRecoveryContracts(unittest.TestCase):
                     break
                 workflow.submit(packet['packet_id'],{cid:response(cid,item) for cid,item in packet['items'].items()},
                     'host/test',packet['input_hash'])
-            outcome=prepare_evidence_patch(workflow,['a'],reason='Link new financing evidence; preserve uncertainty')
+            code,outcome=cli('repair-evidence','--work-dir',str(workflow.directory),
+                '--claim-id','a','--request-id',request_id,
+                '--reason','Link new financing evidence; preserve uncertainty')
+            self.assertEqual(code,0,outcome)
             self.assertIn('revision_prompts',outcome)
             self.assertIn('committed debt',outcome['revision_prompts'][0][1])
             patch=workflow.next();self.assertEqual(patch.get('kind'),'patch',patch)

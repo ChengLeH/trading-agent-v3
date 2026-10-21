@@ -429,9 +429,10 @@ class SemanticAcceptance(unittest.TestCase):
 
         blocked = r.execute_phase6(verifier, deep, patcher, global_client)
 
-        self.assertTrue(blocked["blocked"])
-        self.assertEqual(blocked["status"], "blocked:resolution_required")
-        self.assertEqual(blocked["resolution_routes"], ["evidence_needed"])
+        self.assertFalse(blocked["blocked"])
+        self.assertEqual(blocked["status"], "evidence_recovery")
+        self.assertFalse(blocked["delivery_ready"])
+        self.assertEqual(len(blocked["evidence_requests"]), 1)
         self.assertEqual(r.revision_round, 0)
         self.assertEqual(patcher.calls, [])
         self.assertEqual(r.deferred_global_findings[0]["resolution_route"], "evidence_needed")
@@ -448,8 +449,9 @@ class SemanticAcceptance(unittest.TestCase):
         global_client.responder = lambda _: global_review(r)
         next(c for c in r.run.claims if c["claim_id"] == "role.bear")["text"] = "另一個角色的新觀察。"
         unchanged = r.execute_phase6(verifier, deep, patcher, global_client)
-        self.assertTrue(unchanged["blocked"])
-        self.assertEqual(unchanged["status"], "blocked:resolution_required")
+        self.assertFalse(unchanged["blocked"])
+        self.assertEqual(unchanged["status"], "evidence_recovery")
+        self.assertFalse(unchanged["delivery_ready"])
         self.assertEqual(r.revision_round, 0)
 
         saved_id = r.deferred_global_findings[0]["finding_id"]
@@ -459,8 +461,8 @@ class SemanticAcceptance(unittest.TestCase):
                                                  reason="此自由文字不構成 typed proof")]
         }
         rejected = r.execute_phase6(verifier, deep, patcher, global_client)
-        self.assertTrue(rejected["blocked"])
-        self.assertEqual(rejected["status"], "blocked:resolution_required")
+        self.assertFalse(rejected["blocked"])
+        self.assertEqual(rejected["status"], "evidence_recovery")
         self.assertTrue(rejected["rejected_external_resolutions"])
 
         self.add_evidence_reference(r, "b", "ev.new_data")

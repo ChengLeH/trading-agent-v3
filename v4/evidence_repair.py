@@ -27,7 +27,32 @@ def augment_documents(run, report):
         report['evidence'] = report.get('evidence', 0) + 1
 
 
-def append_sources(workflow, manifest_path, *, reason):
+def _evidence_request(runner, request_id):
+    from .evidence_requests import is_request_stale, validate_work_log
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise ValueError('request_id must be a nonempty exact ID')
+    records = validate_work_log(runner.evidence_requests)
+    record = next((row for row in records if row['request_id'] == request_id), None)
+    if record is None:
+        raise ValueError('unknown evidence request_id')
+    if is_request_stale(record, runner.run.claims):
+        raise ValueError('evidence request is stale for the current Claim versions')
+    return record
+
+
+def record_evidence_search(workflow, request_id, outcome, *, query='', details=''):
+    """Persist an operator search result without changing canonical evidence."""
+    with workflow.queue.transaction() as state:
+        runner = workflow._load(state)
+        runner.record_evidence_search(request_id, outcome, query=query, details=details)
+        workflow._save(state, runner)
+        record = next(row for row in runner.evidence_requests if row['request_id'] == request_id)
+        return dict(status='evidence_search_recorded', request_id=request_id,
+                    search_result=deepcopy(record['search_results'][-1]),
+                    resolution_status='unresolved', input_hash=runner._hash())
+
+
+def append_sources(workflow, manifest_path, *, reason, request_id=None):
     """Validate new sources separately, then append in one canonical transaction.
 
     Existing IDs/values are never overwritten. The operator supplies a manifest
@@ -49,6 +74,7 @@ def append_sources(workflow, manifest_path, *, reason):
         manifest['issuer_registry_path'] = str((path.parent / manifest['issuer_registry_path']).resolve())
     with workflow.queue.transaction() as state:
         runner = workflow._load(state)
+        request = _evidence_request(runner, request_id) if request_id is not None else None
         run = runner.run
         if manifest.get('subject') != run.manifest['subject'] or manifest.get('as_of') != run.manifest['as_of']:
             raise ValueError('new evidence must retain exact subject and as_of; start a new run to change them')
@@ -90,8 +116,13 @@ def append_sources(workflow, manifest_path, *, reason):
         runner.orch.runs[runner.run_id] = shadow
         _reopen_evidence_reviews(workflow, state, runner, 'canonical_evidence_added',
                                  preserve_role_state=True)
+        if request is not None:
+            for source_id in new_ids:
+                runner.record_evidence_source(request['request_id'], source_id)
         event = dict(source_ids=new_ids, canonical_refs=sorted(additions), reason=reason.strip(),
                      before_hash=before_hash, after_hash=runner._hash())
+        if request is not None:
+            event['request_id'] = request['request_id']
         state.setdefault('evidence_additions', []).append(event)
         workflow._save(state, runner)
         return dict(status='evidence_added', **event,
@@ -188,7 +219,7 @@ def register_event_catalog(workflow, events, *, reason):
         return dict(status='events_registered', findings_resolved=False, **event)
 
 
-def prepare_evidence_patch(workflow, claim_ids, *, reason):
+def prepare_evidence_patch(workflow, claim_ids, *, reason, request_id=None):
     """Explicit main-Agent repair scope; never guess Claim IDs from prose."""
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError('operator reason required')
@@ -199,18 +230,45 @@ def prepare_evidence_patch(workflow, claim_ids, *, reason):
         runner = workflow._load(state)
         if set(ids) - claim_index(runner.run.claims).keys():
             raise ValueError('unknown evidence repair Claim IDs')
-        if not state.get('evidence_additions'):
+        request = _evidence_request(runner, request_id) if request_id is not None else None
+        if request is not None and ids != request['claim_ids']:
+            raise ValueError('Claim IDs must exactly match the evidence request targets')
+        addition = None
+        if request is not None:
+            addition = next((row for row in reversed(state.get('evidence_additions', []))
+                             if row.get('request_id') == request['request_id']), None)
+            if addition is None or not set(request['submitted_source_ids']).intersection(addition['source_ids']):
+                raise ValueError('append canonical sources for this evidence request before requesting a patch')
+        elif state.get('evidence_additions'):
+            addition = state['evidence_additions'][-1]
+        if addition is None:
             raise ValueError('append evidence before requesting an evidence repair')
         if runner.pending_patch is not None:
             raise ValueError('finish the current pending patch first')
+        tasks = runner._tasks()
+        missing_atomic = [cid for cid, task in tasks.items()
+                          if cid not in runner.receipts
+                          or runner.receipts[cid]['input_hash'] != digest(task.to_dict())]
+        if missing_atomic:
+            workflow._save(state, runner)
+            return dict(status='reviews_pending', blocked=False, layer='atomic',
+                        pending_claim_ids=missing_atomic, next_action='next')
+        missing_deep = [cid for cid, task in tasks.items()
+                        if runner.receipts[cid]['result']['verdict'] != 'PASS'
+                        and (cid not in runner.deep_receipts
+                             or runner.deep_receipts[cid]['input_hash'] != digest(task.to_dict()))]
+        if missing_deep:
+            workflow._save(state, runner)
+            return dict(status='reviews_pending', blocked=False, layer='deep',
+                        pending_claim_ids=missing_deep, next_action='next')
         findings = [dict(claim_id=cid, category='evidence_recovery', resolution_route='claim_patch',
             issue='主 Agent 要求核對新增證據對此主張的影響；不是已認定錯誤',
-            evidence=dict(addition=deepcopy(state['evidence_additions'][-1])),
+            evidence=dict(addition=deepcopy(addition)),
             suggested_fix=reason.strip()) for cid in ids]
         from .pipeline import source_catalog
         catalog = source_catalog(runner.run)
         findings[0]['evidence']['sources'] = {ref: deepcopy(catalog[ref])
-            for ref in state['evidence_additions'][-1]['canonical_refs']}
+            for ref in addition['canonical_refs']}
         outcome = runner.prepare_phase6_revision_v4(findings)
         if 'revision_prompts' in outcome:
             runner.pending_global = runner.global_review_progress = None

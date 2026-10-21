@@ -834,7 +834,7 @@ class NativeGlobalFindingsPatch(NativeReviews):
             with workflow.queue.transaction() as state:
                 self.assertEqual(len(state['patch_retry_history']), 1)
 
-    def test_non_patchable_route_stays_blocked_without_patch_packet(self):
+    def test_non_patchable_route_emits_evidence_work_without_patch_packet(self):
         with tempfile.TemporaryDirectory() as root:
             workflow = self.bootstrap(root)
             finding = dict(claim_id='a', category='evidence_gap',
@@ -845,9 +845,58 @@ class NativeGlobalFindingsPatch(NativeReviews):
                            evidence_request=dict(proposition='Obtain the missing source.'))
             outcome = self._global_with_findings(workflow, finding)
             self.assertTrue(outcome['blocked'])
-            blocked = NativeReviewWorkflow(workflow.directory).next()
-            self.assertEqual(blocked['status'], 'blocked:resolution_required')
-            self.assertTrue(blocked['blocked'])
+            work = NativeReviewWorkflow(workflow.directory).next()
+            self.assertEqual(work['status'], 'evidence_recovery')
+            self.assertFalse(work['blocked'])
+            self.assertFalse(work['delivery_ready'])
+            self.assertEqual(work['evidence_requests'][0]['claim_ids'], ['a'])
+
+    def test_deep_evidence_finding_reaches_native_work_and_search_is_durable(self):
+        import contextlib
+        import io
+        from .agent_cli import main
+        with tempfile.TemporaryDirectory() as root:
+            workflow = self.bootstrap(root)
+            for _ in range(24):
+                packet = NativeReviewWorkflow(workflow.directory).next()
+                if packet.get('status') == 'evidence_recovery':
+                    break
+                self.assertIn(packet.get('kind'), ('atomic', 'deep'), packet)
+                outputs = {}
+                for cid, item in packet['items'].items():
+                    status = 'SUSPICIOUS' if packet['kind'] == 'atomic' and cid == 'a' else 'PASS'
+                    if packet['kind'] == 'deep' and cid == 'a':
+                        status = 'FAIL'
+                    answer = response(cid, item, status)
+                    if cid == 'a' and status != 'PASS':
+                        answer['findings'] = [dict(issue='The source does not establish this period.',
+                            resolution_route='evidence_needed',
+                            resolution_reason='The current source does not cover the requested period.',
+                            evidence_request=dict(proposition='Find source evidence for this period.'))]
+                    outputs[cid] = answer
+                workflow.submit(packet['packet_id'], outputs, 'host/main', packet['input_hash'])
+            else:
+                self.fail('accepted deep evidence finding did not reach recovery work')
+
+            self.assertEqual(packet['status'], 'evidence_recovery')
+            self.assertFalse(packet['delivery_ready'])
+            request = packet['evidence_requests'][0]
+            self.assertEqual(request['resolution_status'], 'unresolved')
+            resumed = NativeReviewWorkflow(workflow.directory).next()
+            self.assertEqual(resumed['status'], 'evidence_recovery')
+            self.assertEqual(resumed['evidence_requests'][0]['request_id'], request['request_id'])
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = main(['record-evidence-search', '--work-dir', str(workflow.directory),
+                    '--request-id', request['request_id'], '--outcome', 'not_found',
+                    '--query', 'official filing', '--details', 'No exact passage located'])
+            self.assertEqual(code, 0)
+            recorded = json.loads(output.getvalue())
+            self.assertEqual(recorded['status'], 'evidence_search_recorded')
+            again = NativeReviewWorkflow(workflow.directory).next()
+            self.assertEqual(again['evidence_requests'][0]['resolution_status'], 'unresolved')
+            self.assertEqual(again['evidence_requests'][0]['search_results'][-1]['outcome'], 'not_found')
 
 
 if __name__ == '__main__':

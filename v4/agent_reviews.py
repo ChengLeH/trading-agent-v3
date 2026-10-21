@@ -332,6 +332,10 @@ class NativeReviewWorkflow(NativeWorkflow):
             return self._prepare_global_repair(state, runner, findings=claim_failures)
         semantic_findings = runner._claim_review_findings()
         if semantic_findings:
+            evidence_work = runner.prepare_evidence_work(semantic_findings)
+            if evidence_work:
+                self._save(state, runner)
+                return evidence_work
             return self._prepare_global_repair(state, runner, findings=semantic_findings)
         blocked = state.get("global_blocked")
         if blocked:
@@ -438,6 +442,19 @@ class NativeReviewWorkflow(NativeWorkflow):
             if not findings:
                 return dict(status="blocked:global_findings", blocked=True,
                             findings=deepcopy(runner.global_receipt["findings"]))
+            evidence_work = runner.prepare_evidence_work(findings)
+            if evidence_work:
+                # Carry every current finding across source ingestion. The
+                # global receipt will be invalidated when evidence changes.
+                merged = {row.get("finding_id"): deepcopy(row)
+                          for row in runner.deferred_global_findings
+                          if row.get("finding_id")}
+                for finding in findings:
+                    if finding.get("finding_id"):
+                        merged[finding["finding_id"]] = deepcopy(finding)
+                runner.deferred_global_findings = list(merged.values())
+                self._save(state, runner)
+                return evidence_work
             prepared = runner.prepare_phase6_revision_v4(findings)
             if prepared.get("needs_linking"):
                 role, prompt = prepared["linker_prompt"]
