@@ -6,7 +6,11 @@ infers meaning from prose, invents edges or decides source entailment itself.
 from copy import deepcopy
 from .schema import Claim, claim_index, id_list
 
-SEMANTIC_REVIEW_CONTRACT = "v4-semantic-review/3"
+SEMANTIC_REVIEW_CONTRACT = "v4-semantic-review/4"
+SEMANTIC_RESOLUTION_ROUTES = frozenset({
+    "claim_patch", "evidence_needed", "transport_recovery", "role_redeliberation",
+    "human_decision", "uncertain",
+})
 SEMANTIC_REVIEW_SCHEMA = {
     "type": "object",
     "required": ["claim_id", "verdict", "reference_checks", "findings"],
@@ -25,7 +29,23 @@ SEMANTIC_REVIEW_SCHEMA = {
         }},
         "findings": {"type": "array", "items": {
             "type": "object", "required": ["issue"],
-            "properties": {"issue": {"type": "string", "minLength": 1}},
+            "properties": {
+                "issue": {"type": "string", "minLength": 1},
+                "resolution_route": {"type": "string", "enum": sorted(SEMANTIC_RESOLUTION_ROUTES)},
+                "resolution_reason": {"type": "string", "minLength": 1},
+                "evidence_request": {
+                    "type": "object", "required": ["proposition"],
+                    "properties": {
+                        "proposition": {"type": "string", "minLength": 1},
+                        "refs": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                        **{field: {"type": "string"} for field in
+                           ("entity", "metric", "period", "unit", "basis", "scope")},
+                        "known_data_range": {"type": "object", "properties": {
+                            "start": {"type": "string"}, "end": {"type": "string"},
+                        }},
+                    },
+                },
+            },
         }},
         "clarity_notes": {"type": "array", "items": {
             "type": "object", "required": ["issue", "reason"],
@@ -59,6 +79,9 @@ source_evidence 必須指出 context 內的實際證據；不相關的真實摘�
 來源矛盾回 CONTRADICTS 且 verdict=FAIL；證據不足回 INSUFFICIENT，禁止 PASS。
 無任何引用或相依時可省略 reference_checks 或回 []，仍需完整審查 Claim 語義；有任何引用時不可省略或少審。"""
 
+EVIDENCE_REQUEST_INSTRUCTIONS = """只有在你已完成當前層級的語義判斷，並明確判定問題需要缺少的外部來源資料時，finding 才可標 resolution_route="evidence_needed"；這不是 claim_patch 能修正的文字／口徑問題。此時附上 resolution_reason 及 evidence_request：proposition 用一句話寫明待查命題，refs 只列你在 context 中能精確識別的相關 ID，entity/metric/period/unit/basis/scope 與 known_data_range 只填已知值，未知留空。不可從 finding prose 猜 ID、不可捏造來源或把搜尋結果當證據。補證據紀錄不代表問題已解決；仍須由主 Agent 匯入來源、修訂 Claim，並完成必要重驗與 Global。
+"""
+
 
 def review_ref_ids(claim):
     return list(dict.fromkeys(claim.get("refs", []) + claim.get("fact_refs", []) + claim.get("dependencies", [])))
@@ -71,6 +94,11 @@ def semantic_review_schema(claim, *, reference_ids=None):
     if len(set(refs)) != len(refs) or set(refs) - set(all_refs):
         raise ValueError("semantic review schema reference IDs must be unique Claim references")
     schema["properties"]["claim_id"]["enum"] = [claim["claim_id"]]
+    request_refs = schema["properties"]["findings"]["items"]["properties"]["evidence_request"]["properties"]["refs"]
+    if all_refs:
+        request_refs["items"]["enum"] = all_refs
+    else:
+        request_refs["maxItems"] = 0
     checks = schema["properties"]["reference_checks"]
     checks.update(minItems=len(refs), maxItems=len(refs))
     if refs:
@@ -120,6 +148,30 @@ def normalize_reference_checks(expected_refs, result, *, allow_missing=False):
     if missing and not allow_missing:
         raise MissingReferenceChecks(missing)
     return deepcopy(rows)
+
+
+def normalize_semantic_finding_fields(finding, *, allowed_evidence_refs=None):
+    """Validate optional typed finding routes without classifying its prose."""
+    from .evidence_requests import normalize_evidence_request
+
+    row = deepcopy(finding)
+    route = row.get("resolution_route")
+    if route is not None and (not isinstance(route, str) or route not in SEMANTIC_RESOLUTION_ROUTES):
+        raise ValueError("invalid semantic finding resolution_route")
+    if route is not None and route != "claim_patch":
+        require_text(row.get("resolution_reason"), "finding resolution_reason")
+    has_request = "evidence_request" in row
+    if route == "evidence_needed" and not has_request:
+        raise ValueError("evidence_needed requires a typed evidence_request")
+    if has_request:
+        if route != "evidence_needed":
+            raise ValueError("evidence_request requires resolution_route=evidence_needed")
+        row["evidence_request"] = normalize_evidence_request(row["evidence_request"])
+        if allowed_evidence_refs is not None:
+            unknown = set(row["evidence_request"]["refs"]) - set(allowed_evidence_refs)
+            if unknown:
+                raise ValueError(f"evidence_request references unknown IDs: {sorted(unknown)}")
+    return row
 
 
 def normalize_dependency_review(claims, result, *, allow_partial=False, expected_claim_ids=None):

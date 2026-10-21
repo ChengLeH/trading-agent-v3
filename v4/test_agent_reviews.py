@@ -841,7 +841,8 @@ class NativeGlobalFindingsPatch(NativeReviews):
                            issue='Fixture requires new evidence outside the current sources',
                            evidence=dict(trigger='synthetic'),
                            resolution_route='evidence_needed',
-                           resolution_reason='current evidence cannot settle the conflict')
+                           resolution_reason='current evidence cannot settle the conflict',
+                           evidence_request=dict(proposition='Obtain the missing source.'))
             outcome = self._global_with_findings(workflow, finding)
             self.assertTrue(outcome['blocked'])
             blocked = NativeReviewWorkflow(workflow.directory).next()

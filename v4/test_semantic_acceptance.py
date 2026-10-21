@@ -419,7 +419,10 @@ class SemanticAcceptance(unittest.TestCase):
         r.max_revisions = 0
         finding = dict(claim_ids=["b"], issue="缺少九月的來源數據", evidence="當前 source store 無該期間資料",
                        materiality="material", resolution_route="evidence_needed",
-                       resolution_reason="Claim 修補器不能建立不存在的行情資料")
+                       resolution_reason="Claim 修補器不能建立不存在的行情資料",
+                       evidence_request=dict(proposition="取得九月行情資料", refs=[], entity="TEST",
+                           metric="closing price", period="2026-09", unit="USD", basis="",
+                           scope="", known_data_range=dict(start="2026-08", end="2026-10")))
         verifier, deep = CloudDouble(), CloudDouble("test/deep")
         patcher = CloudDouble("test/patcher")
         global_client = CloudDouble("test/global", lambda _: global_review(r, [finding]))
@@ -472,11 +475,91 @@ class SemanticAcceptance(unittest.TestCase):
         self.assertEqual(r.deferred_global_findings, [])
         self.assertEqual(r.revision_round, 0)
 
+    def test_evidence_route_requires_typed_request_and_valid_route(self):
+        from .semantic_contracts import normalize_semantic_finding_fields, semantic_review_schema
+        base = dict(issue="Need the original filing", resolution_route="evidence_needed",
+                    resolution_reason="The provided evidence does not establish the reported item.")
+        with self.assertRaisesRegex(ValueError, "typed evidence_request"):
+            normalize_semantic_finding_fields(base)
+        with self.assertRaisesRegex(ValueError, "invalid semantic finding"):
+            normalize_semantic_finding_fields(base | dict(resolution_route=[]))
+        with self.assertRaisesRegex(ValueError, "requires resolution_route"):
+            normalize_semantic_finding_fields(base | dict(resolution_route="claim_patch",
+                evidence_request=dict(proposition="Find the filing")))
+        with self.assertRaisesRegex(ValueError, "evidence_request"):
+            normalize_semantic_finding_fields(base | dict(evidence_request=None))
+        with self.assertRaisesRegex(ValueError, "unknown IDs"):
+            normalize_semantic_finding_fields(base | dict(evidence_request={
+                "proposition": "Find the filing", "refs": ["invented.source"]}),
+                allowed_evidence_refs=[])
+        normalized = normalize_semantic_finding_fields(base | dict(evidence_request={
+            "proposition": "Find the filing"}))
+        self.assertEqual(normalized["evidence_request"], dict(
+            proposition="Find the filing", refs=[], entity="", metric="", period="", unit="",
+            basis="", scope="", known_data_range=dict(start="", end="")))
+
+        claim = next(c for c in seeded().run.claims if c["claim_id"] == "a")
+        schema = semantic_review_schema(claim)
+        request_refs = schema["properties"]["findings"]["items"]["properties"][
+            "evidence_request"]["properties"]["refs"]
+        if claim_reference_ids(claim):
+            self.assertEqual(request_refs["items"]["enum"], claim_reference_ids(claim))
+        else:
+            self.assertEqual(request_refs["maxItems"], 0)
+
+    def test_only_accepted_deep_evidence_finding_becomes_durable_work(self):
+        from .checkpoint import load_checkpoint, save_checkpoint
+
+        def reviewed_runner(deep_status):
+            runner = seeded()
+            prepared = runner.prepare_phase6_atomic()
+            tasks = {task.claim_id: task for task in build_atomic_tasks(runner.run)}
+            results = {cid: verdict(cid, ref_ids=reference_ids(task))
+                       for cid, task in tasks.items()}
+            results["a"] = verdict("a", "SUSPICIOUS", ref_ids=reference_ids(tasks["a"]))
+            results["a"]["findings"] = [dict(issue="Source does not establish the period.",
+                resolution_route="evidence_needed", resolution_reason="The period is absent.",
+                evidence_request=dict(proposition="Find a source for the period."))]
+            runner.collect_phase6_atomic(results, model_identity="test/atomic")
+            deep = runner.prepare_phase6_deep_review()
+            deep_result = verdict("a", deep_status, ref_ids=reference_ids(tasks["a"]))
+            if deep_status != "PASS":
+                deep_result["findings"] = [dict(issue="The period still lacks source support.",
+                    resolution_route="evidence_needed", resolution_reason="The reviewed evidence is insufficient.",
+                    evidence_request=dict(proposition="Find a source for the period."))]
+            runner.collect_phase6_deep_review({"a": deep_result}, model_identity="test/deep")
+            return runner
+
+        passed = reviewed_runner("PASS")
+        self.assertIsNone(passed.prepare_evidence_work())
+        self.assertEqual(passed.evidence_requests, [])
+
+        accepted = reviewed_runner("FAIL")
+        work = accepted.prepare_evidence_work()
+        self.assertEqual(work["status"], "evidence_recovery")
+        self.assertEqual(len(work["evidence_requests"]), 1)
+        record = work["evidence_requests"][0]
+        finding_id = record["finding_id"]
+        self.assertTrue(finding_id.startswith("deep."))
+        self.assertEqual(record["claim_ids"], ["a"])
+        self.assertEqual(accepted._claim_review_findings()[0]["finding_id"], finding_id)
+        self.assertEqual(accepted.prepare_evidence_work()["evidence_requests"][0]["request_id"],
+                         record["request_id"])
+        baseline = accepted.deep_finding_baselines[finding_id]
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "checkpoint.json"
+            save_checkpoint(accepted, path)
+            restored = load_checkpoint(path, continue_verification=False)
+        self.assertEqual(restored.evidence_requests, accepted.evidence_requests)
+        self.assertEqual(restored.deep_finding_baselines[finding_id], baseline)
+
     def test_unmapped_external_finding_needs_explicit_global_resolution(self):
         r = seeded(); review_all(r)
         finding = dict(claim_ids=[], unresolved=True, issue="缺少來源證據",
                        evidence="來源資料尚未提供", materiality="material",
-                       resolution_route="evidence_needed", resolution_reason="需要補上來源資料")
+                       resolution_route="evidence_needed", resolution_reason="需要補上來源資料",
+                       evidence_request=dict(proposition="取得可支持原始主張的來源"))
         global_calls = []
         def global_response(_prompt):
             global_calls.append(True)

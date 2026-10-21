@@ -178,6 +178,8 @@ def save_checkpoint(runner, path):
                           reference_supplements=runner.reference_supplements,
                           global_review_progress=runner.global_review_progress,
                           deferred_global_findings=runner.deferred_global_findings,
+                          evidence_requests=runner.evidence_requests,
+                          deep_finding_baselines=runner.deep_finding_baselines,
                           max_revisions=runner.max_revisions, max_workers=runner.max_workers,
                           max_contract_attempts=runner.max_contract_attempts,
                           review_batch_size=runner.review_batch_size, review_batch_max_bytes=runner.review_batch_max_bytes,
@@ -375,6 +377,35 @@ def load_checkpoint(path, *, continue_verification=True):
     r.revision_round = data["revision_round"]
     r.history = data["history"]
     r.deferred_global_findings = data.get("deferred_global_findings", [])
+    from .evidence_requests import validate_work_log
+    r.evidence_requests = validate_work_log(data.get("evidence_requests", []))
+    r.deep_finding_baselines = data.get("deep_finding_baselines", {})
+    if not isinstance(r.deep_finding_baselines, dict):
+        raise ValueError("invalid deep finding baselines")
+    for finding_id, baseline in r.deep_finding_baselines.items():
+        if (not isinstance(finding_id, str) or not finding_id.startswith("deep.")
+                or len(finding_id) != 69
+                or any(char not in "0123456789abcdef" for char in finding_id[5:])
+                or not isinstance(baseline, dict)
+                or set(baseline) != {"trusted", "source_ids", "claim_hashes", "transport_attempt_ids"}
+                or baseline.get("trusted") is not True
+                or not isinstance(baseline.get("source_ids"), list)
+                or any(not isinstance(value, str) or not value for value in baseline["source_ids"])
+                or len(set(baseline["source_ids"])) != len(baseline["source_ids"])
+                or not isinstance(baseline.get("claim_hashes"), dict)
+                or any(not isinstance(claim_id, str) or not claim_id.strip()
+                       for claim_id in baseline["claim_hashes"])
+                or any(not isinstance(value, str) or len(value) != 64
+                       or any(char not in "0123456789abcdef" for char in value)
+                       for value in baseline["claim_hashes"].values())
+                or not isinstance(baseline.get("transport_attempt_ids"), list)):
+            raise ValueError("invalid deep finding baseline")
+        for attempt_id in baseline["transport_attempt_ids"]:
+            try:
+                if not isinstance(attempt_id, str) or UUID(attempt_id).hex != attempt_id:
+                    raise ValueError
+            except (TypeError, ValueError, AttributeError):
+                raise ValueError("invalid deep finding transport attempt") from None
     if (not isinstance(r.deferred_global_findings, list)
             or any(not isinstance(f, dict) or not isinstance(f.get("issue"), str)
                    or not f["issue"].strip() or not isinstance(f.get("finding_id"), str)

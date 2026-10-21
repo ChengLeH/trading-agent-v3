@@ -91,6 +91,11 @@ def _normalize_evidence_request(request):
     return dict(proposition=proposition, refs=refs, **dimensions, known_data_range=bounds)
 
 
+def normalize_evidence_request(request):
+    """Public typed normalization used by review-result contracts."""
+    return _normalize_evidence_request(request)
+
+
 def _request_id(finding_id):
     return "evidence." + digest({"finding_id": finding_id})
 

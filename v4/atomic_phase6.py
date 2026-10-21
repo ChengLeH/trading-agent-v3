@@ -18,7 +18,8 @@ from .schema import claim_index, digest
 from .review_context import calculation_definitions, indicator_definitions
 from .semantic_contracts import (REFERENCE_INSTRUCTIONS, EVIDENCE_INSTRUCTIONS, MissingReferenceChecks,
                                  normalize_reference_checks, SEMANTIC_REVIEW_CONTRACT,
-                                 semantic_review_schema, review_ref_ids, require_text)
+                                 semantic_review_schema, review_ref_ids, require_text,
+                                 normalize_semantic_finding_fields, EVIDENCE_REQUEST_INSTRUCTIONS)
 
 from .financial_review import FINANCIAL_REVIEW_CONTRACT, FINANCIAL_REVIEW_VERSION, ingestion_diagnostics
 from .source_lineage import project_source_lineage
@@ -263,7 +264,7 @@ ATOMIC_INSTRUCTIONS = r"""
   "clarity_notes": [{"issue":"不影響事實或決策的輕微表達提醒","reason":"為何合理解讀不會改變主張"}]
 }
 clarity_notes 可省略。PASS 時 findings 必須是空陣列；小幅措辭提醒不算 finding。
-""".strip() + "\n\n" + REFERENCE_INSTRUCTIONS + "\n" + FINANCIAL_REVIEW_CONTRACT
+""".strip() + "\n\n" + REFERENCE_INSTRUCTIONS + "\n" + FINANCIAL_REVIEW_CONTRACT + "\n" + EVIDENCE_REQUEST_INSTRUCTIONS
 
 
 def build_atomic_prompt(task: AtomicTask, *, verification_epoch=None) -> str:
@@ -306,6 +307,7 @@ def build_reference_supplement_prompt(task: AtomicTask, prior_result, missing_re
         role_instructions
         + EVIDENCE_INSTRUCTIONS
         + FINANCIAL_REVIEW_CONTRACT
+        + EVIDENCE_REQUEST_INSTRUCTIONS
         + "只補 expected_reference_ids 所列的缺漏引用；reference_checks 必須只含這些 ID。"
         + "逐項比對原文歸因與 context 內實際證據，不相關的真實摘錄不構成支持。"
         + "relation 只能是 SUPPORTS、CONTRADICTS、INSUFFICIENT；矛盾必須判 FAIL，"
@@ -341,6 +343,7 @@ def build_reference_verdict_repair_prompt(task: AtomicTask, accepted_reference_c
         role
         + EVIDENCE_INSTRUCTIONS
         + FINANCIAL_REVIEW_CONTRACT
+        + EVIDENCE_REQUEST_INSTRUCTIONS
         + "accepted_reference_checks 是已完成且保存的來源審查；使用它們判斷主張，但不要重審、改寫或重複回傳。"
         + "只修正 validation_error 指出的 verdict/findings/結構契約問題。"
         + "所有 Claim 仍須由你作語義判斷；來源支持不足、矛盾或不確定時，不可判 PASS。"
@@ -377,6 +380,8 @@ def normalize_atomic_result(claim_id: str, result: Dict[str, Any], *, expected_r
             raise ValueError("every finding requires issue text")
         if finding.get("claim_id", claim_id) != claim_id:
             raise ValueError("finding targets another claim")
+    findings = [normalize_semantic_finding_fields(finding, allowed_evidence_refs=expected_ref_ids)
+                for finding in findings]
     if "clarity_notes" in result:
         notes = result["clarity_notes"]
         if not isinstance(notes, list):
