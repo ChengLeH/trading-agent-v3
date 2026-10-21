@@ -141,14 +141,56 @@ class FinancialSourceContracts(unittest.TestCase):
                             for line in orch.runs[rid].records[0].meta[
                                 "financial_data_extraction"]["limitations"]))
 
-    def test_complete_nonoverlapping_debt_components_allow_generic_total(self):
-        orch, rid, _ = self.build({"income": [], "balance": [{
-            "fiscal_year": 2025, "short_term_debt": 10,
-            "current_portion_of_long_term_debt": 4, "long_term_debt": 20,
-            "debt_components_complete": True,
-            "current_portion_in_short_term_debt": False}], "cash_flow": []})
-        facts = orch.runs[rid].fact_store.to_dict()
-        self.assertEqual(facts["fact.TotalDebt.FY2025"]["value"], 34)
+    def test_complete_debt_components_respect_current_portion_overlap(self):
+        for included, expected in ((False, 34), (True, 30)):
+            with self.subTest(current_portion_in_short_term_debt=included):
+                orch, rid, report = self.build({"income": [], "balance": [{
+                    "fiscal_year": 2025, "short_term_debt": 10,
+                    "current_portion_of_long_term_debt": 4, "long_term_debt": 20,
+                    "debt_components_complete": True,
+                    "current_portion_in_short_term_debt": included}], "cash_flow": []})
+                facts = orch.runs[rid].fact_store.to_dict()
+                self.assertEqual(facts["fact.TotalDebt.FY2025"]["value"], expected)
+                self.assertFalse(any('TotalDebt unavailable' in line for line in report['limitations']))
+
+    def test_total_debt_diagnostics_name_only_the_unsatisfied_requirements(self):
+        from .financial_data import extract_financial_facts
+
+        complete = dict(fiscal_year=2025, short_term_debt=10,
+            current_portion_of_long_term_debt=4, long_term_debt=20,
+            debt_components_complete=True, current_portion_in_short_term_debt=False)
+        cases = []
+        for field in ('short_term_debt', 'current_portion_of_long_term_debt', 'long_term_debt'):
+            row = {key: value for key, value in complete.items() if key != field}
+            cases.append((row, [f'missing component: {field}']))
+        for field in ('debt_components_complete', 'current_portion_in_short_term_debt'):
+            row = {key: value for key, value in complete.items() if key != field}
+            cases.append((row, [f'missing declaration: {field}']))
+        cases.extend([
+            ({key: value for key, value in complete.items() if key not in
+              ('debt_components_complete', 'current_portion_in_short_term_debt')},
+             ['missing declaration: debt_components_complete',
+              'missing declaration: current_portion_in_short_term_debt']),
+            ({**complete, 'short_term_debt': -1}, ['invalid component: short_term_debt']),
+            ({**complete, 'debt_components_complete': False},
+             ['incomplete declaration: debt_components_complete=false']),
+            ({**complete, 'debt_components_complete': 'true'},
+             ['invalid declaration: debt_components_complete (expected true)']),
+            ({**complete, 'current_portion_in_short_term_debt': 'false'},
+             ['invalid declaration: current_portion_in_short_term_debt (expected boolean)']),
+            (dict(fiscal_year=2025, debt_components_complete=True,
+                  current_portion_in_short_term_debt=False),
+             [f'missing component: {field}' for field in
+              ('short_term_debt', 'current_portion_of_long_term_debt', 'long_term_debt')]),
+        ])
+        for row, expected in cases:
+            with self.subTest(row=row):
+                facts, diagnostic = extract_financial_facts(fundamentals_record(
+                    dict(income=[], balance=[row], cash_flow=[])))
+                self.assertFalse(any(f.concept == 'TotalDebt' for f in facts))
+                reasons = [line.split('TotalDebt unavailable: ', 1)[1]
+                           for line in diagnostic['limitations'] if 'TotalDebt unavailable: ' in line]
+                self.assertEqual(reasons, ['; '.join(expected)])
 
     def test_duplicate_source_versions_keep_distinct_facts_and_no_ambiguous_growth(self):
         orch, rid = OrchestratorV4(), "duplicate-financial-source-fixture"

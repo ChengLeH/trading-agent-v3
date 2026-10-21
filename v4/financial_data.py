@@ -348,9 +348,23 @@ def _debt_facts(record, row, metadata, index, dims, produced, findings, limitati
                 period_info=dims,
                 source_pointer=f"derived:balance[{index}].debt_components"))
             produced.append("TotalDebt")
-        elif any(row.get(field) is not None for field in _DEBT_COMPONENT_FIELDS):
+        elif any(row.get(field) is not None for field in (*_DEBT_COMPONENT_FIELDS,
+                "debt_components_complete", "current_portion_in_short_term_debt")):
+            reasons = [f"{'missing' if row.get(field) is None else 'invalid'} component: {field}"
+                       for field in _DEBT_COMPONENT_FIELDS if field not in components]
+            if not complete:
+                if row.get("debt_components_complete") is None:
+                    reasons.append("missing declaration: debt_components_complete")
+                elif row["debt_components_complete"] is False:
+                    reasons.append("incomplete declaration: debt_components_complete=false")
+                else:
+                    reasons.append("invalid declaration: debt_components_complete (expected true)")
+            if not overlap_known:
+                reasons.append("missing declaration: current_portion_in_short_term_debt"
+                    if row.get("current_portion_in_short_term_debt") is None else
+                    "invalid declaration: current_portion_in_short_term_debt (expected boolean)")
             limitations.append(f"{record.id}: balance[{index}] TotalDebt unavailable: "
-                "components or their completeness/overlap declaration are missing")
+                               + "; ".join(reasons))
     return facts
 
 
