@@ -17,6 +17,77 @@ from .source_lineage import validate_run_source_lineage
 from .storage import write_json
 
 
+def _valid_claim_dependency_snapshot(baseline, known_claims):
+    dependencies = baseline.get("claim_dependencies")
+    if dependencies is None:  # pre-U10 checkpoints remain readable
+        return True
+    hashes = baseline.get("claim_hashes")
+    if not isinstance(dependencies, dict) or not isinstance(hashes, dict):
+        return False
+    if set(dependencies) != set(hashes) or set(dependencies) - known_claims:
+        return False
+    for claim_id, parents in dependencies.items():
+        if (not isinstance(parents, list)
+                or any(not isinstance(parent, str) or not parent.strip() for parent in parents)
+                or len(set(parents)) != len(parents)
+                or claim_id in parents or set(parents) - known_claims):
+            return False
+    return True
+
+
+def _validate_saved_resolution_progress(finding, progress, runner, known_claims):
+    from .evidence_requests import normalize_target_reviews
+
+    fields = {"format", "finding_id", "input_hash", "history_hash", "verification_epoch",
+              "reviewer", "target_claim_ids", "target_reviews", "missing_target_ids"}
+    if not isinstance(progress, dict) or set(progress) != fields:
+        raise ValueError("invalid deferred Claim resolution progress")
+    targets = runner._finding_claim_ids(finding)
+    if (progress["format"] != "v4-claim-resolution-progress/1"
+            or progress["finding_id"] != finding.get("finding_id")
+            or progress["target_claim_ids"] != targets
+            or set(targets) - known_claims
+            or not isinstance(progress["reviewer"], str) or not progress["reviewer"].strip()
+            or not isinstance(progress["verification_epoch"], str)
+            or not progress["verification_epoch"].strip()):
+        raise ValueError("invalid deferred Claim resolution progress")
+    normalized = normalize_target_reviews(progress["target_reviews"], targets)
+    if normalized["missing_claim_ids"] != progress["missing_target_ids"]:
+        raise ValueError("deferred Claim resolution progress has inconsistent target coverage")
+    if not runner._resolution_progress_is_current(finding, progress):
+        finding.pop("resolution_progress", None)
+
+
+def _validate_global_resolution_progress(progress, runner, audit):
+    completion = progress.get("resolution_completion")
+    missing_by_finding = progress.get("missing_target_ids")
+    accepted_by_finding = progress.get("accepted_target_reviews")
+    review = progress.get("review", {})
+    response = review.get("response", {}) if isinstance(review, dict) else {}
+    if (audit["missing_dependency_claim_ids"] or not isinstance(completion, dict)
+            or set(completion) != {"missing_target_ids", "round"}
+            or type(completion.get("round")) is not int or completion["round"] < 1
+            or completion["round"] != progress.get("completion_round")
+            or type(progress.get("needs_retry")) is not bool
+            or progress["needs_retry"] != (completion["round"] < runner.max_contract_attempts)
+            or not isinstance(missing_by_finding, dict) or not missing_by_finding
+            or missing_by_finding != completion.get("missing_target_ids")
+            or not isinstance(accepted_by_finding, dict)):
+        raise ValueError("invalid global resolution progress")
+    if not isinstance(response, dict):
+        raise ValueError("invalid global resolution response")
+    _, _, proof_progress = runner._validate_external_resolutions(
+        response.get("resolved_external_findings", []), runner.deferred_global_findings,
+        model_identity=review["model"])
+    expected_missing = {finding_id: item["missing_target_ids"]
+                        for finding_id, item in proof_progress.items()
+                        if item["missing_target_ids"]}
+    expected_accepted = {finding_id: item["target_reviews"]
+                         for finding_id, item in proof_progress.items()}
+    if expected_missing != missing_by_finding or expected_accepted != accepted_by_finding:
+        raise ValueError("global resolution progress has inconsistent target proof")
+
+
 def _load_review_row(run_dir, source, *, run_id, model, layer, claim_id, task_hash,
                      verification_epoch=None, allowed_agent_policies=None,
                      first_review_hash=None, reference_parents=None):
@@ -382,12 +453,16 @@ def load_checkpoint(path, *, continue_verification=True):
     r.deep_finding_baselines = data.get("deep_finding_baselines", {})
     if not isinstance(r.deep_finding_baselines, dict):
         raise ValueError("invalid deep finding baselines")
+    from .schema import claim_index
+    known_claims = set(claim_index(run.claims))
+    legacy_baseline_fields = {"trusted", "source_ids", "claim_hashes", "transport_attempt_ids"}
+    extended_baseline_fields = legacy_baseline_fields | {"claim_dependencies"}
     for finding_id, baseline in r.deep_finding_baselines.items():
         if (not isinstance(finding_id, str) or not finding_id.startswith("deep.")
                 or len(finding_id) != 69
                 or any(char not in "0123456789abcdef" for char in finding_id[5:])
                 or not isinstance(baseline, dict)
-                or set(baseline) != {"trusted", "source_ids", "claim_hashes", "transport_attempt_ids"}
+                or set(baseline) not in (legacy_baseline_fields, extended_baseline_fields)
                 or baseline.get("trusted") is not True
                 or not isinstance(baseline.get("source_ids"), list)
                 or any(not isinstance(value, str) or not value for value in baseline["source_ids"])
@@ -398,7 +473,8 @@ def load_checkpoint(path, *, continue_verification=True):
                 or any(not isinstance(value, str) or len(value) != 64
                        or any(char not in "0123456789abcdef" for char in value)
                        for value in baseline["claim_hashes"].values())
-                or not isinstance(baseline.get("transport_attempt_ids"), list)):
+                or not isinstance(baseline.get("transport_attempt_ids"), list)
+                or not _valid_claim_dependency_snapshot(baseline, known_claims)):
             raise ValueError("invalid deep finding baseline")
         for attempt_id in baseline["transport_attempt_ids"]:
             try:
@@ -413,11 +489,10 @@ def load_checkpoint(path, *, continue_verification=True):
         raise ValueError("invalid deferred global findings")
     if len({f["finding_id"] for f in r.deferred_global_findings}) != len(r.deferred_global_findings):
         raise ValueError("duplicate deferred finding_id")
-    from .schema import claim_index
-    known_claims = claim_index(run.claims)
+    known_claim_map = claim_index(run.claims)
     for finding in r.deferred_global_findings:
         finding_ids = r._finding_claim_ids(finding)
-        if set(finding_ids) - known_claims.keys() or (not finding_ids and finding.get("unresolved") is not True):
+        if set(finding_ids) - known_claim_map.keys() or (not finding_ids and finding.get("unresolved") is not True):
             raise ValueError("invalid deferred global finding targets")
         if finding.get("resolution_route", "claim_patch") == "claim_patch":
             continue
@@ -432,19 +507,20 @@ def load_checkpoint(path, *, continue_verification=True):
         baseline = finding.get("resolution_baseline")
         if baseline is None:
             finding["resolution_baseline"] = dict(trusted=False, source_ids=[], claim_hashes={},
-                                                   transport_attempt_ids=[])
-        elif (not isinstance(baseline, dict) or set(baseline) != {
-                "trusted", "source_ids", "claim_hashes", "transport_attempt_ids"}
+                                                   claim_dependencies={}, transport_attempt_ids=[])
+        elif (not isinstance(baseline, dict)
+                or set(baseline) not in (legacy_baseline_fields, extended_baseline_fields)
                 or type(baseline.get("trusted")) is not bool
                 or not isinstance(baseline.get("source_ids"), list)
                 or any(not isinstance(value, str) or not value for value in baseline["source_ids"])
                 or len(set(baseline["source_ids"])) != len(baseline["source_ids"])
                 or not isinstance(baseline.get("claim_hashes"), dict)
-                or set(baseline["claim_hashes"]) - known_claims.keys()
+                or set(baseline["claim_hashes"]) - known_claims
                 or any(not isinstance(value, str) or len(value) != 64
                        or any(ch not in "0123456789abcdef" for ch in value)
                        for value in baseline["claim_hashes"].values())
-                or not isinstance(baseline.get("transport_attempt_ids"), list)):
+                or not isinstance(baseline.get("transport_attempt_ids"), list)
+                or not _valid_claim_dependency_snapshot(baseline, known_claims)):
             raise ValueError("invalid deferred resolution baseline")
         else:
             try:
@@ -454,6 +530,9 @@ def load_checkpoint(path, *, continue_verification=True):
                     raise ValueError("invalid transport attempts")
             except (TypeError, ValueError, AttributeError):
                 raise ValueError("invalid deferred resolution baseline") from None
+        if "resolution_progress" in finding:
+            _validate_saved_resolution_progress(
+                finding, finding["resolution_progress"], r, known_claims)
     from .semantic_contracts import validate_revision_history
     validate_revision_history(run.claims, r.history)
     previous_state = r._state()
@@ -472,7 +551,9 @@ def load_checkpoint(path, *, continue_verification=True):
         progress = None
     if progress is not None and continue_verification:
         from .semantic_contracts import normalize_dependency_review
-        if (not isinstance(progress, dict) or progress.get("format") != "v4-global-progress/1"
+        progress_format = progress.get("format") if isinstance(progress, dict) else None
+        if (not isinstance(progress, dict) or progress_format not in {
+                "v4-global-progress/1", "v4-global-progress/2"}
                 or progress.get("verification_epoch") != r._verification_epoch
                 or progress.get("input_hash") != r._hash() or progress.get("history_hash") != digest(r.history)
                 or type(progress.get("coverage_round")) is not int or progress["coverage_round"] < 1):
@@ -482,10 +563,13 @@ def load_checkpoint(path, *, continue_verification=True):
             raise ValueError("invalid global progress model")
         audit = normalize_dependency_review(run.claims, review.get("response"), allow_partial=True)
         r._validate_global_findings(review["response"]["findings"])
-        if (progress.get("missing_dependency_claim_ids") != audit["missing_dependency_claim_ids"]
-                or progress.get("reviewed_dependency_claim_ids") != audit["reviewed_dependency_claim_ids"]
-                or not audit["missing_dependency_claim_ids"]):
-            raise ValueError("invalid global progress coverage")
+        if progress_format == "v4-global-progress/1":
+            if (progress.get("missing_dependency_claim_ids") != audit["missing_dependency_claim_ids"]
+                    or progress.get("reviewed_dependency_claim_ids") != audit["reviewed_dependency_claim_ids"]
+                    or not audit["missing_dependency_claim_ids"]):
+                raise ValueError("invalid global progress coverage")
+        else:
+            _validate_global_resolution_progress(progress, r, audit)
         # Diagnostic only. Reconstruct accepted rows by replaying exact request
         # archives through collectors, never trust serialized review receipts.
         r.global_review_progress = progress
@@ -515,7 +599,7 @@ def load_checkpoint(path, *, continue_verification=True):
                 raise ValueError("invalid fields")
             ids = id_list(pending["ids"], "pending repair IDs")
             findings = pending["findings"]
-            if (not ids or set(ids) - known_claims.keys()
+            if (not ids or set(ids) - known_claims
                     or pending["input_hash"] != r._hash()
                     or not isinstance(findings, list) or not findings):
                 raise ValueError("stale state or empty repairs")

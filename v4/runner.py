@@ -220,10 +220,13 @@ class PipelineRunnerV4:
         source_ids = sorted({key for bucket in ("facts", "calcs", "evidence", "events")
                              for key in state.get(bucket, {})})
         claim_hashes = {claim["claim_id"]: digest(claim) for claim in self.run.claims}
+        claim_dependencies = {claim["claim_id"]: list(claim["dependencies"])
+                              for claim in self.run.claims}
         attempts = (self.journal.received_attempts(self.run_id)
                     if self.journal is not None and callable(getattr(self.journal, "received_attempts", None))
                     else [])
         return dict(trusted=True, source_ids=source_ids, claim_hashes=claim_hashes,
+                    claim_dependencies=claim_dependencies,
                     transport_attempt_ids=sorted(row["attempt_id"] for row in attempts))
 
     def _transport_recovery_candidates(self, findings, *, received_attempts=None, task_hashes=None):
@@ -317,6 +320,12 @@ class PipelineRunnerV4:
             row = dict(finding_id=finding.get("finding_id"), resolution_route=route)
             if route == "evidence_needed":
                 row["new_source_ids"] = sorted(source_ids - set(baseline.get("source_ids", [])))
+                progress = finding.get("resolution_progress")
+                if self._resolution_progress_is_current(finding, progress):
+                    row["claim_revision_progress"] = dict(
+                        reviewer=progress["reviewer"],
+                        target_reviews=deepcopy(progress["target_reviews"]),
+                        missing_target_ids=deepcopy(progress["missing_target_ids"]))
             elif route == "role_redeliberation":
                 old_hashes = baseline.get("claim_hashes", {})
                 row["changed_claim_ids"] = sorted(cid for cid, current_hash in claim_hashes.items()
@@ -1178,9 +1187,15 @@ class PipelineRunnerV4:
                     or self.pending_global["history_hash"] != digest(self.history)):
                 raise ValueError("stale partial global review; accepted rows cannot be reused")
             status = self._global_coverage_status()
-            if not status["needs_retry"]:
+            if self.pending_global.get("resolution_completion"):
+                return self._prepare_global_resolution_completion(
+                    state=state)
+            if status["missing_dependency_claim_ids"]:
+                if not status["needs_retry"]:
+                    return status
+                target_ids = status["missing_dependency_claim_ids"][:self.global_dependency_batch_size]
+            else:
                 return status
-            target_ids = status["missing_dependency_claim_ids"][:self.global_dependency_batch_size]
             self.pending_global["target_claim_ids"] = target_ids
             self.status = "global_dependency_completion"
             global_state = self._global_review_state(state=state, snapshot=snapshot)
@@ -1252,8 +1267,15 @@ class PipelineRunnerV4:
             '回傳 JSON object，findings 為問題陣列（無問題 []）。每項含 issue/evidence/suggested_fix/claim_ids/materiality；'
             'materiality 為 material 或 clarity_only。clarity_only 另含 materiality_reason；material 須含 resolution_route，'
             '若 route 不是 claim_patch，另含 resolution_reason；evidence_needed 必須附 evidence_request，欄位為 proposition、refs、entity、metric、period、unit、basis、scope、known_data_range。'
-            '另回傳 resolved_external_findings 陣列，無則 []；格式為 {finding_id,evidence,reason,claim_ids,resolution_refs}。'
-            'evidence_needed 只能引用新加入 canonical state 的來源 ID，並列出實際引用它的 claim_ids；'
+            '另回傳 resolved_external_findings 陣列，無則 []。evidence_needed 若原 finding 有明確 target，claim_ids 必須恰好涵蓋全部 target；'
+            '若原 finding unresolved 且沒有 target，new_evidence 可依結構化引用選出實際受影響 Claim，並須逐條具備新來源引用與 fresh review；'
+            'claim_revised 只能用原 finding 已明確列出的 target，沒有 target 時不可用此模式。'
+            '若 resolution_mode=new_evidence，格式為 {finding_id,resolution_mode,evidence,reason,claim_ids,resolution_refs}；'
+            '只能引用新加入 canonical state 且被每個 target Claim 實際引用的來源 ID。'
+            '若 resolution_mode=claim_revised，格式為 {finding_id,resolution_mode,evidence,reason,claim_ids,resolution_refs:[],target_reviews}；'
+            'claim_ids 必須涵蓋全部原 target；target_reviews 對每個 target 回 {claim_id,status:resolved|unresolved,reason}。'
+            'claim_revised 只在原缺證據命題已因目標 Claim 或其已宣告因果前提的修訂而實際縮小／撤回時才可 resolved；'
+            '僅改 claim_type、刪 refs、加免責句或修改無關文字都不算。每條 finding 都要逐 target 判定，不能以部分證明解除整筆。'
             'role_redeliberation 只能引用 role_redeliberation_records 中 finding 之後新收到的原角色回覆 attempt_id，'
             '並列出該回覆與目前 canonical Claim 完全一致的 claim_ids；只有手動改字或 Claim patch 不算重新裁決。'
             'transport_recovery 只能引用 transport_recovery_records 中 finding 之後新收到、且對應相關 Claim 的 attempt_id。'
@@ -1270,6 +1292,107 @@ class PipelineRunnerV4:
                  report_hash=rendered["sidecar"]["report_hash"], canonical_state_hash=state_hash,
                  history=history, deferred_global_findings=self._prompt_deferred_findings(),
                  history_hash=digest(self.history)), compact=True))
+
+    def _prepare_global_resolution_completion(self, *, state):
+        completion = self.pending_global["resolution_completion"]
+        missing_by_finding = completion.get("missing_target_ids", {})
+        round_number = completion.get("round")
+        if (type(round_number) is not int or round_number < 1
+                or not isinstance(missing_by_finding, dict) or not missing_by_finding):
+            raise ValueError("invalid global resolution completion state")
+        if round_number >= self.max_contract_attempts:
+            self.status = "blocked:global_resolution_coverage"
+            return deepcopy(self.global_review_progress or dict(
+                blocked=True, status=self.status, needs_resolution_completion=True,
+                needs_retry=False, missing_target_ids=deepcopy(missing_by_finding),
+                completion_round=round_number, max_contract_attempts=self.max_contract_attempts))
+        normalized_missing = {}
+        for finding_id, raw_ids in missing_by_finding.items():
+            if not isinstance(finding_id, str) or not finding_id.strip():
+                raise ValueError("global resolution completion has an invalid finding ID")
+            target_ids_for_finding = id_list(raw_ids, "missing target IDs")
+            if not target_ids_for_finding:
+                raise ValueError("global resolution completion has no missing target rows")
+            normalized_missing[finding_id] = target_ids_for_finding
+        target_ids = list(dict.fromkeys(cid for ids in normalized_missing.values() for cid in ids))
+        if not target_ids:
+            raise ValueError("global resolution completion has no missing target rows")
+        claims = claim_index(self.run.claims)
+        dependencies = {cid: claim.get("dependencies", []) for cid, claim in claims.items()}
+        scope_ids = set(target_ids)
+        for cid in target_ids:
+            scope_ids.update(self._dependency_closure(cid, dependencies))
+        scope_ids &= claims.keys()
+        scoped_claims = [deepcopy(claims[cid]) for cid in claims if cid in scope_ids]
+        refs = {ref for claim in scoped_claims
+                for ref in claim.get("refs", []) + claim.get("fact_refs", [])}
+        refs.update(binding.get("ref_id") for claim in scoped_claims
+                    for binding in claim.get("bindings", []) if binding.get("ref_id"))
+        scoped_state = {key: deepcopy(state[key]) for key in ("as_of", "trade") if key in state}
+        scoped_state["claims"] = scoped_claims
+        for plural, key in (("facts", "facts"), ("calcs", "calcs"),
+                            ("evidence", "evidence"), ("events", "events")):
+            scoped_state[key] = {ref: deepcopy(value) for ref, value in state.get(plural, {}).items()
+                                 if ref in refs}
+        lineage = state.get("source_lineage", {})
+        if isinstance(lineage, dict):
+            scoped_state["source_lineage"] = {ref: deepcopy(value) for ref, value in lineage.items()
+                                               if ref in refs}
+        scoped_state["calculation_definitions"] = calculation_definitions(scoped_state["calcs"])
+        scoped_state["indicator_definitions"] = indicator_definitions(scoped_state["facts"])
+        claim_ids = set(scope_ids)
+        relevant_history = []
+        for entry in self.history:
+            changes = [deepcopy(change) for change in entry.get("claim_changes", [])
+                       if change.get("claim_id") in claim_ids]
+            if changes:
+                relevant_history.append(dict(claim_changes=changes))
+
+        prior_rows = {row.get("finding_id"): row for row in
+                      self.pending_global["review"]["response"].get("resolved_external_findings", [])
+                      if isinstance(row, dict)}
+        deferred = {row.get("finding_id"): row for row in self.deferred_global_findings
+                    if isinstance(row, dict)}
+        resolution_items = []
+        for finding_id, missing_ids in normalized_missing.items():
+            finding = deferred.get(finding_id)
+            if finding is None:
+                raise ValueError("global resolution completion references an unknown deferred finding")
+            expected_targets = self._finding_claim_ids(finding)
+            if set(missing_ids) - set(expected_targets):
+                raise ValueError("global resolution completion has invalid missing target IDs")
+            proof = prior_rows.get(finding_id, {})
+            if proof.get("resolution_mode") != "claim_revised" or proof.get("claim_ids") != expected_targets:
+                raise ValueError("global resolution completion has no matching saved Claim revision proof")
+            resolution_items.append(dict(
+                finding_id=finding_id,
+                original_finding={key: deepcopy(finding[key]) for key in
+                                  ("issue", "evidence", "resolution_reason", "evidence_request", "claim_ids", "claim_id")
+                                  if key in finding},
+                target_claim_ids=self._finding_claim_ids(finding),
+                missing_target_ids=deepcopy(missing_ids),
+                accepted_target_reviews=deepcopy(proof.get("target_reviews", []))))
+
+        self.pending_global["target_claim_ids"] = target_ids
+        self.status = "global_resolution_completion"
+        return ("global_dependency_completion", json_prompt(
+            SINGLE_REVIEW_INSTRUCTIONS + FINANCIAL_REVIEW_CONTRACT + EVIDENCE_REQUEST_INSTRUCTIONS +
+            "前一個完整全局掃描已完成；這是同一全局工作未回覆齊全的 target proof 補列，不是新掃描。"
+            "只審查 resolution_completion.missing_target_ids；勿重答、改寫或遺失 accepted_target_reviews。"
+            "對每個缺漏 target 判斷原 evidence_needed 命題是否已被相關 Claim／其已宣告因果前提的修訂實際縮小或撤回。"
+            "只要原問題仍存在，就回 status=unresolved；不得以修改標籤、刪 refs、免責句或無關改字當成解決。"
+            "即使目標 Claim 本身未改，只要其已宣告因果前提有相關修訂，也要依目前證據重新判斷。"
+            "程式會自行核對歷史、依賴、輸入版本和新收據；不要產生或猜測雜湊。"
+            "回傳 JSON object：findings=[]、dependency_reviews=[]、resolved_external_findings 陣列。"
+            "每個回覆格式為 {finding_id,resolution_mode:'claim_revised',claim_ids:[該 finding 全部原始 target IDs],"
+            "target_reviews:[{claim_id,status:'resolved'|'unresolved',reason}] }。"
+            "target_reviews 本次只列指定的 missing_target_ids；不得省略其中任何一個，也不得重回已接受列。",
+            dict(review_scope="external_resolution_completion", target_claim_ids=target_ids,
+                 resolution_completion=resolution_items, state=scoped_state,
+                 history=relevant_history,
+                 verification_epoch=self._verification_epoch,
+                 canonical_state_hash=self._hash(), history_hash=digest(self.history),
+                 coverage_round=self.pending_global["coverage_round"] + 1), compact=True))
 
     def _global_review_state(self, *, state=None, snapshot=None):
         # Keep each canonical source passage once: global factual corrections
@@ -1329,7 +1452,87 @@ class PipelineRunnerV4:
             if not ids and finding.get("unresolved") is not True:
                 raise ValueError("global finding needs explicit IDs or unresolved=true")
 
-    def _validate_external_resolutions(self, rows, prior_deferred):
+    def _resolution_progress_is_current(self, finding, progress, *, model_identity=None):
+        if not isinstance(progress, dict):
+            return False
+        try:
+            targets = self._finding_claim_ids(finding)
+        except (ValueError, TypeError, KeyError):
+            return False
+        return (progress.get("format") == "v4-claim-resolution-progress/1"
+                and progress.get("finding_id") == finding.get("finding_id")
+                and progress.get("input_hash") == self._hash()
+                and progress.get("history_hash") == digest(self.history)
+                and progress.get("verification_epoch") == self._verification_epoch
+                and progress.get("target_claim_ids") == targets
+                and isinstance(progress.get("reviewer"), str)
+                and (model_identity is None or progress.get("reviewer") == model_identity))
+
+    def _fresh_claim_reviews(self, claim_ids, task_hashes):
+        for claim_id in claim_ids:
+            task_hash = task_hashes.get(claim_id)
+            atomic = self.receipts.get(claim_id)
+            if (task_hash is None or not isinstance(atomic, dict)
+                    or atomic.get("input_hash") != task_hash
+                    or not isinstance(atomic.get("result"), dict)):
+                return False
+            try:
+                require_model_identity(atomic.get("model"))
+            except ValueError:
+                return False
+            if atomic["result"].get("verdict") != "PASS":
+                deep = self.deep_receipts.get(claim_id)
+                if (not isinstance(deep, dict) or deep.get("input_hash") != task_hash
+                        or not isinstance(deep.get("result"), dict)):
+                    return False
+                try:
+                    require_model_identity(deep.get("model"))
+                except ValueError:
+                    return False
+        return True
+
+    @staticmethod
+    def _dependency_closure(claim_id, dependencies):
+        seen, pending = set(), list(dependencies.get(claim_id, []))
+        while pending:
+            parent = pending.pop()
+            if parent in seen or parent == claim_id:
+                continue
+            seen.add(parent)
+            pending.extend(dependencies.get(parent, []))
+        return seen
+
+    @staticmethod
+    def _causal_change_context(baseline, current_dependencies, current_hashes, changed_history):
+        if not isinstance(baseline, dict):
+            return None
+        before_hashes = baseline.get("claim_hashes")
+        before_dependencies = baseline.get("claim_dependencies")
+        if not isinstance(before_hashes, dict) or not isinstance(before_dependencies, dict):
+            return None
+        if set(before_dependencies) != set(before_hashes):
+            return None
+        combined_dependencies = {
+            cid: list(dict.fromkeys(before_dependencies.get(cid, []) + current_dependencies.get(cid, [])))
+            for cid in current_dependencies
+        }
+        return dict(before_hashes=before_hashes, current_hashes=current_hashes,
+                    changed_history=changed_history, dependencies=combined_dependencies)
+
+    @staticmethod
+    def _changed_causal_premises(claim_id, context):
+        if not isinstance(context, dict):
+            return set()
+        before_hashes = context["before_hashes"]
+        current_hashes = context["current_hashes"]
+        changed_history = context["changed_history"]
+        related = {claim_id} | PipelineRunnerV4._dependency_closure(claim_id, context["dependencies"])
+        return {cid for cid in related
+                if cid in changed_history and before_hashes.get(cid) != current_hashes.get(cid)}
+
+    def _validate_external_resolutions(self, rows, prior_deferred, *, model_identity):
+        from .evidence_requests import RESOLUTION_MODES, normalize_target_reviews
+
         if rows is None:
             rows = []
         if not isinstance(rows, list):
@@ -1337,13 +1540,29 @@ class PipelineRunnerV4:
         eligible = {finding["finding_id"]: finding for finding in prior_deferred
                     if finding.get("resolution_route", "claim_patch") != "claim_patch"
                     and isinstance(finding.get("finding_id"), str)}
-        seen, normalized = set(), []
-        rejected = []
+        seen, normalized, rejected, progress_by_id = set(), [], [], {}
         index = claim_index(self.run.claims)
         state = self._state()
         sources = {key for bucket in ("facts", "calcs", "evidence", "events")
                    for key in state.get(bucket, {})}
-        task_hashes = {task.claim_id: digest(task.to_dict()) for task in build_atomic_tasks(self.run)}
+        tasks = {task.claim_id: task for task in build_atomic_tasks(self.run)}
+        task_hashes = {cid: digest(task.to_dict()) for cid, task in tasks.items()}
+        evidence_findings = {finding_id: finding for finding_id, finding in eligible.items()
+                             if finding.get("resolution_route") == "evidence_needed"}
+        causal_contexts = {}
+        if evidence_findings:
+            current_dependencies = {cid: list(claim.get("dependencies", [])) for cid, claim in index.items()}
+            current_hashes = {cid: digest(claim) for cid, claim in index.items()}
+            changed_history = {change.get("claim_id")
+                               for entry in self.history
+                               for change in entry.get("claim_changes", [])
+                               if isinstance(change, dict)}
+            causal_contexts = {
+                finding_id: self._causal_change_context(
+                    finding.get("resolution_baseline", {}), current_dependencies,
+                    current_hashes, changed_history)
+                for finding_id, finding in evidence_findings.items()
+            }
         for row in rows:
             if not isinstance(row, dict):
                 rejected.append(dict(finding_id="", reason="resolution row is not an object"))
@@ -1353,10 +1572,11 @@ class PipelineRunnerV4:
                 rejected.append(dict(finding_id=finding_id if isinstance(finding_id, str) else "",
                                      reason="unknown or duplicate finding ID"))
                 continue
+            seen.add(finding_id)
             try:
                 require_text(row.get("evidence"), "resolved_external_findings.evidence")
                 require_text(row.get("reason"), "resolved_external_findings.reason")
-                resolution_refs = id_list(row.get("resolution_refs"), "resolution_refs")
+                resolution_refs = id_list(row.get("resolution_refs", []), "resolution_refs")
                 claim_ids = id_list(row.get("claim_ids"), "resolution claim_ids")
             except ValueError:
                 rejected.append(dict(finding_id=finding_id, reason="missing or malformed typed resolution references"))
@@ -1369,15 +1589,102 @@ class PipelineRunnerV4:
                 continue
             valid = False
             if route == "evidence_needed":
-                prior_claim_ids = set(self._finding_claim_ids(finding))
+                expected_target_ids = self._finding_claim_ids(finding)
+                prior_claim_ids = set(expected_target_ids)
                 target_ids = set(claim_ids)
-                new_refs = set(resolution_refs) - set(baseline.get("source_ids", []))
-                bound_refs = {ref for cid in target_ids if cid in index
-                              for ref in index[cid].get("refs", []) + index[cid].get("fact_refs", [])}
-                valid = (bool(new_refs) and set(resolution_refs) <= new_refs and target_ids <= index.keys()
-                         and (not prior_claim_ids or bool(target_ids & prior_claim_ids))
-                         and (not prior_claim_ids or target_ids <= prior_claim_ids)
-                         and set(resolution_refs) <= sources and set(resolution_refs) <= bound_refs)
+                mode = row.get("resolution_mode", "new_evidence")
+                if mode not in RESOLUTION_MODES:
+                    rejected.append(dict(finding_id=finding_id, reason="unknown evidence resolution_mode"))
+                    continue
+                if ((prior_claim_ids and target_ids != prior_claim_ids)
+                        or (not prior_claim_ids and (not target_ids or target_ids - index.keys()))
+                        or (not prior_claim_ids and mode == "claim_revised")
+                        or not self._fresh_claim_reviews(target_ids, task_hashes)):
+                    rejected.append(dict(finding_id=finding_id,
+                                         reason="resolution must cover every finding target with fresh reviews"))
+                    continue
+                if mode == "new_evidence":
+                    new_refs = set(resolution_refs) - set(baseline.get("source_ids", []))
+                    refs_by_target = {cid: set(index[cid].get("refs", []) + index[cid].get("fact_refs", []))
+                                      for cid in prior_claim_ids if cid in index}
+                    valid = (bool(new_refs) and set(resolution_refs) <= new_refs
+                             and set(resolution_refs) <= sources
+                             and all(set(resolution_refs) & refs_by_target[cid]
+                                     for cid in prior_claim_ids))
+                    if valid:
+                        normalized.append(dict(finding_id=finding_id, evidence=row["evidence"],
+                                               reason=row["reason"], claim_ids=claim_ids,
+                                               resolution_refs=resolution_refs,
+                                               resolution_mode="new_evidence"))
+                    else:
+                        rejected.append(dict(finding_id=finding_id,
+                                             reason="new evidence must be canonical, newly added, and bound to every target"))
+                    continue
+
+                if resolution_refs:
+                    rejected.append(dict(finding_id=finding_id,
+                                         reason="claim_revised resolution cannot use source refs as proof"))
+                    continue
+                if not prior_claim_ids:
+                    rejected.append(dict(finding_id=finding_id,
+                                         reason="claim_revised resolution requires explicit original finding targets"))
+                    continue
+                claim_ids = expected_target_ids
+                try:
+                    incoming = normalize_target_reviews(row.get("target_reviews", []), claim_ids)
+                except (ValueError, TypeError, KeyError) as exc:
+                    rejected.append(dict(finding_id=finding_id, reason=f"invalid target review coverage: {exc}"))
+                    continue
+                prior_progress = finding.get("resolution_progress")
+                accepted = {}
+                if self._resolution_progress_is_current(
+                        finding, prior_progress, model_identity=model_identity):
+                    accepted = {item["claim_id"]: deepcopy(item)
+                                for item in prior_progress["target_reviews"]}
+                duplicate_conflict = False
+                for item in incoming["reviews"]:
+                    previous = accepted.get(item["claim_id"])
+                    if previous is not None and previous != item:
+                        duplicate_conflict = True
+                        break
+                    accepted[item["claim_id"]] = item
+                if duplicate_conflict:
+                    rejected.append(dict(finding_id=finding_id,
+                                         reason="target review conflicts with a previously accepted proof"))
+                    continue
+
+                target_reviews = []
+                for cid in claim_ids:
+                    item = accepted.get(cid)
+                    if item is None:
+                        continue
+                    if item["status"] == "resolved":
+                        changed = self._changed_causal_premises(cid, causal_contexts.get(finding_id))
+                        if not changed:
+                            item = dict(claim_id=cid, status="unresolved",
+                                        reason="No relevant Claim or declared causal premise changed since the finding baseline.")
+                            rejected.append(dict(finding_id=finding_id, claim_id=cid,
+                                                 reason="claim_revised proof has no relevant recorded change"))
+                        elif not self._fresh_claim_reviews([cid], task_hashes):
+                            item = dict(claim_id=cid, status="unresolved",
+                                        reason="Fresh atomic and required deep review receipts are missing for this target.")
+                            rejected.append(dict(finding_id=finding_id, claim_id=cid,
+                                                 reason="claim_revised proof lacks fresh semantic receipts"))
+                    target_reviews.append(item)
+                reviewed_ids = {item["claim_id"] for item in target_reviews}
+                missing = [cid for cid in claim_ids if cid not in reviewed_ids]
+                progress_by_id[finding_id] = dict(
+                    format="v4-claim-resolution-progress/1", finding_id=finding_id,
+                    input_hash=self._hash(), history_hash=digest(self.history),
+                    verification_epoch=self._verification_epoch, reviewer=model_identity,
+                    target_claim_ids=claim_ids, target_reviews=target_reviews,
+                    missing_target_ids=missing)
+                if (not missing and len(target_reviews) == len(claim_ids)
+                        and all(item["status"] == "resolved" for item in target_reviews)):
+                    normalized.append(dict(finding_id=finding_id, evidence=row["evidence"],
+                                           reason=row["reason"], claim_ids=claim_ids,
+                                           resolution_refs=[], resolution_mode="claim_revised",
+                                           target_reviews=target_reviews))
             elif route == "role_redeliberation":
                 prior_ids = set(self._finding_claim_ids(finding))
                 candidates = {row["attempt_id"]: set(row["claim_ids"])
@@ -1409,10 +1716,55 @@ class PipelineRunnerV4:
             if not valid:
                 rejected.append(dict(finding_id=finding_id, reason="typed proof does not match the resolution route"))
                 continue
-            seen.add(finding_id)
             normalized.append(dict(finding_id=finding_id, evidence=row["evidence"], reason=row["reason"],
                                    claim_ids=claim_ids, resolution_refs=resolution_refs))
-        return normalized, rejected
+        return normalized, rejected, progress_by_id
+
+    @staticmethod
+    def _merge_external_resolution_rows(original_rows, completion_rows):
+        if not isinstance(original_rows, list) or not isinstance(completion_rows, list):
+            raise ValueError("resolved_external_findings must be an array")
+        merged = deepcopy(original_rows)
+        positions = {}
+        for index, row in enumerate(merged):
+            if not isinstance(row, dict) or not isinstance(row.get("finding_id"), str):
+                raise ValueError("saved external resolution row is malformed")
+            if row["finding_id"] in positions:
+                raise ValueError("saved external resolution finding_id is duplicated")
+            positions[row["finding_id"]] = index
+        for addition in completion_rows:
+            if not isinstance(addition, dict) or not isinstance(addition.get("finding_id"), str):
+                raise ValueError("external resolution completion row is malformed")
+            position = positions.get(addition["finding_id"])
+            if position is None:
+                merged.append(deepcopy(addition))
+                positions[addition["finding_id"]] = len(merged) - 1
+                continue
+            prior = merged[position]
+            if (prior.get("resolution_mode") != "claim_revised"
+                    or addition.get("resolution_mode") != "claim_revised"
+                    or prior.get("claim_ids") != addition.get("claim_ids")
+                    or prior.get("resolution_refs", []) != addition.get("resolution_refs", [])):
+                raise ValueError("external resolution completion changed the saved proof contract")
+            old_reviews = prior.get("target_reviews", [])
+            new_reviews = addition.get("target_reviews", [])
+            if not isinstance(old_reviews, list) or not isinstance(new_reviews, list):
+                raise ValueError("target_reviews must be arrays")
+            seen = {row.get("claim_id"): row for row in old_reviews if isinstance(row, dict)}
+            if len(seen) != len(old_reviews):
+                raise ValueError("saved target review IDs are duplicated or malformed")
+            for review in new_reviews:
+                if not isinstance(review, dict) or not isinstance(review.get("claim_id"), str):
+                    raise ValueError("target review completion row is malformed")
+                previous = seen.get(review["claim_id"])
+                if previous is not None:
+                    if previous != review:
+                        raise ValueError("target review completion conflicts with a saved proof")
+                    continue
+                old_reviews.append(deepcopy(review))
+                seen[review["claim_id"]] = review
+            prior["target_reviews"] = old_reviews
+        return merged
 
     def collect_phase6_global_sweep(self, findings, *, model_identity=None):
         require_model_identity(model_identity)
@@ -1425,20 +1777,56 @@ class PipelineRunnerV4:
         returned_ids = {row.get("claim_id") for row in findings.get("dependency_reviews", []) if isinstance(row, dict)} if isinstance(findings, dict) else set()
         completed_batches = self.pending_global.get("completed_batches", 0) + int(set(requested) <= returned_ids)
         prior_deferred = deepcopy(self.deferred_global_findings)
+        resolution_completion = self.pending_global.get("resolution_completion") if prior else None
         if prior:
             if prior["model"] != model_identity:
                 raise ValueError("dependency completion model differs from saved global reviewer")
-            missing = self._global_coverage_status()["missing_dependency_claim_ids"]
-            normalize_dependency_review(self.run.claims, findings, allow_partial=True, expected_claim_ids=missing)
-            findings = dict(findings=deepcopy(prior["response"]["findings"] + findings["findings"]),
-                            dependency_reviews=deepcopy(prior["response"]["dependency_reviews"] + findings["dependency_reviews"]),
-                            resolved_external_findings=deepcopy(
-                                prior["response"].get("resolved_external_findings", [])
-                                + findings.get("resolved_external_findings", [])))
+            if resolution_completion:
+                if (not isinstance(findings, dict)
+                        or findings.get("findings", [])
+                        or findings.get("dependency_reviews", [])):
+                    raise ValueError("resolution completion must not repeat global findings or dependency reviews")
+                missing_by_finding = resolution_completion.get("missing_target_ids", {})
+                original_rows = {row.get("finding_id"): row for row in
+                                 prior["response"].get("resolved_external_findings", [])
+                                 if isinstance(row, dict)}
+                completion_rows = findings.get("resolved_external_findings", [])
+                if not isinstance(completion_rows, list):
+                    raise ValueError("resolved_external_findings must be an array")
+                completion_ids = [row.get("finding_id") for row in completion_rows
+                                  if isinstance(row, dict)]
+                if (len(completion_ids) != len(completion_rows)
+                        or len(set(completion_ids)) != len(completion_ids)
+                        or set(completion_ids) - set(missing_by_finding)):
+                    raise ValueError("resolution completion returned an unknown or duplicate finding")
+                from .evidence_requests import normalize_target_reviews
+                for row in completion_rows:
+                    finding_id = row["finding_id"]
+                    original = original_rows.get(finding_id)
+                    if (original is None or row.get("resolution_mode") != "claim_revised"
+                            or row.get("claim_ids") != original.get("claim_ids")
+                            or row.get("resolution_refs", []) not in (None, [])):
+                        raise ValueError("resolution completion changed the saved proof contract")
+                    missing_ids = id_list(missing_by_finding[finding_id], "missing target IDs")
+                    normalize_target_reviews(row.get("target_reviews", []), missing_ids)
+                merged_resolutions = self._merge_external_resolution_rows(
+                    prior["response"].get("resolved_external_findings", []),
+                    findings.get("resolved_external_findings", []))
+                findings = dict(findings=deepcopy(prior["response"]["findings"]),
+                                dependency_reviews=deepcopy(prior["response"]["dependency_reviews"]),
+                                resolved_external_findings=merged_resolutions)
+            else:
+                missing = self._global_coverage_status()["missing_dependency_claim_ids"]
+                normalize_dependency_review(self.run.claims, findings, allow_partial=True, expected_claim_ids=missing)
+                findings = dict(findings=deepcopy(prior["response"]["findings"] + findings["findings"]),
+                                dependency_reviews=deepcopy(prior["response"]["dependency_reviews"] + findings["dependency_reviews"]),
+                                resolved_external_findings=deepcopy(
+                                    prior["response"].get("resolved_external_findings", [])
+                                    + findings.get("resolved_external_findings", [])))
         audit = normalize_dependency_review(self.run.claims, findings, allow_partial=True)
         self._validate_global_findings(findings["findings"])
-        resolved_external, rejected_external = self._validate_external_resolutions(
-            findings.get("resolved_external_findings", []), prior_deferred)
+        resolved_external, rejected_external, resolution_progress = self._validate_external_resolutions(
+            findings.get("resolved_external_findings", []), prior_deferred, model_identity=model_identity)
         active_ids = {f.get("finding_id") for f in findings["findings"] if isinstance(f, dict)}
         conflicts = active_ids.intersection(row["finding_id"] for row in resolved_external)
         if conflicts:
@@ -1453,6 +1841,30 @@ class PipelineRunnerV4:
             result = self._global_coverage_status()
             self.global_review_progress = dict(format="v4-global-progress/1", verification_epoch=self._verification_epoch,
                                               **{**deepcopy(self.pending_global), **deepcopy(result)})
+            self._persist()
+            return result
+        missing_target_ids = {finding_id: deepcopy(progress["missing_target_ids"])
+                              for finding_id, progress in resolution_progress.items()
+                              if progress["missing_target_ids"]}
+        if missing_target_ids:
+            attempts = (resolution_completion or {}).get("round", 0)
+            completion = dict(missing_target_ids=missing_target_ids, round=attempts + 1)
+            self.pending_global.update(review=dict(model=model_identity, response=deepcopy(findings)),
+                                       coverage_round=coverage_round,
+                                       completed_batches=completed_batches,
+                                       resolution_completion=completion)
+            retry = completion["round"] < self.max_contract_attempts
+            result = dict(blocked=True, status="blocked:global_resolution_coverage",
+                          needs_resolution_completion=True, needs_retry=retry,
+                          missing_target_ids=missing_target_ids,
+                          accepted_target_reviews={fid: deepcopy(progress["target_reviews"])
+                              for fid, progress in resolution_progress.items()},
+                          completion_round=completion["round"],
+                          max_contract_attempts=self.max_contract_attempts)
+            self.status = result["status"]
+            self.global_review_progress = dict(format="v4-global-progress/2",
+                verification_epoch=self._verification_epoch,
+                **{**deepcopy(self.pending_global), **deepcopy(result)})
             self._persist()
             return result
         content_findings = deepcopy(findings["findings"])
@@ -1473,9 +1885,16 @@ class PipelineRunnerV4:
                 route = finding.get("resolution_route", "claim_patch")
                 if prior_route == route:
                     finding["resolution_baseline"] = deepcopy(prior_by_id[finding["finding_id"]].get(
-                        "resolution_baseline", dict(trusted=False, source_ids=[], claim_hashes={}, transport_attempt_ids=[])))
+                        "resolution_baseline", dict(trusted=False, source_ids=[], claim_hashes={},
+                                                     claim_dependencies={}, transport_attempt_ids=[])))
+                    prior_progress = prior_by_id[finding["finding_id"]].get("resolution_progress")
+                    if self._resolution_progress_is_current(finding, prior_progress,
+                                                            model_identity=model_identity):
+                        finding["resolution_progress"] = deepcopy(prior_progress)
                 else:
                     finding["resolution_baseline"] = self._resolution_baseline()
+                if finding["finding_id"] in resolution_progress:
+                    finding["resolution_progress"] = deepcopy(resolution_progress[finding["finding_id"]])
         # External actions cannot be inferred from unrelated state changes.
         # Require the global reviewer to identify each resolved deferred route
         # and provide its current evidence; otherwise keep it blocking.
@@ -1486,6 +1905,8 @@ class PipelineRunnerV4:
                     or finding.get("finding_id") in returned_prior_ids
                     or finding.get("finding_id") in resolved_external_ids):
                 continue
+            if finding.get("finding_id") in resolution_progress:
+                finding["resolution_progress"] = deepcopy(resolution_progress[finding["finding_id"]])
             unchanged_external.append(finding)
         content_findings.extend(unchanged_external)
         clarity_notes = [f for f in content_findings if f.get("materiality", "material") == "clarity_only"]
@@ -1721,7 +2142,8 @@ class PipelineRunnerV4:
                             raise ValueError("dependency completion model differs from saved global reviewer")
                         global_findings = self._complete(global_reviewer, role, prompt)
                         result = self.collect_phase6_global_sweep(global_findings, model_identity=global_reviewer.identity)
-                        if not result.get("needs_dependency_completion"):
+                        if not (result.get("needs_dependency_completion")
+                                or result.get("needs_resolution_completion")):
                             break
                         if not result["needs_retry"]:
                             return result

@@ -14,6 +14,8 @@ _REQUEST_FIELDS = frozenset({
 })
 _DIMENSION_FIELDS = ("entity", "metric", "period", "unit", "basis", "scope")
 _SEARCH_OUTCOMES = frozenset({"found", "not_found", "unavailable"})
+RESOLUTION_MODES = frozenset({"new_evidence", "claim_revised"})
+_TARGET_REVIEW_STATUSES = frozenset({"resolved", "unresolved"})
 _RECORD_FIELDS = frozenset({
     "request_id", "finding_id", "claim_ids", "claim_hashes", "issue", "evidence_request",
     "search_results", "submitted_source_ids", "resolution_status",
@@ -94,6 +96,33 @@ def _normalize_evidence_request(request):
 def normalize_evidence_request(request):
     """Public typed normalization used by review-result contracts."""
     return _normalize_evidence_request(request)
+
+
+def normalize_target_reviews(rows, expected_claim_ids):
+    """Validate target-scoped global judgments without interpreting their prose."""
+    expected = [_identifier(cid, "target claim_id") for cid in expected_claim_ids]
+    if not expected or len(set(expected)) != len(expected):
+        raise ValueError("target claim IDs must be nonempty and unique")
+    if not isinstance(rows, list):
+        raise ValueError("target_reviews must be an array")
+    by_id = {}
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"claim_id", "status", "reason"}:
+            raise ValueError("target review must contain only claim_id, status, and reason")
+        claim_id = _identifier(row.get("claim_id"), "target review claim_id")
+        if claim_id not in expected:
+            raise ValueError("target review references a Claim outside the finding")
+        if claim_id in by_id:
+            raise ValueError("duplicate target review claim_id")
+        status = row.get("status")
+        if status not in _TARGET_REVIEW_STATUSES:
+            raise ValueError("target review status must be resolved or unresolved")
+        reason = row.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("target review reason is required")
+        by_id[claim_id] = dict(claim_id=claim_id, status=status, reason=reason)
+    reviews = [by_id[cid] for cid in expected if cid in by_id]
+    return dict(reviews=reviews, missing_claim_ids=[cid for cid in expected if cid not in by_id])
 
 
 def _request_id(finding_id):

@@ -188,7 +188,9 @@ class NativeReviewWorkflow(NativeWorkflow):
                     report_hash=pending["report_hash"],
                     verification_epoch=runner._verification_epoch,
                     coverage_round=pending["coverage_round"],
-                    target_claim_ids=deepcopy(pending["target_claim_ids"]))
+                    target_claim_ids=deepcopy(pending["target_claim_ids"]),
+                    resolution_completion_hash=(digest(pending["resolution_completion"])
+                                                if pending.get("resolution_completion") else None))
 
     def _matches_global(self, runner, packet, prepared):
         role = next(iter(packet["items"]))
@@ -221,6 +223,50 @@ class NativeReviewWorkflow(NativeWorkflow):
         deterministic_blocked = False
         if needs_global_replay:
             _, deterministic_blocked = runner.orch.validate_stage(runner.run_id, 'final')
+        restored_final_global = None
+        current_report_hash = None
+        if (not pending_patch and not deterministic_blocked
+                and not runner.deferred_global_findings):
+            has_open_global = any(packet.get("kind") == "global" and not packet.get("retired")
+                                  and packet.get("input_hash") == current_hash
+                                  for packet in state.get("packets", {}).values())
+            if not has_open_global:
+                for packet in reversed(list(state.get("packets", {}).values())):
+                    stored = state.get("global_outcomes", {}).get(packet.get("packet_id"))
+                    snapshot = state.get("global_receipt_snapshots", {}).get(packet.get("packet_id"))
+                    if (packet.get("kind") != "global" or packet.get("input_hash") != current_hash
+                            or not isinstance(stored, dict) or stored.get("status") != "verified"
+                            or not isinstance(snapshot, dict) or snapshot.get("input_hash") != current_hash
+                            or snapshot.get("findings") != []
+                            or not snapshot.get("resolved_external_findings")):
+                        continue
+                    from .reporting import render_report
+                    from .runner import require_model_identity
+                    if current_report_hash is None:
+                        current_report_hash = render_report(
+                            runner.orch.snapshot(runner.run_id))["sidecar"]["report_hash"]
+                    if (snapshot.get("report_hash") != current_report_hash
+                            or snapshot.get("history_hash") != digest(runner.history)):
+                        continue
+                    require_model_identity(snapshot.get("model"))
+                    for candidate in state.get("packets", {}).values():
+                        outcome = state.get("global_outcomes", {}).get(candidate.get("packet_id"))
+                        if (candidate.get("kind") != "global" or candidate.get("input_hash") != current_hash
+                                or not isinstance(outcome, dict)
+                                or outcome.get("status") == "blocked:global_contract"):
+                            continue
+                        candidate_role = next(iter(candidate["items"]))
+                        candidate_row = candidate.get("received", {}).get(candidate_role)
+                        if candidate_row is None or journal.response_provenance(
+                                runner, SimpleNamespace(identity=candidate_row["executor"]), candidate_role,
+                                candidate["items"][candidate_role]["prompt"], candidate_row["response"]) is None:
+                            raise ValueError("global packet has no verified raw response archive")
+                    runner.global_receipt = deepcopy(snapshot)
+                    runner.pending_global = None
+                    runner.global_review_progress = None
+                    runner.status = "verified"
+                    restored_final_global = packet["packet_id"]
+                    break
         for packet in state.get("packets", {}).values():
             if packet.get("kind") != "global":
                 continue
@@ -245,6 +291,8 @@ class NativeReviewWorkflow(NativeWorkflow):
                 continue
             if deterministic_blocked:
                 continue  # old receipts remain audit evidence, never bypass a current invariant
+            if restored_final_global is not None:
+                continue
             snapshot = state.get("global_receipt_snapshots", {}).get(packet["packet_id"])
             if (stored.get("status") == "revision" and isinstance(snapshot, dict)
                     and snapshot.get("input_hash") == current_hash):
@@ -686,13 +734,10 @@ class NativeReviewWorkflow(NativeWorkflow):
         packet["retired"] = True
         if state.get("active_packet_id") == packet["packet_id"]:
             state["active_packet_id"] = None
-        if result.get("status") == "revision" and runner.global_receipt is not None:
-            # Standard checkpoints do not serialize global receipts. A sweep
-            # ending in findings must restore its exact finding-bearing
-            # receipt later; the collector itself is not replay-idempotent
-            # once findings were deferred into canonical state.
-            state.setdefault("global_receipt_snapshots", {})[packet["packet_id"]] = \
-                deepcopy(runner.global_receipt)
+        if result.get("status") in {"revision", "verified"} and runner.global_receipt is not None:
+            if result.get("status") == "revision" or runner.global_receipt.get("resolved_external_findings"):
+                state.setdefault("global_receipt_snapshots", {})[packet["packet_id"]] = \
+                    deepcopy(runner.global_receipt)
         state.setdefault("global_outcomes", {})[packet["packet_id"]] = deepcopy(result)
         return result
 
