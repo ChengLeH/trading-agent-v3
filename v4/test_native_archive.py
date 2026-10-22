@@ -61,6 +61,21 @@ class NativeArchiveTests(unittest.TestCase):
                 self.assertEqual(actual, expected)
             self.assertLess(queue.state_path.stat().st_size, 3000)
 
+    def test_legacy_inline_state_upgrades_and_previous_reader_rejects_archive_format(self):
+        from .agent_queue import STATE_FORMAT, LEGACY_STATE_FORMAT
+        self.assertNotEqual(STATE_FORMAT, LEGACY_STATE_FORMAT)
+        with tempfile.TemporaryDirectory() as directory:
+            queue, _, expected = self.seed(directory)
+            legacy = deepcopy(expected)
+            legacy['format'] = LEGACY_STATE_FORMAT
+            queue.state_path.write_text(json.dumps(legacy))
+            with queue.transaction() as hydrated:
+                self.assertEqual(hydrated['format'], STATE_FORMAT)
+            disk = self.disk(queue)
+            self.assertEqual(disk['format'], STATE_FORMAT)
+            self.assertIn('_native_archive', disk)
+            self.assertNotEqual(disk['format'], LEGACY_STATE_FORMAT)
+
     def test_mutating_or_unretiring_hydrated_packet_keeps_exact_content(self):
         with tempfile.TemporaryDirectory() as directory:
             queue, packet_id, expected = self.seed(directory)

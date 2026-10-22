@@ -14,7 +14,8 @@ from uuid import uuid4
 from .storage import write_json
 from .native_archive import NativeArchive
 
-STATE_FORMAT = "v4-native-work/1"
+STATE_FORMAT = "v4-native-work/2"
+LEGACY_STATE_FORMAT = "v4-native-work/1"
 
 
 def _require_identity(value, label):
@@ -36,10 +37,13 @@ class NativeWorkQueue:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
-            if not isinstance(state, dict) or state.get("format") != STATE_FORMAT:
+            if not isinstance(state, dict) or state.get("format") not in (STATE_FORMAT, LEGACY_STATE_FORMAT):
                 raise ValueError("unsupported native work queue state")
             archive = NativeArchive(self.directory)
             state = archive.hydrate(state)
+            # Upgrade inline /1 states during the successful transaction only.
+            # Old binaries reject /2 before interpreting any cold payload marker.
+            state["format"] = STATE_FORMAT
             yield state
             write_json(self.state_path, archive.compact(state))
         finally:

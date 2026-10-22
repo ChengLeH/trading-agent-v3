@@ -74,6 +74,24 @@ class ContextCompaction(unittest.TestCase):
         self.assertEqual(set(scoped['source_lineage']), {'source'})
         self.assertEqual(state, before)
 
+    def test_binding_ref_only_reaches_fact_and_evidence_lineage(self):
+        from .review_context import scoped_review_state
+        state = dict(claims=[dict(claim_id='a', dependencies=[], refs=[], fact_refs=[],
+            bindings=[dict(ref_id='binding.fact'), dict(ref_id='binding.evidence')])],
+            facts={'binding.fact': dict(value=2, source_id='report-source'),
+                   'unrelated.fact': dict(value=3)},
+            calcs={}, events={},
+            evidence={'binding.evidence': dict(text='source', source_id='evidence-origin'),
+                      'unrelated.evidence': dict(text='noise')},
+            source_lineage={'report-source': dict(publisher='Issuer'),
+                            'evidence-origin': dict(publisher='Original'),
+                            'unrelated.origin': dict(publisher='Third')},
+            trade={'direction': 'WAIT'})
+        result = scoped_review_state(state, ['a'])
+        self.assertEqual(set(result['facts']), {'binding.fact'})
+        self.assertEqual(set(result['evidence']), {'binding.evidence'})
+        self.assertEqual(set(result['source_lineage']), {'report-source', 'evidence-origin'})
+
     def test_history_compacts_deltas_and_preserves_pending_rechecks(self):
         from .review_context import compact_review_history
         before = dict(claim_id='a', text='old', refs=['source'], bindings=[{'value': 'X' * 5000}])

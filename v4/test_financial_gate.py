@@ -28,6 +28,16 @@ class FinancialGate(unittest.TestCase):
             self.assertEqual(row['reason'], 'required_report_not_received')
             self.assertEqual(row['coverage']['requirement'], self.requirement())
 
+    def test_unknown_requirement_warns_without_blocking(self):
+        runner = seeded()
+        req = self.requirement()
+        req['published_or_filing_time'] = ''
+        runner.run.manifest['financial_coverage_requirements'] = [req]
+        findings, blocked = runner.orch.validate_stage(runner.run_id, 'final')
+        row = next(f for f in findings if f['check_id'] == 'financial_coverage_requirement')
+        self.assertEqual(row['status'], 'WARN')
+        self.assertFalse(blocked)
+
     def test_fresh_manifest_preserves_evidence_only_report_declaration(self):
         with tempfile.TemporaryDirectory() as root:
             source = Path(root) / 'release.txt'

@@ -12,8 +12,8 @@ TRADE_EVIDENCE_CONTRACT = 'trade-evidence/1'
 TRADE_EVIDENCE_INSTRUCTIONS = '''
 新交易方案填 evidence_contract="trade-evidence/1"，並提供：
 target_basis={use:trade_target|valuation_context|unknown,source_refs:[],bridge_refs:[]}；
-source_horizon={start:ISO日期或null,end:ISO日期} 或 null（未知），trade_valid_until=ISO日期或null；
-execution_assumption={order_type:已知委託方式或unknown,assumed_fill_price:數字或null,fill_guaranteed:false}。
+source_horizon={start:ISO日期或null,end:ISO日期} 或 null（未知），trade_valid_until=ISO日期或null；若用 trade_target，來源期限 end 與交易期限均不得為 null；
+execution_assumption={order_type:已知委託方式或unknown,assumed_fill_price:數字或null,fill_guaranteed:false}。BUY/SHORT 不可將 target_basis 或 execution_assumption 整個填 null；宣稱 planned_stop_loss 時須填成交價且不得優於停損觸發價。
 source_refs/bridge_refs 只能用已提供的來源或上游 Claim ID，並列入交易 Claim 的 refs/dependencies。
 source_horizon 是預測本身的期限，不是文章發布日。長期目標僅作 valuation_context 時，不可因此把它設為短期 target；
 若其作 trade_target 且晚於交易期限，必須提供 bridge_refs，由既有語義驗證核對短期可達性的證據；存在引用不代表理由成立。
@@ -59,6 +59,11 @@ def validate_trade_evidence(trade, known_refs):
         for key in ('target_basis', 'source_horizon', 'trade_valid_until', 'execution_assumption'):
             if key not in trade:
                 raise ValueError(f'trade.{key} required; explicit unknown is allowed')
+        # An active declared contract cannot be satisfied by null dictionaries:
+        # such a plan contains no target basis or executable stop assumptions.
+        for key in ('target_basis', 'execution_assumption'):
+            if trade[key] is None:
+                raise ValueError(f'trade.{key} must be declared for an active trade')
 
     def references(row, key, *, required=False):
         refs = id_list(row.get(key, []), f'trade.{key}')
@@ -82,6 +87,8 @@ def validate_trade_evidence(trade, known_refs):
     if basis is not None:
         if not isinstance(basis, dict) or basis.get('use') not in {'trade_target', 'valuation_context', 'unknown'}:
             raise ValueError('trade.target_basis requires an explicit use')
+        if contract and basis['use'] == 'trade_target' and (end is None or valid_until is None):
+            raise ValueError('trade.source_horizon.end and trade_valid_until required for trade_target')
         references(basis, 'bridge_refs', required=bool(
             basis['use'] == 'trade_target' and end and valid_until and end > valid_until))
         references(basis, 'source_refs')
@@ -92,6 +99,15 @@ def validate_trade_evidence(trade, known_refs):
         fill = execution.get('assumed_fill_price')
         if fill is not None and number(fill) <= 0:
             raise ValueError('trade.execution_assumption.assumed_fill_price must be positive')
+        if trade.get('planned_stop_loss') is not None:
+            if fill is None:
+                raise ValueError('trade.planned_stop_loss requires explicit assumed_fill_price')
+            # A proposed stop-loss estimate may not assume execution more
+            # favorable than the plan's own trigger price.
+            stop = number(trade['stop'])
+            if (trade['direction'] == 'BUY' and number(fill) > stop
+                    or trade['direction'] == 'SHORT' and number(fill) < stop):
+                raise ValueError('trade.execution_assumption.assumed_fill_price must be on the adverse side of trade.stop')
         references(execution, 'guarantee_refs', required=execution['fill_guaranteed'])
     else:
         fill = None

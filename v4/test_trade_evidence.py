@@ -34,6 +34,59 @@ class TradeEvidence(unittest.TestCase):
         self.assertEqual(r.run.trade, trade)
         self.assertIn('trader.plan', {c['claim_id'] for c in r.run.claims})
         self.assertFalse(r.receipts)  # Accepting a premise is not semantic verification.
+        # Shadow patch must keep candidate claims when rechecking trade refs.
+        before = deepcopy(r.run.trade)
+        original = next(c for c in r.run.claims if c['claim_id'] == 'a')
+        changed = r.orch.patch(r.run_id,
+            [dict(claim_id='a', text=original['text'] + ' (revised)')], ['a'])
+        self.assertIn('a', changed)
+        self.assertEqual(r.run.trade, before)
+        self.assertIn('trader.bridge', {c['claim_id'] for c in r.run.claims})
+
+    def test_planned_stop_loss_cannot_assume_favorable_fill(self):
+        for direction, stop, favorable, adverse in (
+            ('BUY', 50, 100, 50), ('SHORT', 150, 100, 150)):
+            with self.subTest(direction=direction):
+                trade = plan()
+                trade.update(direction=direction, stop=stop, target=80 if direction == 'SHORT' else 120,
+                    source_horizon=None,
+                    target_basis=dict(use='unknown', source_refs=[], bridge_refs=[]))
+                if direction == 'SHORT':
+                    trade['gap_stress_loss']['scenario_return_pct'] = 30
+                trade['execution_assumption']['assumed_fill_price'] = favorable
+                trade['planned_stop_loss']['value'] = 0
+                with self.assertRaisesRegex(ValueError, 'adverse side'):
+                    seeded().orch.register_trade('fixture', trade)
+                trade['execution_assumption']['assumed_fill_price'] = adverse
+                trade['planned_stop_loss']['value'] = 5
+                seeded().orch.register_trade('fixture', trade)
+                trade['planned_stop_loss']['value'] = 0
+                with self.assertRaisesRegex(ValueError, 'planned_stop_loss'):
+                    seeded().orch.register_trade('fixture', trade)
+
+    def test_short_stress_direction_requires_correct_loss(self):
+        trade = plan()
+        trade.update(direction='SHORT', stop=110, target=80, source_horizon=None,
+            target_basis=dict(use='unknown', source_refs=[], bridge_refs=[]))
+        trade['execution_assumption']['assumed_fill_price'] = 110
+        trade['gap_stress_loss']['scenario_return_pct'] = 30
+        seeded().orch.register_trade('fixture', trade)
+        trade['gap_stress_loss']['value'] = 0
+        with self.assertRaisesRegex(ValueError, 'gap_stress_loss'):
+            seeded().orch.register_trade('fixture', trade)
+
+    def test_declared_contract_rejects_null_premises_and_unknown_target_horizon(self):
+        for missing in ('target_basis', 'execution_assumption'):
+            t = plan(); t[missing] = None
+            with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, missing):
+                seeded().orch.register_trade('fixture', t)
+        t = plan(); t['source_horizon'] = None
+        t['target_basis']['bridge_refs'] = []
+        with self.assertRaisesRegex(ValueError, 'source_horizon'):
+            seeded().orch.register_trade('fixture', t)
+        t = plan(); t['trade_valid_until'] = None
+        with self.assertRaisesRegex(ValueError, 'trade_valid_until'):
+            seeded().orch.register_trade('fixture', t)
 
     def test_declared_loss_rounding_is_supported_without_global_tolerance(self):
         trade = plan(); trade.update(entry=91.69, stop=84, source_horizon=None)

@@ -795,7 +795,8 @@ class OrchestratorV4(Orchestrator):
         self.runs["__patch_candidate__"] = shadow
         try:
             if trade_claims:
-                self.register_trade("__patch_candidate__", trade_claims[0]["assertion"]["trade"])
+                self.register_trade("__patch_candidate__", trade_claims[0]["assertion"]["trade"],
+                    candidate_claims=candidate)
             grouped = {}
             for c in candidate:
                 grouped.setdefault(c["author_role"], []).append(c)

@@ -457,7 +457,7 @@ permission 判斷不再搜尋整個 step JSON，結構化 error_code 優先。�
 
 ### 財報覆蓋、交易期限與執行假設
 
-`financial-evidence/6` 沿用原有角色／atomic／deep／global 審查，不增加模型輪次。
+`financial-evidence/7` 沿用原有角色／atomic／deep／global 審查，不增加模型輪次。
 升級後舊版收據會失效，必須依新契約重驗；不要在無法接受重驗成本時中途更新進行中的 run。
 
 來源可在 manifest 的 source row 宣告 `financial_report_coverage` 陣列，欄位為
@@ -473,11 +473,14 @@ manifest 可另設 `financial_coverage_requirements`，例如：
 
 已知且在分析截止前公布的必需資料若未收到、或要求結構化卻沒有相符 Fact，會列明缺口並阻擋。
 沒有明示要求時只提供覆蓋診斷，不假定每家公司都須有美國 10-Q、不從當前年份推測最新財報。
+若目前僅有年度結構化資訊，且有發布日期更新、卻沒有期間 metadata 的新聞證據，預設發出 WARN：最新期中覆蓋尚未確認；不推造某季財報、更不自動 FAIL。
 `received` 不代表數字已抽取；`structured` 只代表同主體、期間、發布版本至少有一項 Fact，
 不認證全份報表或每個指標都齊全。quarter／YTD／TTM 不互相代替。歷史分析仍可用舊年度資料。
 
 新生成的 BUY／SHORT 方案須填 `evidence_contract="trade-evidence/1"`，並明示
-`target_basis`、`source_horizon`、`trade_valid_until`、`execution_assumption`；未知可寫 null／unknown。
+`target_basis`、`source_horizon`、`trade_valid_until`、`execution_assumption`。活躍交易的 `target_basis`、`execution_assumption` 不可整個為 null；
+若 `target_basis.use=trade_target`，`source_horizon.end` 與 `trade_valid_until` 必須有明確日期，不能靠 null 豁免橋接。
+其他未經證明的期限或維度保留 null／unknown，並由既有語義審查處理。
 具體格式及語義責任在共用金融契約內。長期來源若直接作短期交易目標，須列 `bridge_refs`；
 程式只查日期、引用存在及交易 Claim 有宣告這些引用，理由是否成立仍由既有 LLM 驗證。
 舊 checkpoint 可載入；缺少這些欄位的 legacy 計畫會標示未知，不能當成已證明期限相容或可保證成交。

@@ -82,6 +82,7 @@ def financial_coverage_diagnostics(run):
     as_of = manifest.get('as_of')
     cutoff = _timestamp(as_of, as_of=True)
     entries, findings = [], []
+    untyped_evidence = []
 
     def add(row, source_id, origin, ref_id=None, entity=None):
         if not isinstance(row, dict):
@@ -94,6 +95,11 @@ def financial_coverage_diagnostics(run):
         subject, period, category = _dimensions(values)
         # Unrelated news and market-price observations are not report inventory.
         if category == 'unknown' and not (values.get('period_coverage') or values.get('fiscal_period')):
+            # Never pretend prose proves a report period, but do not silently
+            # certify annual-only coverage when later untyped news exists.
+            if origin == 'evidence':
+                untyped_evidence.append(dict(ref_id=ref_id, source_id=source_id,
+                    published_or_filing_time=values.get('published_or_filing_time', '')))
             return
         published = values.get('published_or_filing_time', '')
         stamp = _timestamp(published)
@@ -223,6 +229,23 @@ def financial_coverage_diagnostics(run):
             status, reason = 'PASS', 'required_report_covered'
         requirements.append(dict(index=i, requirement=deepcopy(raw), status=status,
             reason=reason, received=received, structured=structured, fact_refs=fact_refs))
+    # A typed annual inventory does not establish that no subsequent interim
+    # announcement appeared in untyped news. One WARN, no inferred quarter or
+    # synthetic requirement: this is a review obligation, not a filing claim.
+    typed_latest = [x for x in latest if x['category'] in
+        {'annual', 'quarter', 'year_to_date', 'ttm'}]
+    if typed_latest and {x['category'] for x in typed_latest} == {'annual'}:
+        newest_annual = max((_timestamp(x['published_or_filing_time'])
+                             for x in typed_latest), default=None)
+        newer_untyped = [row['ref_id'] for row in untyped_evidence
+            if newest_annual is not None and cutoff is not None
+            and (stamp := _timestamp(row['published_or_filing_time'])) is not None
+            and newest_annual < stamp <= cutoff]
+        if newer_untyped:
+            findings.append(dict(status='WARN', check_id='financial_coverage_untyped_newer_evidence',
+                evidence_refs=sorted(set(newer_untyped)),
+                reason='Newer untyped evidence is not a report inventory: latest interim '
+                       'coverage remains unverified; no period or filing is inferred'))
     inventory = {}
     for entry in entries:
         identity = tuple(entry[key] for key in ('entity', 'period', 'category',

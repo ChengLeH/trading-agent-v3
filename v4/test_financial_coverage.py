@@ -54,6 +54,24 @@ class FinancialCoverage(unittest.TestCase):
         self.assertTrue(all(f['status'] == 'WARN' for f in d['findings']))
         self.assertTrue(any(r['section'] == 'financial_coverage' for r in ingestion_diagnostics(run)))
 
+    def test_newer_untyped_news_warns_without_inventing_quarter_or_blocking(self):
+        run = run_with(facts=[report('FY2030', 'annual', '2031-02-01')],
+                       evidence=[dict(published_or_filing_time='2031-08-09')])
+        d = self.diagnostic(run)
+        self.assertEqual([x['category'] for x in d['latest']], ['annual'])
+        row = next(x for x in d['findings']
+                   if x['check_id'] == 'financial_coverage_untyped_newer_evidence')
+        self.assertEqual(row['status'], 'WARN')
+        self.assertEqual(row['evidence_refs'], ['ev.0'])
+        self.assertFalse(d['requirements'])
+        self.assertFalse(any(x['status'] == 'FAIL' for x in d['findings']))
+        # A typed interim inventory removes this specific uncertainty warning.
+        known = run_with(facts=[report('FY2030', 'annual', '2031-02-01'),
+                                report('FY2031-Q2', 'single_period', '2031-08-05')],
+                         evidence=[dict(published_or_filing_time='2031-08-09')])
+        self.assertFalse(any(x['check_id'] == 'financial_coverage_untyped_newer_evidence'
+                             for x in self.diagnostic(known)['findings']))
+
     def test_publication_asof_not_period_label_controls_eligibility(self):
         d = self.diagnostic(run_with(declarations=[report(published='2031-08-11'),
             report('FY2031-Q1', published='2031-05-06')]))
