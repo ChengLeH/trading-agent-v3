@@ -21,7 +21,8 @@ from .semantic_contracts import (REFERENCE_INSTRUCTIONS, review_ref_ids, normali
                                  EVIDENCE_REQUEST_INSTRUCTIONS)
 from .cloud import request_completion, structured_prompt
 from .agy_session import AntigravityError
-from .review_context import SINGLE_REVIEW_INSTRUCTIONS, calculation_definitions, indicator_definitions
+from .review_context import (SINGLE_REVIEW_INSTRUCTIONS, calculation_definitions, indicator_definitions,
+                             compact_review_history, dependency_claim_catalog, scoped_review_state)
 
 PHASE_2_ROLES = ("market_analyst", "fundamentals_analyst", "news_analyst", "social_analyst")
 PHASE_3_ROLES = ("bull", "bear")
@@ -509,6 +510,9 @@ class PipelineRunnerV4:
     def collect_trader(self, claims, text="", trade=None):
         if trade is None:
             raise ValueError("trader must supply a structured trade, including WAIT")
+        from .trade_evidence import TRADE_EVIDENCE_CONTRACT
+        if trade.get('direction') in {'BUY', 'SHORT'} and trade.get('evidence_contract') != TRADE_EVIDENCE_CONTRACT:
+            raise ValueError('new active trade requires evidence_contract=trade-evidence/1 and explicit horizon/execution fields; unknown values may be null')
         # Finance registration and claims commit as one transaction.
         original = deepcopy(self.run)
         try:
@@ -517,7 +521,7 @@ class PipelineRunnerV4:
             plans = [c for c in claims if c.get("assertion", {}).get("kind") == "trade_plan"]
             if len(plans) != 1 or plans[0]["assertion"].get("trade") != trade:
                 raise ValueError("trader must bind exactly one canonical trade_plan Claim to trade")
-            self.orch.register_trade(self.run_id, deepcopy(trade))
+            self.orch.register_trade(self.run_id, deepcopy(trade), candidate_claims=claims)
             self._collect_roles({"trader": claims}, ("trader",))
         except Exception:
             self.orch.runs[self.run_id] = original
@@ -1168,13 +1172,7 @@ class PipelineRunnerV4:
             self.deferred_global_findings = [f for f in self.deferred_global_findings
                 if f.get("resolution_route", "claim_patch") != "claim_patch" or f not in retired]
         rendered = render_report(snapshot)
-        history = [{"claim_changes": [dict(claim_id=change["claim_id"],
-                    before={k: v for k, v in change["before"].items() if v != change["after"].get(k)},
-                    after={k: v for k, v in change["after"].items() if v != change["before"].get(k)})
-                    for change in row.get("claim_changes", [])]} for row in self.history]
-        for item, row in zip(history, self.history):
-            if row.get("invalidated_global_findings"):
-                item["findings_to_recheck"] = row["invalidated_global_findings"]
+        history = compact_review_history(self.history)
         recheck_instruction = (
             'history.findings_to_recheck 是舊判定待重驗，不代表問題已解決；逐項重驗，仍成立就列入 findings。'
             if any("findings_to_recheck" in row for row in history) else '')
@@ -1198,7 +1196,7 @@ class PipelineRunnerV4:
                 return status
             self.pending_global["target_claim_ids"] = target_ids
             self.status = "global_dependency_completion"
-            global_state = self._global_review_state(state=state, snapshot=snapshot)
+            global_state = scoped_review_state(state, target_ids)
             received_attempts = self._received_attempts()
             task_hashes = {cid: digest(task.to_dict()) for cid, task in tasks.items()}
             transport_records = self._transport_recovery_candidates(
@@ -1213,14 +1211,17 @@ class PipelineRunnerV4:
                 '保留既有 findings，不重做全文掃描、不重回已審列、不把漏審視為無依賴。'
                 'original_resolved_external_findings 會由系統與本次結果合併；本次 resolved_external_findings 只列新項，'
                 '不要重複舊項。若本次發現新的外部問題已由目前證據解決，才按 route 列 typed resolution_refs 與 claim_ids。'
-                '以完整 Claim DAG 與來源理解真正因果依賴，不以字詞猜連線。'
+                'state 提供指定 Claim 與其上游前提的完整來源；claim_catalog 保留全體 Claim 的文字、斷言與依賴，'
+                '須逐一考慮目錄中的未宣告前提，不能因不在 state.claims 就忽略；不足以確定時 unresolved=true。'
+                '以 Claim DAG、完整語義與來源理解真正因果依賴，不以字詞猜連線。'
                 '回傳 JSON object：findings（本次新發現的問題，無則 []）及 dependency_reviews。'
                 '對 target_claim_ids 每個恰回 {claim_id,required_dependencies:[精確ID],unresolved:boolean,reason:簡短語義理由}。'
                 '只列指定 ID，不回傳其他 Claim 的審查列；理由限於必要因果，勿複述整段原文。'
-                'required_dependencies 可指向 state.claims 的任何合法前提，不能指自己或後續結論。',
+                'required_dependencies 可指向 claim_catalog 的任何合法前提，不能指自己或後續結論。',
                 dict(review_scope="dependency_completion", target_claim_ids=target_ids,
                      coverage_round=self.pending_global["coverage_round"] + 1,
                      verification_epoch=self._verification_epoch, state=global_state,
+                     claim_catalog=dependency_claim_catalog(state["claims"]),
                      transport_recovery_records=transport_records,
                      external_resolution_candidates=external_candidates,
                      original_findings=self.pending_global["review"]["response"]["findings"],
@@ -1317,36 +1318,9 @@ class PipelineRunnerV4:
         target_ids = list(dict.fromkeys(cid for ids in normalized_missing.values() for cid in ids))
         if not target_ids:
             raise ValueError("global resolution completion has no missing target rows")
-        claims = claim_index(self.run.claims)
-        dependencies = {cid: claim.get("dependencies", []) for cid, claim in claims.items()}
-        scope_ids = set(target_ids)
-        for cid in target_ids:
-            scope_ids.update(self._dependency_closure(cid, dependencies))
-        scope_ids &= claims.keys()
-        scoped_claims = [deepcopy(claims[cid]) for cid in claims if cid in scope_ids]
-        refs = {ref for claim in scoped_claims
-                for ref in claim.get("refs", []) + claim.get("fact_refs", [])}
-        refs.update(binding.get("ref_id") for claim in scoped_claims
-                    for binding in claim.get("bindings", []) if binding.get("ref_id"))
-        scoped_state = {key: deepcopy(state[key]) for key in ("as_of", "trade") if key in state}
-        scoped_state["claims"] = scoped_claims
-        for plural, key in (("facts", "facts"), ("calcs", "calcs"),
-                            ("evidence", "evidence"), ("events", "events")):
-            scoped_state[key] = {ref: deepcopy(value) for ref, value in state.get(plural, {}).items()
-                                 if ref in refs}
-        lineage = state.get("source_lineage", {})
-        if isinstance(lineage, dict):
-            scoped_state["source_lineage"] = {ref: deepcopy(value) for ref, value in lineage.items()
-                                               if ref in refs}
-        scoped_state["calculation_definitions"] = calculation_definitions(scoped_state["calcs"])
-        scoped_state["indicator_definitions"] = indicator_definitions(scoped_state["facts"])
-        claim_ids = set(scope_ids)
-        relevant_history = []
-        for entry in self.history:
-            changes = [deepcopy(change) for change in entry.get("claim_changes", [])
-                       if change.get("claim_id") in claim_ids]
-            if changes:
-                relevant_history.append(dict(claim_changes=changes))
+        scoped_state = scoped_review_state(state, target_ids)
+        claim_ids = {claim["claim_id"] for claim in scoped_state["claims"]}
+        relevant_history = compact_review_history(self.history, claim_ids=claim_ids)
 
         prior_rows = {row.get("finding_id"): row for row in
                       self.pending_global["review"]["response"].get("resolved_external_findings", [])

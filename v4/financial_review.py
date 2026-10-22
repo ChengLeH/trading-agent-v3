@@ -1,7 +1,7 @@
 """Shared semantic obligations for existing LLM stages, not a new classifier."""
-FINANCIAL_REVIEW_VERSION = 'financial-evidence/5'
+FINANCIAL_REVIEW_VERSION = 'financial-evidence/6'
 FINANCIAL_REVIEW_CONTRACT = '''
-金融證據契約 financial-evidence/5：這些是語義核對責任，不是以字詞命中判錯。
+金融證據契約 financial-evidence/6：這些是語義核對責任，不是以字詞命中判錯。
 來源原始值、計算值與展示值須區分；assertion.value 保留 canonical 值。
 可另附 assertion.presentation={value,unit,decimal_places,rounding:half_up|half_even} 明示換單位與捨入。
 合理四捨五入或不同抓取時點造成的小差異，若來源、時間與精度足以解釋，不列重大錯誤；
@@ -25,13 +25,21 @@ GAAP P/E 算對不代表已證明便宜；淨利減營業利益不等於可直�
 相同事實、限制與情境假設在下游若被轉成確定結論，須列 material finding；只影響行文且不改意思的提醒列 clarity_only。
 來源沿革是明示的 provenance 註記，不是程式認證的來源獨立性。逐一核對來源正文及其明示的 origin_id、derived_from、publisher 與證據引用；同一原始文件的轉載不得當成多份獨立佐證。不同網址、發布者或平台也不自動代表獨立；相同事件不代表同一來源。缺少沿革註記時獨立性為未知，不能推定為獨立或因此否決一項由單一來源支持的事實。只有 Claim 實際依賴「獨立佐證」時，才判斷來源能否支持該語義；來源數量本身不構成證據充分性門檻。
 風控結論須區分來源明載事實、程式計算、情境假設、使用者明示政策、當下投資決策與普遍必然性主張，並檢查結論範圍是否超出已證明的前提。選擇 WAIT 或 0% 部位可以是特定時點與風險偏好下的合理決策，但不等於證明所有非零部位都不可控或不存在其他可行方案。ATR、波動度或壓力情境可支持風險大小、停損距離與情境敏感度的分析，單獨不足以證明任何非零部位都不可能符合風險限制。若結論是「依本策略不得持倉」，須有實際明示的風險政策、風險預算、交易限制或足以推出該結論的前提，並將結論限定在該政策與假設內。不得替使用者發明最大部位、風險預算、事件禁令或 ATR 門檻；沒有明示時保留為未知。壓力測試與跳空風險是條件情境，不是必然結果；不得假設風險為零。措辭差異或同一組事實下存在多個合理政策選擇，不構成 finding；只有結論超出證據或明示約束時，沿用既有 material finding／clarity_only 分流。
+預測期間與交易持有期間須分開核對：長期目標價不能直接充當短期交易目標、到期前報酬或同一期間的風險報酬比；跨期間使用須明示時間橋接、催化事件、估值與退出假設，無依據時只能作背景或情境。交易有效期限、預計持有期、來源預測期間未知時不得補猜，也不得僅因引用長期預測就否決明確限定為背景的歷史分析。
+停損觸發價不是保證成交價；停損單、限價停損單、成交假設、滑價、流動性、跳空、盤中或盤外條件須分開說明。依觸發價計算的部位風險或帳戶損失只在明示成交假設下成立，不能直接稱為實際最大損失、保本或硬上限。
+歷史樣本不是未來最大損失的硬上限；歷史跌幅乘部位權重只代表該情境下、該分母與槓桿假設的帳戶損失，不是尾端風險保證、使用者可接受的風險預算或已證明能遵守的政策。不得從情境數字反推使用者政策；缺少實際明示的政策時，將部位與損失限定為分析者假設。
+目前財務或交易結論須核對截至 as_of 已發布且與命題相關的年度與期中資料，分開 received（來源或證據已收到）與 structured（同期間、版本已有結構化數值）。新聞提到最新報表不代表財務 Fact 已涵蓋；年度資料不能自動替代最新期中報表，單季、累計 YTD、滾動 TTM 不能互換。依明示 publication、period、coverage 與來源引用判斷；不得從年份、抓取日、公司所在地或文句猜最新應有報表或強制套用某國表單。未知可用性須說未知，已知本次未提供須說本次未提供。financial_coverage 診斷僅描述明示 metadata；WARN 不等於自動否決或語義合格，仍須在既有審查中核對用途。歷史分析仍可使用舊報表，須限定期間與用途；明示 financial_coverage_requirements 才構成對應的收件及結構化門檻，不得自行發明強制最新報表政策。
 '''.strip()
+
+from .trade_evidence import TRADE_EVIDENCE_INSTRUCTIONS
+FINANCIAL_REVIEW_CONTRACT += '\n' + TRADE_EVIDENCE_INSTRUCTIONS
 
 
 def ingestion_diagnostics(run):
     """Typed adapter diagnostics, including explicit coverage gaps."""
     from copy import deepcopy
+    from .financial_coverage import financial_coverage_diagnostics
     return [deepcopy(rec.meta[key]) for rec in getattr(run, 'records', [])
             for key in ('cash_flow_extraction', 'financial_statement_extraction',
                         'financial_data_extraction', 'market_data_extraction')
-            if getattr(rec, 'meta', {}).get(key)]
+            if getattr(rec, 'meta', {}).get(key)] + financial_coverage_diagnostics(run)

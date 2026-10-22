@@ -110,7 +110,7 @@ class ReviewContext(unittest.TestCase):
         risk_claim_id = risk_claim["claim_id"]
         risk_task = next(task for task in build_atomic_tasks(runner.run) if task.claim_id == risk_claim_id)
 
-        self.assertEqual(FINANCIAL_REVIEW_VERSION, "financial-evidence/5")
+        self.assertEqual(FINANCIAL_REVIEW_VERSION, "financial-evidence/6")
         self.assertIn(FINANCIAL_REVIEW_CONTRACT, risk_prompt)
         self.assertIn(FINANCIAL_REVIEW_CONTRACT, atomic[risk_claim_id])
         self.assertEqual(risk_task.context["financial_review_contract"], FINANCIAL_REVIEW_VERSION)

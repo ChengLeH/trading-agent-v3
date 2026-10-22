@@ -454,3 +454,56 @@ Atomic 全 PASS 不代表整輪完成，不得將尚未完成的 Global 說成�
 
 CLI 診斷僅讀錯誤 envelope：stream interruption 支援明示代碼及有限的大小寫／空白／標點正規化；
 permission 判斷不再搜尋整個 step JSON，結構化 error_code 優先。未知錯誤仍保持未知，工具政策不放寬。
+
+### 財報覆蓋、交易期限與執行假設
+
+`financial-evidence/6` 沿用原有角色／atomic／deep／global 審查，不增加模型輪次。
+升級後舊版收據會失效，必須依新契約重驗；不要在無法接受重驗成本時中途更新進行中的 run。
+
+來源可在 manifest 的 source row 宣告 `financial_report_coverage` 陣列，欄位為
+`entity/period/period_coverage/published_or_filing_time`。這是操作者提供的來源 metadata，
+不是程式從新聞文字猜出的季別或發布日。
+manifest 可另設 `financial_coverage_requirements`，例如：
+
+```json
+[{"entity":"EXAMPLE","period":"FY2030-Q2","period_coverage":"single_period",
+  "published_or_filing_time":"2030-08-05","source_refs":["quarter.release"],
+  "require_structured":true,"purpose":"current_analysis"}]
+```
+
+已知且在分析截止前公布的必需資料若未收到、或要求結構化卻沒有相符 Fact，會列明缺口並阻擋。
+沒有明示要求時只提供覆蓋診斷，不假定每家公司都須有美國 10-Q、不從當前年份推測最新財報。
+`received` 不代表數字已抽取；`structured` 只代表同主體、期間、發布版本至少有一項 Fact，
+不認證全份報表或每個指標都齊全。quarter／YTD／TTM 不互相代替。歷史分析仍可用舊年度資料。
+
+新生成的 BUY／SHORT 方案須填 `evidence_contract="trade-evidence/1"`，並明示
+`target_basis`、`source_horizon`、`trade_valid_until`、`execution_assumption`；未知可寫 null／unknown。
+具體格式及語義責任在共用金融契約內。長期來源若直接作短期交易目標，須列 `bridge_refs`；
+程式只查日期、引用存在及交易 Claim 有宣告這些引用，理由是否成立仍由既有 LLM 驗證。
+舊 checkpoint 可載入；缺少這些欄位的 legacy 計畫會標示未知，不能當成已證明期限相容或可保證成交。
+
+`planned_stop_loss`、`gap_stress_loss` 與 `maximum_loss_bound` 分開保存。
+損失以 `portfolio_pct` 為單位；依明示成交假設／情境重算，若儲存捨入值可附 `output_rounding`。
+未知硬上限用 null；宣稱硬上限或保證成交必須有 proof／guarantee refs，存在引用本身仍不是保證證明。
+停損指令、歷史最大跳空與使用者風險預算不能混為一談。WAIT 不要求捏造交易欄位。
+
+### Native 狀態封存與補審 context
+
+成功 transaction 後，retired packet 的完整 items／received，以及 patch_outcomes，會按內容 SHA256
+保存到 work-dir 的 `native-archive/`；active state 保留索引。共同 prompt 前綴只存一份，
+讀取時逐字還原並核對封存及還原內容的 hash，不改工作包、候選回覆或收據的邏輯內容。
+既有 inline 狀態可直接讀取，首次成功寫入時才搬移；中斷不會先寫入指向尚未保存資料的索引。
+封存損壞或遺失會明確報錯，不會繞過原始審查 archive 的驗證。
+
+備份／搬移 run 時須複製**整個 work-dir**，包含 `native-archive/` 與原有 responses／sessions。
+外部程式讀取歷史包時應透過 `NativeWorkQueue.transaction()` 還原，不能假定磁碟 JSON 一律含全文。
+回退舊程式前，先停止使用者與 worker、備份整個目錄，使用新版 `NativeArchive.hydrate()`
+將磁碟狀態還原為 inline 後另存副本，再用舊程式開該副本；不可只回退程式而遺失封存目錄。
+
+全局初掃保留全文圖與證據；dependency completion 只攜帶 target／已宣告祖先的完整來源閉包，
+另保留所有 Claim 的語義 catalog，供發現未宣告的前提。calc inputs、event／來源沿革均遞迴保留。
+最後 Global 一致性掃描仍是交付條件，不以髒區抽樣取代。共同前綴封存降低儲存重複，
+不代表供應商已提供 prompt cache；每次模型請求仍自足。
+
+角色輸入既有路徑直接使用 canonical Fact／Calc／Evidence，不重新讀原始 OHLCV 來算相同摘要。
+原始來源繼續保存供稽核；外部社群搜尋的候選擷取不在這個 repo 的執行路徑內，未擅自刪除候選或改抓取器。

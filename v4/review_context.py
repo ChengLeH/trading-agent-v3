@@ -123,3 +123,80 @@ def indicator_definitions(facts):
                  kernel='v3.calculations.atr')}
     return {fid: deepcopy(methods[(fact.get('concept'), fact.get('source_pointer'))])
             for fid, fact in facts.items() if (fact.get('concept'), fact.get('source_pointer')) in methods}
+
+
+def compact_review_history(history, *, claim_ids=None):
+    """Retain ordered field deltas and pending judgments, never raw snapshots."""
+    result = []
+    for entry in history:
+        changes = []
+        for change in entry.get('claim_changes', []):
+            if claim_ids is not None and change['claim_id'] not in claim_ids:
+                continue
+            before, after = change['before'], change['after']
+            changes.append(dict(claim_id=change['claim_id'],
+                before={key: deepcopy(value) for key, value in before.items()
+                        if key not in after or value != after[key]},
+                after={key: deepcopy(value) for key, value in after.items()
+                       if key not in before or value != before[key]}))
+        findings = [deepcopy(finding) for finding in entry.get('invalidated_global_findings', [])
+                    if claim_ids is None or not finding.get('claim_ids')
+                    or set(finding['claim_ids']) & claim_ids]
+        if changes or findings:
+            item = dict(claim_changes=changes)
+            if findings:
+                item['findings_to_recheck'] = findings
+            result.append(item)
+    return result
+
+
+def dependency_claim_catalog(claims):
+    """Keep every possible premise visible without repeating source bindings."""
+    keys = ('claim_id', 'text', 'assertion', 'claim_type', 'author_role',
+            'subsection', 'purpose', 'dependencies')
+    return [{key: deepcopy(claim[key]) for key in keys if key in claim}
+            for claim in claims]
+
+
+def scoped_review_state(state, target_ids):
+    """Exact target/ancestor evidence closure; preserve canonical object order."""
+    claims = {claim['claim_id']: claim for claim in state['claims']}
+    scope, pending = set(), list(target_ids)
+    while pending:
+        cid = pending.pop()
+        if cid in scope or cid not in claims:
+            continue
+        scope.add(cid)
+        pending.extend(claims[cid].get('dependencies', []))
+        # Explicit Claim refs remain causal context even in an incomplete DAG.
+        pending.extend(ref for ref in claims[cid].get('refs', []) if ref in claims)
+    scoped_claims = [deepcopy(claim) for cid, claim in claims.items() if cid in scope]
+    refs = {ref for claim in scoped_claims
+            for ref in claim.get('refs', []) + claim.get('fact_refs', [])}
+    refs.update(binding['ref_id'] for claim in scoped_claims
+                for binding in claim.get('bindings', []) if binding.get('ref_id'))
+    pending = list(refs)
+    while pending:
+        ref = pending.pop()
+        parents = list(state.get('calcs', {}).get(ref, {}).get('input_refs', []))
+        event = state.get('events', {}).get(ref, {})
+        parents.extend(event[key] for key in ('source_ref', 'aggregate_ref') if event.get(key))
+        lineage = state.get('source_lineage', {}).get(ref, {})
+        parents.extend(lineage.get('derived_from', []))
+        parents.extend(lineage.get('evidence_refs', []))
+        for bucket in ('facts', 'evidence'):
+            owner = state.get(bucket, {}).get(ref, {}).get('source_id')
+            if owner:
+                parents.append(owner)
+        for parent in parents:
+            if parent not in refs:
+                refs.add(parent)
+                pending.append(parent)
+    result = {key: deepcopy(state[key]) for key in
+              ('as_of', 'trade', 'financial_review_contract', 'source_declarations') if key in state}
+    result['claims'] = scoped_claims
+    for key in ('facts', 'calcs', 'evidence', 'events', 'source_lineage'):
+        result[key] = {ref: deepcopy(value) for ref, value in state.get(key, {}).items() if ref in refs}
+    result['calculation_definitions'] = calculation_definitions(result['calcs'])
+    result['indicator_definitions'] = indicator_definitions(result['facts'])
+    return result

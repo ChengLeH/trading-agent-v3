@@ -12,6 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .storage import write_json
+from .native_archive import NativeArchive
 
 STATE_FORMAT = "v4-native-work/1"
 
@@ -37,8 +38,10 @@ class NativeWorkQueue:
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
             if not isinstance(state, dict) or state.get("format") != STATE_FORMAT:
                 raise ValueError("unsupported native work queue state")
+            archive = NativeArchive(self.directory)
+            state = archive.hydrate(state)
             yield state
-            write_json(self.state_path, state)
+            write_json(self.state_path, archive.compact(state))
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             lock.close()

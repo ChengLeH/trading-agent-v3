@@ -12,6 +12,7 @@ from .review_context import calculation_definitions, indicator_definitions
 from .source_lineage import normalize_source_lineage, validate_run_source_lineage
 from datetime import date
 from .financial_review import ingestion_diagnostics
+from .trade_evidence import validate_trade_evidence, trade_evidence_findings
 
 
 class ClaimSourceError(ValueError):
@@ -62,6 +63,11 @@ def validate_trade_claim(claims, trade):
         raise ValueError(f"trader requires exactly one canonical trade_plan Claim; trader_claim_ids={trader_ids}; trade_plan_claim_ids={plan_ids}")
     if plans and plans[0]["assertion"]["trade"] != trade:
         raise ValueError("canonical trade_plan Claim differs from derived trade state")
+    if plans:
+        from .trade_evidence import trade_evidence_refs
+        declared = set(plans[0]['refs']) | set(plans[0]['dependencies'])
+        if trade_evidence_refs(trade) - declared:
+            raise ValueError('trade evidence refs must be declared by canonical trade_plan Claim')
 
 
 def _known(value):
@@ -329,6 +335,16 @@ def freshness_findings(run):
 
 
 class OrchestratorV4(Orchestrator):
+    def ingest(self, run_id, registry=None):
+        records = super().ingest(run_id, registry)
+        declarations = {row['id']: row['financial_report_coverage']
+                        for row in self.runs[run_id].manifest.get('sources', [])
+                        if isinstance(row, dict) and 'id' in row and 'financial_report_coverage' in row}
+        for record in self.runs[run_id].records:
+            if not isinstance(record, SourceError) and record.id in declarations:
+                record.meta['financial_report_coverage'] = deepcopy(declarations[record.id])
+        return records
+
     def require_issuer_identity(self, run_id):
         from .issuer_identity import verify_issuer, IssuerIdentityError
         findings = verify_issuer(self.runs[run_id])
@@ -455,9 +471,11 @@ class OrchestratorV4(Orchestrator):
             self.runs[rid]._source_lineage_candidate = lineage
         if 'issuer_registry_path' in manifest:
             self.runs[rid].manifest['issuer_registry_path'] = manifest['issuer_registry_path']
+        if 'financial_coverage_requirements' in manifest:
+            self.runs[rid].manifest['financial_coverage_requirements'] = deepcopy(manifest['financial_coverage_requirements'])
         return rid
 
-    def register_trade(self, run_id, trade):
+    def register_trade(self, run_id, trade, *, candidate_claims=()):
         """Rebuild only resources created by the previous trade registration."""
         run = self.runs[run_id]
         shadow = deepcopy(run)
@@ -478,6 +496,9 @@ class OrchestratorV4(Orchestrator):
                     raise ValueError(f"trade.{key} must be numeric")
             if not 0 < trade["position_pct"] <= 100:
                 raise ValueError("trade.position_pct outside (0,100]")
+        candidates = [Claim.from_dict(c).to_dict() for c in candidate_claims]
+        candidate_index = claim_index(run.claims + candidates)
+        validate_trade_evidence(trade, set(source_catalog(shadow)) | set(candidate_index))
         digest(trade)
         before_facts, before_calcs = set(shadow.fact_store.to_dict()), set(shadow.calc_store.to_dict())
         self.runs[run_id] = shadow
@@ -613,6 +634,13 @@ class OrchestratorV4(Orchestrator):
         out.extend(calculation_findings(run))
         from .financial_statements import financial_statement_findings
         out.extend(financial_statement_findings(run))
+        out.extend(trade_evidence_findings(run.trade))
+        for diagnostic in ingestion_diagnostics(run):
+            if diagnostic.get('section') == 'financial_coverage':
+                out.extend(diagnostic['findings'])
+                out.extend(dict(status=row['status'], check_id='financial_coverage_requirement',
+                    object_id=f"financial_coverage_requirements.{row['index']}",
+                    reason=row['reason'], coverage=deepcopy(row)) for row in diagnostic['requirements'])
         # Fact identity includes entity. Different entities/bases/scopes are
         # legitimate distinct facts, unlike V3's broader collision grouping.
         seen = {}
