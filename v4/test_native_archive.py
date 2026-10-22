@@ -76,6 +76,25 @@ class NativeArchiveTests(unittest.TestCase):
             self.assertIn('_native_archive', disk)
             self.assertNotEqual(disk['format'], LEGACY_STATE_FORMAT)
 
+    def test_historical_v1_reader_rejects_v2_archived_state(self):
+        # Execute a frozen copy of the real v1 reader from commit 90363b7,
+        # so the regression also runs in shallow CI checkouts.
+        from types import ModuleType
+        snapshot = (Path(__file__).parent / 'test_fixtures' / 'native_queue_v1.py.txt').read_bytes()
+        self.assertEqual(hashlib.sha256(snapshot).hexdigest(),
+            '3373cdf262182ab9d3d49a74f93a628c86ca800d02d2c205891b62a28bd03578')
+        old = ModuleType('v4.agent_queue_v1_test_reader')
+        old.__package__ = 'v4'
+        exec(compile(snapshot, 'v4/agent_queue_v1_snapshot.py', 'exec'), old.__dict__)
+        self.assertEqual(old.STATE_FORMAT, 'v4-native-work/1')
+        with tempfile.TemporaryDirectory() as directory:
+            queue, _, _ = self.seed(directory)
+            self.assertEqual(self.disk(queue)['format'], 'v4-native-work/2')
+            self.assertIn('_native_archive', self.disk(queue))
+            with self.assertRaisesRegex(ValueError, 'unsupported native work queue state'):
+                with old.NativeWorkQueue(directory).transaction():
+                    self.fail('previous version accepted a compacted /2 state')
+
     def test_mutating_or_unretiring_hydrated_packet_keeps_exact_content(self):
         with tempfile.TemporaryDirectory() as directory:
             queue, packet_id, expected = self.seed(directory)

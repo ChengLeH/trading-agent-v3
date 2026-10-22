@@ -49,7 +49,6 @@ class TradeEvidence(unittest.TestCase):
             with self.subTest(direction=direction):
                 trade = plan()
                 trade.update(direction=direction, stop=stop, target=80 if direction == 'SHORT' else 120,
-                    source_horizon=None,
                     target_basis=dict(use='unknown', source_refs=[], bridge_refs=[]))
                 if direction == 'SHORT':
                     trade['gap_stress_loss']['scenario_return_pct'] = 30
@@ -66,8 +65,7 @@ class TradeEvidence(unittest.TestCase):
 
     def test_short_stress_direction_requires_correct_loss(self):
         trade = plan()
-        trade.update(direction='SHORT', stop=110, target=80, source_horizon=None,
-            target_basis=dict(use='unknown', source_refs=[], bridge_refs=[]))
+        trade.update(direction='SHORT', stop=110, target=80, target_basis=dict(use='unknown', source_refs=[], bridge_refs=[]))
         trade['execution_assumption']['assumed_fill_price'] = 110
         trade['gap_stress_loss']['scenario_return_pct'] = 30
         seeded().orch.register_trade('fixture', trade)
@@ -88,8 +86,63 @@ class TradeEvidence(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'trade_valid_until'):
             seeded().orch.register_trade('fixture', t)
 
+    def test_trade_scoped_horizons_ignore_model_basis_label(self):
+        for use in ('trade_target', 'valuation_context', 'unknown'):
+            for missing in ('source_horizon', 'source_horizon.end', 'trade_valid_until'):
+                with self.subTest(use=use, missing=missing):
+                    t = plan()
+                    t['target_basis'] = dict(use=use, source_refs=[], bridge_refs=[])
+                    if missing == 'source_horizon':
+                        t['source_horizon'] = None
+                    elif missing == 'source_horizon.end':
+                        t['source_horizon']['end'] = None
+                    else:
+                        t['trade_valid_until'] = None
+                    with self.assertRaisesRegex(ValueError, 'source_horizon.end and trade_valid_until'):
+                        seeded().orch.register_trade('fixture', t)
+            t = plan()
+            t['target_basis'] = dict(use=use, source_refs=[], bridge_refs=['a'] if use == 'trade_target' else [])
+            seeded().orch.register_trade('fixture', t)
+        # Unknown never licenses a fabricated date; WAIT remains exempt.
+        seeded().orch.register_trade('fixture', dict(direction='WAIT'))
+
+    def test_legacy_planned_loss_without_execution_is_not_certified(self):
+        for direction, stop, target in (('BUY', 50, 120), ('SHORT', 150, 80)):
+            with self.subTest(direction=direction):
+                t = plan()
+                t.pop('evidence_contract')
+                t.pop('execution_assumption')
+                t.update(direction=direction, stop=stop, target=target,
+                    target_basis=dict(use='unknown', source_refs=[], bridge_refs=[]),
+                    gap_stress_loss=None,
+                    planned_stop_loss=dict(value=0, unit='portfolio_pct'))
+                with self.assertRaisesRegex(ValueError, 'planned_stop_loss requires explicit assumed_fill_price'):
+                    seeded().orch.register_trade('fixture', t)
+                t['planned_stop_loss'] = None
+                seeded().orch.register_trade('fixture', t)
+
+    def test_loss_rounding_requires_two_decimal_places(self):
+        t = plan()
+        t.update(stop=50, position_pct=10.9, gap_stress_loss=None,
+                 target_basis=dict(use='unknown', source_refs=[], bridge_refs=[]))
+        t['execution_assumption']['assumed_fill_price'] = 50
+        for field in ('planned_stop_loss', 'gap_stress_loss'):
+            t['planned_stop_loss'] = None
+            t['gap_stress_loss'] = None
+            base = dict(value=5, unit='portfolio_pct')
+            if field == 'gap_stress_loss':
+                base['scenario_return_pct'] = -50
+            for dp in (0, 1):
+                with self.subTest(field=field, decimals=dp):
+                    t[field] = {**base, 'output_rounding': dict(decimal_places=dp, rounding='half_up')}
+                    with self.assertRaisesRegex(ValueError, 'at least 2 decimal_places'):
+                        seeded().orch.register_trade('fixture', t)
+            t[field] = {**base, 'value': 5.45,
+                        'output_rounding': dict(decimal_places=2, rounding='half_up')}
+            seeded().orch.register_trade('fixture', t)
+
     def test_declared_loss_rounding_is_supported_without_global_tolerance(self):
-        trade = plan(); trade.update(entry=91.69, stop=84, source_horizon=None)
+        trade = plan(); trade.update(entry=91.69, stop=84)
         trade['target_basis'] = dict(use='unknown', source_refs=[], bridge_refs=[])
         trade['execution_assumption']['assumed_fill_price'] = 84
         trade['planned_stop_loss'] = dict(value=.84, unit='portfolio_pct',
@@ -126,7 +179,6 @@ class TradeEvidence(unittest.TestCase):
 
     def test_historical_scenario_cannot_certify_a_hard_bound(self):
         r = seeded(); trade = plan()
-        trade['source_horizon'] = None
         trade['target_basis'] = dict(use='valuation_context', source_refs=[], bridge_refs=[])
         trade['maximum_loss_bound'] = dict(value=3, unit='portfolio_pct', proof_refs=[])
         with self.assertRaisesRegex(ValueError, 'proof_refs'):
@@ -134,7 +186,6 @@ class TradeEvidence(unittest.TestCase):
 
     def test_stop_guarantee_cannot_be_inferred_from_an_assumed_fill(self):
         r = seeded(); trade = plan()
-        trade['source_horizon'] = None
         trade['target_basis'] = dict(use='valuation_context', source_refs=[], bridge_refs=[])
         trade['execution_assumption']['fill_guaranteed'] = True
         with self.assertRaisesRegex(ValueError, 'guarantee_refs'):
@@ -142,6 +193,7 @@ class TradeEvidence(unittest.TestCase):
 
     def test_unknown_scope_preserved_for_semantic_review_and_wait_exempt(self):
         r = seeded(); trade = plan()
+        trade.pop('evidence_contract')  # legacy unknowns are WARN-only
         trade['source_horizon'] = None
         trade['target_basis'] = dict(use='unknown', source_refs=[], bridge_refs=[])
         r.orch.register_trade(r.run_id, trade)
@@ -160,7 +212,7 @@ class TradeEvidence(unittest.TestCase):
             seeded().orch.register_trade('fixture', trade)
 
     def test_risk_loss_magnitudes_are_not_interchangeable(self):
-        trade = plan(); trade['source_horizon'] = None
+        trade = plan()
         trade['target_basis'] = dict(use='unknown', source_refs=[], bridge_refs=[])
         trade['planned_stop_loss']['value'] = 3  # 1% under this declared fill
         with self.assertRaisesRegex(ValueError, 'planned_stop_loss'):

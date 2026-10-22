@@ -98,7 +98,7 @@ def financial_coverage_diagnostics(run):
             # Never pretend prose proves a report period, but do not silently
             # certify annual-only coverage when later untyped news exists.
             if origin == 'evidence':
-                untyped_evidence.append(dict(ref_id=ref_id, source_id=source_id,
+                untyped_evidence.append(dict(entity=subject, ref_id=ref_id, source_id=source_id,
                     published_or_filing_time=values.get('published_or_filing_time', '')))
             return
         published = values.get('published_or_filing_time', '')
@@ -234,18 +234,49 @@ def financial_coverage_diagnostics(run):
     # synthetic requirement: this is a review obligation, not a filing claim.
     typed_latest = [x for x in latest if x['category'] in
         {'annual', 'quarter', 'year_to_date', 'ttm'}]
-    if typed_latest and {x['category'] for x in typed_latest} == {'annual'}:
-        newest_annual = max((_timestamp(x['published_or_filing_time'])
-                             for x in typed_latest), default=None)
-        newer_untyped = [row['ref_id'] for row in untyped_evidence
-            if newest_annual is not None and cutoff is not None
+    by_entity = {}
+    for row in typed_latest:
+        if row['entity'] is not None:
+            by_entity.setdefault(row['entity'], []).append(row)
+    annual_only = {}
+    for entity, rows in by_entity.items():
+        if {row['category'] for row in rows} != {'annual'}:
+            continue
+        dates = [_timestamp(row['published_or_filing_time']) for row in rows]
+        valid_dates = [stamp for stamp in dates if stamp is not None]
+        if valid_dates:
+            annual_only[entity] = max(valid_dates)
+
+    # A company's coverage must never be suppressed by a different company's
+    # quarter or later annual report. Explicitly attributable evidence gets an
+    # entity-scoped warning; unattributed news stays unattributed.
+    def newer_refs(rows, anchor):
+        return sorted({row['ref_id'] for row in rows
+            if cutoff is not None
             and (stamp := _timestamp(row['published_or_filing_time'])) is not None
-            and newest_annual < stamp <= cutoff]
-        if newer_untyped:
-            findings.append(dict(status='WARN', check_id='financial_coverage_untyped_newer_evidence',
-                evidence_refs=sorted(set(newer_untyped)),
-                reason='Newer untyped evidence is not a report inventory: latest interim '
-                       'coverage remains unverified; no period or filing is inferred'))
+            and anchor < stamp <= cutoff})
+
+    for entity, annual_stamp in sorted(annual_only.items()):
+        refs = newer_refs((row for row in untyped_evidence if row['entity'] == entity),
+                          annual_stamp)
+        if refs:
+            findings.append(dict(status='WARN',
+                check_id='financial_coverage_untyped_newer_evidence',
+                entity=entity, evidence_refs=refs,
+                reason='Newer untyped evidence for this entity is not a report inventory: '
+                       'interim coverage remains unverified; no period or filing is inferred'))
+
+    # No entity ID means no company attribution. A global warning preserves the
+    # default-flow non-silence guarantee without inventing ticker provenance.
+    if annual_only:
+        refs = newer_refs((row for row in untyped_evidence if row['entity'] is None),
+                          min(annual_only.values()))
+        if refs:
+            findings.append(dict(status='WARN',
+                check_id='financial_coverage_untyped_newer_evidence',
+                entity=None, evidence_refs=refs,
+                reason='Newer untyped evidence has no known entity: interim coverage '
+                       'may be incomplete; source identity and period are unverified'))
     inventory = {}
     for entry in entries:
         identity = tuple(entry[key] for key in ('entity', 'period', 'category',

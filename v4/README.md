@@ -457,7 +457,7 @@ permission 判斷不再搜尋整個 step JSON，結構化 error_code 優先。�
 
 ### 財報覆蓋、交易期限與執行假設
 
-`financial-evidence/7` 沿用原有角色／atomic／deep／global 審查，不增加模型輪次。
+`financial-evidence/8` 沿用原有角色／atomic／deep／global 審查，不增加模型輪次。
 升級後舊版收據會失效，必須依新契約重驗；不要在無法接受重驗成本時中途更新進行中的 run。
 
 來源可在 manifest 的 source row 宣告 `financial_report_coverage` 陣列，欄位為
@@ -479,14 +479,14 @@ manifest 可另設 `financial_coverage_requirements`，例如：
 
 新生成的 BUY／SHORT 方案須填 `evidence_contract="trade-evidence/1"`，並明示
 `target_basis`、`source_horizon`、`trade_valid_until`、`execution_assumption`。活躍交易的 `target_basis`、`execution_assumption` 不可整個為 null；
-若 `target_basis.use=trade_target`，`source_horizon.end` 與 `trade_valid_until` 必須有明確日期，不能靠 null 豁免橋接。
+所有宣告契約的 BUY／SHORT，不論 `target_basis.use` 為何，`source_horizon.end` 與 `trade_valid_until` 都必須有具證據支持的明確日期；缺失時應拒絕交易方案或改為 WAIT，不得編造日期。
 其他未經證明的期限或維度保留 null／unknown，並由既有語義審查處理。
 具體格式及語義責任在共用金融契約內。長期來源若直接作短期交易目標，須列 `bridge_refs`；
 程式只查日期、引用存在及交易 Claim 有宣告這些引用，理由是否成立仍由既有 LLM 驗證。
 舊 checkpoint 可載入；缺少這些欄位的 legacy 計畫會標示未知，不能當成已證明期限相容或可保證成交。
 
 `planned_stop_loss`、`gap_stress_loss` 與 `maximum_loss_bound` 分開保存。
-損失以 `portfolio_pct` 為單位；依明示成交假設／情境重算，若儲存捨入值可附 `output_rounding`。
+損失以 `portfolio_pct` 為單位；依明示成交假設／情境重算，若儲存捨入值可附 `output_rounding`；`planned_stop_loss` 和 `gap_stress_loss` 最少保留 2 位小數。Legacy trade 若保留 `planned_stop_loss` 但沒有可驗證的成交假設，須拒絕重新註冊，不能將舊數值冒充通過驗算。
 未知硬上限用 null；宣稱硬上限或保證成交必須有 proof／guarantee refs，存在引用本身仍不是保證證明。
 停損指令、歷史最大跳空與使用者風險預算不能混為一談。WAIT 不要求捏造交易欄位。
 

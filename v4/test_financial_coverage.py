@@ -72,6 +72,42 @@ class FinancialCoverage(unittest.TestCase):
         self.assertFalse(any(x['check_id'] == 'financial_coverage_untyped_newer_evidence'
                              for x in self.diagnostic(known)['findings']))
 
+    def test_multi_entity_coverage_does_not_suppress_company_warning(self):
+        a = report('FY2030', 'annual', '2031-02-01')
+        b_quarter = report('FY2031-Q2', 'single_period', '2031-08-05')
+        b_quarter['entity'] = 'SECOND'
+        b_annual = report('FY2031', 'annual', '2031-08-10')
+        b_annual['entity'] = 'SECOND'
+        news = dict(entity='ACME', published_or_filing_time='2031-08-09')
+        for other in (b_quarter, b_annual):
+            with self.subTest(other=other['period']):
+                d = self.diagnostic(run_with(facts=[a, other], evidence=[news]))
+                warnings = [f for f in d['findings']
+                    if f['check_id'] == 'financial_coverage_untyped_newer_evidence']
+                self.assertEqual(len(warnings), 1)
+                self.assertEqual(warnings[0]['entity'], 'ACME')
+                self.assertEqual(warnings[0]['evidence_refs'], ['ev.0'])
+                self.assertFalse(any(f['status'] == 'FAIL' for f in d['findings']))
+        # The other company may have news, but its typed quarter must not
+        # be turned into a false missing-quarter warning.
+        d = self.diagnostic(run_with(facts=[a, b_quarter],
+            evidence=[dict(entity='SECOND', published_or_filing_time='2031-08-09')]))
+        self.assertFalse(any(f['check_id'] == 'financial_coverage_untyped_newer_evidence'
+                             for f in d['findings']))
+
+    def test_undetermined_news_identity_stays_unattributed(self):
+        a = report('FY2030', 'annual', '2031-02-01')
+        b = report('FY2031-Q2', 'single_period', '2031-08-05')
+        b['entity'] = 'SECOND'
+        d = self.diagnostic(run_with(facts=[a, b],
+            evidence=[dict(published_or_filing_time='2031-08-09')]))
+        rows = [f for f in d['findings']
+                if f['check_id'] == 'financial_coverage_untyped_newer_evidence']
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]['entity'])
+        self.assertEqual(rows[0]['evidence_refs'], ['ev.0'])
+        self.assertFalse(any(f['status'] == 'FAIL' for f in d['findings']))
+
     def test_publication_asof_not_period_label_controls_eligibility(self):
         d = self.diagnostic(run_with(declarations=[report(published='2031-08-11'),
             report('FY2031-Q1', published='2031-05-06')]))
