@@ -33,6 +33,27 @@ def _timestamp(value, *, as_of=False):
         return None
 
 
+def _publication_relation(left, right):
+    """True for equal declarations, None for compatible but unverified precision."""
+    a, b = _timestamp(left), _timestamp(right)
+    if a is None or b is None:
+        return None
+    if (len(left) == 10) != (len(right) == 10):
+        day, stamp, precise = (a.date(), right, b) if len(left) == 10 else (b.date(), left, a)
+        # A date-only declaration has no timezone. Either the timestamp's local
+        # date or its UTC date can be compatible, but neither certifies a version.
+        local_day = datetime.fromisoformat(stamp.replace('Z', '+00:00')).date()
+        return None if day in {local_day, precise.date()} else False
+    return a == b
+
+
+def _entity_provenance(rows):
+    fields = ('ref_id', 'source_id', 'entity', 'entity_origin')
+    unique = {tuple(row[key] for key in fields) for row in rows}
+    return [dict(zip(fields, values)) for values in
+            sorted(unique, key=lambda values: tuple(value or '' for value in values))]
+
+
 def _dimensions(row):
     explicit = row.get('period')
     if not explicit and type(row.get('fiscal_year')) is int and row.get('fiscal_period'):
@@ -59,7 +80,8 @@ def _dimensions(row):
     else:
         category = 'unknown'
     entity = row.get('entity')
-    return (entity if isinstance(entity, str) and entity and entity != 'unknown' else None,
+    entity = entity.strip() if isinstance(entity, str) else ''
+    return (entity if entity and entity.casefold() != 'unknown' else None,
             period, category)
 
 
@@ -127,8 +149,8 @@ def financial_coverage_diagnostics(run):
     source_subjects = {}
     for rec in getattr(run, 'records', []):
         subject = getattr(rec, 'subject_ticker', None)
-        if isinstance(subject, str) and subject.strip() and subject != 'unknown':
-            source_subjects.setdefault(rec.id, set()).add(subject)
+        if isinstance(subject, str) and subject.strip() and subject.strip().casefold() != 'unknown':
+            source_subjects.setdefault(rec.id, set()).add(subject.strip())
     source_entities = {source_id: next(iter(subjects))
                        for source_id, subjects in source_subjects.items() if len(subjects) == 1}
     received_refs = {getattr(rec, 'id', '') for rec in getattr(run, 'records', [])}
@@ -201,6 +223,7 @@ def financial_coverage_diagnostics(run):
         latest.append(dict(entity=e['entity'], category=e['category'], period=e['period'],
             published_or_filing_time=e['published_or_filing_time'], received=True,
             structured=bool(fact_refs), fact_refs=fact_refs,
+            entity_provenance=_entity_provenance([x for x in peers if x['origin'] == 'fact'] or peers),
             source_refs=sorted({x['source_id'] for x in peers} or {e['source_id']})))
         if not fact_refs:
             findings.append(dict(status='WARN', check_id='latest_report_not_structured',
@@ -223,20 +246,21 @@ def financial_coverage_diagnostics(run):
         target = dict(entity=entity, period=period, category=category)
         matched = [e for e in eligible if compatible(target, e)
             and refs_valid and (e['source_id'] in refs or e['ref_id'] in refs)
-            and pub is not None and _timestamp(e['published_or_filing_time']) == pub]
+            and pub is not None and _publication_relation(
+                e['published_or_filing_time'], raw.get('published_or_filing_time')) is True]
         fact_refs = sorted({e['ref_id'] for e in matched if e['origin'] == 'fact'})
         received = bool(refs_valid and received_refs.intersection(refs))
         structured = bool(fact_refs)
-        unknown_fact_publication = any(compatible(target, e) and e['origin'] == 'fact'
-            and refs_valid and (e['source_id'] in refs or e['ref_id'] in refs)
-            and e['availability'] == 'unknown' for e in entries)
-        # Known report dimensions with unknown issuer do not prove coverage
-        # for the requested entity. Distinguish this from genuinely missing data.
-        unknown_entity_fact_refs = sorted({e['ref_id'] for e in entries
-            if e['origin'] == 'fact' and e['entity'] is None
+        candidates = [e for e in entries
+            if e['origin'] == 'fact' and e['entity'] in (None, entity)
             and e['period'] == period and e['category'] == category
             and refs_valid and (e['source_id'] in refs or e['ref_id'] in refs)
-            and pub is not None and _timestamp(e['published_or_filing_time']) == pub})
+            and e['availability'] != 'after_as_of'
+            and _publication_relation(e['published_or_filing_time'], raw.get('published_or_filing_time')) is not False]
+        unknown_entity_fact_refs = sorted({e['ref_id'] for e in candidates if e['entity'] is None})
+        unknown_publication_fact_refs = sorted({e['ref_id'] for e in candidates if
+            _publication_relation(e['published_or_filing_time'], raw.get('published_or_filing_time')) is None})
+        unverified_fact_refs = sorted(set(unknown_entity_fact_refs) | set(unknown_publication_fact_refs))
         if (entity is None or period is None or category in {'unknown', 'interim_unknown'}
                 or pub is None or cutoff is None or not refs_valid
                 or type(raw.get('require_structured')) is not bool):
@@ -245,7 +269,9 @@ def financial_coverage_diagnostics(run):
             status, reason = 'WARN', 'report_after_as_of'
         elif not received:
             status, reason = 'FAIL', 'required_report_not_received'
-        elif raw['require_structured'] and not structured and unknown_fact_publication:
+        elif raw['require_structured'] and not structured and unknown_entity_fact_refs and unknown_publication_fact_refs:
+            status, reason = 'WARN', 'structured_metadata_unknown'
+        elif raw['require_structured'] and not structured and unknown_publication_fact_refs:
             status, reason = 'WARN', 'structured_publication_unknown'
         elif raw['require_structured'] and not structured and unknown_entity_fact_refs:
             status, reason = 'WARN', 'structured_entity_unknown'
@@ -255,7 +281,9 @@ def financial_coverage_diagnostics(run):
             status, reason = 'PASS', 'required_report_covered'
         requirements.append(dict(index=i, requirement=deepcopy(raw), status=status,
             reason=reason, received=received, structured=structured, fact_refs=fact_refs,
-            unknown_entity_fact_refs=unknown_entity_fact_refs))
+            unknown_entity_fact_refs=unknown_entity_fact_refs,
+            unverified_fact_refs=unverified_fact_refs,
+            entity_provenance=_entity_provenance([e for e in matched if e['origin'] == 'fact'] or candidates)))
     # A typed annual inventory does not establish that no subsequent interim
     # announcement appeared in untyped news. One WARN, no inferred quarter or
     # synthetic requirement: this is a review obligation, not a filing claim.
@@ -271,7 +299,7 @@ def financial_coverage_diagnostics(run):
             return None
         year = int(period[0])
         suffix = period[1] if len(period) > 1 else ''
-        if row['category'] == 'annual' and not suffix:
+        if row['category'] == 'annual':
             return year, 4
         quarter = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4}
         if suffix in quarter:
@@ -330,7 +358,7 @@ def financial_coverage_diagnostics(run):
     inventory = {}
     for entry in entries:
         identity = tuple(entry[key] for key in ('entity', 'period', 'category',
-            'period_coverage', 'published_or_filing_time', 'source_id', 'origin', 'availability'))
+            'period_coverage', 'published_or_filing_time', 'source_id', 'origin', 'availability', 'entity_origin'))
         row = inventory.setdefault(identity, {**entry, 'ref_ids': []})
         if entry['ref_id'] not in row['ref_ids']:
             row['ref_ids'].append(entry['ref_id'])

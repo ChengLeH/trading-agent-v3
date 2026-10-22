@@ -115,6 +115,7 @@ class FinancialCoverage(unittest.TestCase):
             ('FY2028-Q3', '2028-11-01', True),
             ('FY2028-Q3', '2031-08-08', True),  # late restatement of old period
             ('FY2030-Q3', '2030-11-01', True),
+            ('FY2030-Q4', '2031-01-25', True),
             ('FY2031-Q1', '2031-05-01', False),
             ('FY2031-Q2', '2031-08-05', False),
         ]
@@ -128,6 +129,63 @@ class FinancialCoverage(unittest.TestCase):
                 if rows:
                     self.assertEqual(rows[0]['entity'], 'ACME')
                     self.assertEqual(rows[0]['evidence_refs'], ['ev.0'])
+
+    def test_annual_date_label_cannot_make_an_old_quarter_look_newer(self):
+        for label in ('FY2030', '2030-12-31'):
+            for quarter in ('FY2030-Q3', 'FY2030-Q4'):
+                with self.subTest(label=label, quarter=quarter):
+                    d = self.diagnostic(run_with(facts=[
+                        report(label, 'annual', '2031-02-01'),
+                        report(quarter, 'single_period', '2031-01-25')],
+                        evidence=[dict(entity='ACME', published_or_filing_time='2031-08-09')]))
+                    self.assertTrue(any(f['check_id'] == 'financial_coverage_untyped_newer_evidence'
+                                        for f in d['findings']))
+
+    def test_intervals_without_quarter_end_cannot_suppress_same_year_warning(self):
+        for coverage in ('year_to_date', 'rolling'):
+            for label in ('FY2030-H1', 'FY2030-H2', 'FY2030-YTD', 'FY2030-TTM'):
+                with self.subTest(coverage=coverage, label=label):
+                    d = self.diagnostic(run_with(facts=[
+                        report('FY2030', 'annual', '2031-02-01'),
+                        report(label, coverage, '2031-07-01')],
+                        evidence=[dict(entity='ACME', published_or_filing_time='2031-08-09')]))
+                    self.assertTrue(any(f['check_id'] == 'financial_coverage_untyped_newer_evidence'
+                                        for f in d['findings']))
+
+    def test_combined_unknown_dimensions_stay_unverified_not_missing(self):
+        req = report('FY2030', 'annual', '2031-02-01', source_refs=['statements'], require_structured=True)
+        for entity in ('', 'ACME'):
+            for publication in ('', '2031-02-01T09:30:00+00:00',
+                                '2031-02-01T23:30:00-05:00',
+                                '2031-02-02T00:30:00+05:00'):
+                with self.subTest(entity=entity, publication=publication):
+                    f = report('FY2030', 'annual', publication); f['entity'] = entity
+                    row = self.diagnostic(run_with(facts=[f], requirements=[req]))['requirements'][0]
+                    self.assertEqual(row['status'], 'WARN')
+                    self.assertFalse(row['structured'])
+                    self.assertEqual(row['unverified_fact_refs'], ['fact.0'])
+        # Two precise, different timestamps are different versions even on one day.
+        req['published_or_filing_time'] = '2031-02-01T10:00:00+00:00'
+        f = report('FY2030', 'annual', '2031-02-01T09:30:00+00:00')
+        row = self.diagnostic(run_with(facts=[f], requirements=[req]))['requirements'][0]
+        self.assertEqual(row['status'], 'FAIL')
+        self.assertEqual(row['unverified_fact_refs'], [])
+
+    def test_source_subject_whitespace_and_provenance_survive_verdict_views(self):
+        req = report('FY2030', 'annual', '2031-02-01', source_refs=['statements'], require_structured=True)
+        f = report('FY2030', 'annual', '2031-02-01'); f['entity'] = ''
+        for subject in ('ACME', ' ACME '):
+            with self.subTest(subject=subject):
+                run = run_with(facts=[f], requirements=[req])
+                run.records.append(SimpleNamespace(id='statements', subject_ticker=subject, meta={}))
+                d = self.diagnostic(run)
+                self.assertEqual(d['latest'][0]['entity'], 'ACME')
+                self.assertEqual(d['requirements'][0]['status'], 'PASS')
+                for row in (d['latest'][0], d['requirements'][0]):
+                    self.assertEqual(row['entity_provenance'], [dict(ref_id='fact.0',
+                        source_id='statements', entity='ACME', entity_origin='source_record.subject_ticker')])
+                self.assertFalse(any(x['check_id'] == 'financial_coverage_entity_unknown' for x in d['findings']))
+                self.assertEqual(run.fact_store.get('fact.0').entity, '')
 
     def test_typed_fact_entity_can_only_come_from_unique_source_record(self):
         annual = report('FY2030', 'annual', '2031-02-01')
