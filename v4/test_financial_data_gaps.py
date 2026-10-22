@@ -153,6 +153,30 @@ class FinancialSourceContracts(unittest.TestCase):
                 self.assertEqual(facts["fact.TotalDebt.FY2025"]["value"], expected)
                 self.assertFalse(any('TotalDebt unavailable' in line for line in report['limitations']))
 
+    def test_invalid_debt_component_never_enters_canonical_facts(self):
+        # Source rows remain unchanged for forensic/audit purposes, while
+        # rejected components cannot be cited as valid financial facts.
+        from math import nan
+        for invalid in (-5, -0.5, nan, float("inf"), "bad"):
+            with self.subTest(source_value=repr(invalid)):
+                row = dict(fiscal_year=2025, short_term_debt=invalid,
+                    current_portion_of_long_term_debt=7, long_term_debt=11,
+                    debt_components_complete=True,
+                    current_portion_in_short_term_debt=False)
+                orch, rid, report = self.build(dict(income=[], balance=[row], cash_flow=[]))
+                facts = orch.runs[rid].fact_store.to_dict()
+                self.assertNotIn("fact.ShortTermDebt.FY2025", facts)
+                self.assertNotIn("fact.TotalDebt.FY2025", facts)
+                self.assertIs(orch.runs[rid].records[0].payload["balance"][0]["short_term_debt"], invalid)
+                diag = report["financial_data_coverage"][0]
+                self.assertIn(dict(status="FAIL", check_id="debt_component_invalid",
+                    source_id="filing", section="balance", row=0,
+                    field="short_term_debt",
+                    reason="debt components must be finite nonnegative numeric values"),
+                    diag["findings"])
+                self.assertTrue(any("invalid component: short_term_debt" in s
+                    for s in diag["limitations"]))
+
     def test_total_debt_diagnostics_name_only_the_unsatisfied_requirements(self):
         from .financial_data import extract_financial_facts
 

@@ -1,5 +1,6 @@
 """Debt truth table: missing is not zero; overlap requires an explicit boolean."""
 import unittest
+import math
 
 from hypothesis import example, given, strategies as st
 
@@ -10,7 +11,9 @@ from v4.pipeline import OrchestratorV4
 
 FIELDS = ('short_term_debt', 'current_portion_of_long_term_debt', 'long_term_debt')
 MISSING = 'absent'
-AMOUNTS = st.one_of(st.just(MISSING), st.none(), st.just(0), st.integers(1, 1000000))
+AMOUNTS = st.one_of(st.just(MISSING), st.none(), st.just(0),
+    st.integers(-1000000, -1), st.integers(1, 1000000),
+    st.sampled_from((-0.5, 1.25, float('nan'), float('inf'), 'invalid')))
 DECLARATIONS = st.sampled_from((MISSING, None, False, True, 'true', 'false'))
 
 
@@ -29,6 +32,9 @@ class DebtProperties(unittest.TestCase):
     @example(amounts=(None, 0, 1), complete=True, overlap=False)
     @example(amounts=(7, 7, 10), complete=True, overlap=True)
     @example(amounts=(7, 7, 10), complete=True, overlap=False)
+    @example(amounts=(-5, 7, 11), complete=True, overlap=False)
+    @example(amounts=(5, float('nan'), 11), complete=True, overlap=False)
+    @example(amounts=(5, 'invalid', 11), complete=True, overlap=False)
     @given(amounts=st.tuples(AMOUNTS, AMOUNTS, AMOUNTS),
            complete=DECLARATIONS, overlap=DECLARATIONS)
     def test_component_values_and_exact_missing_diagnostics(self, amounts, complete, overlap):
@@ -44,7 +50,12 @@ class DebtProperties(unittest.TestCase):
         # source representations with the same absence of numerical evidence.
         missing = [field for field, value in zip(FIELDS, amounts)
                    if value is None or value == MISSING]
-        eligible = not missing and complete is True and type(overlap) is bool
+        # This oracle deliberately does not call the production debt helper.
+        invalid = [field for field, value in zip(FIELDS, amounts)
+                   if value is not None and value != MISSING
+                   and (type(value) not in (int, float)
+                        or not math.isfinite(value) or value < 0)]
+        eligible = not missing and not invalid and complete is True and type(overlap) is bool
         total = facts.get('fact.TotalDebt.FY2025')
         self.assertEqual(total is not None, eligible)
         if eligible:
@@ -54,11 +65,15 @@ class DebtProperties(unittest.TestCase):
         concepts = ('ShortTermDebt', 'CurrentPortionOfLongTermDebt', 'LongTermDebt')
         for field, concept, value in zip(FIELDS, concepts, amounts):
             fact = facts.get(f'fact.{concept}.FY2025')
-            self.assertEqual(fact is None, field in missing)
-            if field not in missing:
+            self.assertEqual(fact is None, field in missing or field in invalid)
+            if field not in missing and field not in invalid:
                 self.assertEqual(fact['value'], value)
 
-        reasons = [f'missing component: {field}' for field in missing]
+        reasons = [f'{"missing" if field in missing else "invalid"} component: {field}'
+                   for field in FIELDS if field in missing or field in invalid]
+        debt_findings = [f['field'] for f in report['financial_data_coverage'][0]['findings']
+                         if f['check_id'] == 'debt_component_invalid']
+        self.assertEqual(debt_findings, invalid)
         if complete is not True:
             reasons.append('missing declaration: debt_components_complete'
                 if complete is None or complete == MISSING else

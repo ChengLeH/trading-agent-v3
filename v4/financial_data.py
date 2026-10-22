@@ -199,6 +199,10 @@ def extract_financial_facts(record):
                         source_id=record.id, section=section, row=index, field=field,
                         reason="mapped statement value must be a finite number"))
                     continue
+                # The debt-specific validator diagnoses negative source values.
+                # They remain auditable in the original row, not canonical facts.
+                if section == "balance" and field in _DEBT_COMPONENT_FIELDS and value < 0:
+                    continue
                 facts.append(financial_fact(record, row, metadata, section, index, field, concept,
                                             default_unit, value, period_info=dims))
                 produced.append(concept)
@@ -256,7 +260,14 @@ def prepare_legacy_builder_view(builder_records):
                     continue
                 if fiscal_period == "FY" and type(year) is int:
                     seen.add(key)
-                retained.append(row)
+                # Legacy compatibility receives only valid debt numbers. Keep
+                # original records unchanged for V4's typed FAIL diagnostics.
+                clean = dict(row)
+                for field in (*_DEBT_COMPONENT_FIELDS, "total_debt", "reported_total_debt"):
+                    value = clean.get(field)
+                    if value is not None and (not _finite_source_value(value) or value < 0):
+                        clean.pop(field)
+                retained.append(clean)
             payload[section] = retained
     return limitations
 

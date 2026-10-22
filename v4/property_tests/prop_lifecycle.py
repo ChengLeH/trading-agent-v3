@@ -52,13 +52,17 @@ class NativeLifecycle(RuleBasedStateMachine):
                 break
             rows = {cid: candidate(cid, item, 'omitted') for cid, item in packet['items'].items()}
             self.workflow.submit(packet['packet_id'], rows, 'host/property', packet['input_hash'])
-            for cid in rows:
-                self.accepted[cid] = self.fingerprint(cid)
-                self.results[cid] = deepcopy(rows[cid])
-            self.sent.append((deepcopy(packet), rows))
+            self._record_submission(packet, rows)
             if set(self.accepted) == set(self.claims):
                 break
         assert set(self.accepted) == set(self.claims)
+
+    def _record_submission(self, packet, rows):
+        """Independent receipt oracle, shared by bootstrap and live reviews."""
+        for cid in rows:
+            self.accepted[cid] = self.fingerprint(cid)
+            self.results[cid] = deepcopy(rows[cid])
+        self.sent.append((deepcopy(packet), deepcopy(rows)))
 
     def fingerprint(self, cid):
         # This reference model does not call production task/hash/descendant helpers.
@@ -98,10 +102,7 @@ class NativeLifecycle(RuleBasedStateMachine):
         rows = {key: candidate(key, packet['items'][key], notes) for key in selected}
         outcome = self.workflow.submit(packet['packet_id'], rows, 'host/property', packet['input_hash'])
         assert not outcome.get('blocked'), outcome
-        for cid in rows:
-            self.accepted[cid] = self.fingerprint(cid)
-            self.results[cid] = deepcopy(rows[cid])
-        self.sent.append((deepcopy(packet), rows))
+        self._record_submission(packet, rows)
 
     def all_verified(self):
         return all(self.accepted.get(cid) == self.fingerprint(cid) for cid in self.claims)
@@ -136,7 +137,6 @@ class NativeLifecycle(RuleBasedStateMachine):
     def fresh_epoch_from_disk(self):
         previous_epoch = self.epoch
         with self.workflow.queue.transaction() as state:
-            self.workflow._load(state)
             runner = load_checkpoint(self.workflow.checkpoint_path, continue_verification=False)
             assert runner._verification_epoch != previous_epoch
             assert not runner.receipts and not runner.deep_receipts
