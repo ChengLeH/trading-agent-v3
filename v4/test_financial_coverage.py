@@ -108,6 +108,103 @@ class FinancialCoverage(unittest.TestCase):
         self.assertEqual(rows[0]['evidence_refs'], ['ev.0'])
         self.assertFalse(any(f['status'] == 'FAIL' for f in d['findings']))
 
+    def test_stale_quarter_never_suppresses_recent_annual_warning(self):
+        annual = report('FY2030', 'annual', '2031-02-01')
+        news = dict(entity='ACME', published_or_filing_time='2031-08-09')
+        cases = [
+            ('FY2028-Q3', '2028-11-01', True),
+            ('FY2028-Q3', '2031-08-08', True),  # late restatement of old period
+            ('FY2030-Q3', '2030-11-01', True),
+            ('FY2031-Q1', '2031-05-01', False),
+            ('FY2031-Q2', '2031-08-05', False),
+        ]
+        for fiscal, publication, should_warn in cases:
+            with self.subTest(fiscal=fiscal, publication=publication):
+                d = self.diagnostic(run_with(facts=[annual,
+                    report(fiscal, 'single_period', publication)], evidence=[news]))
+                rows = [f for f in d['findings']
+                    if f['check_id'] == 'financial_coverage_untyped_newer_evidence']
+                self.assertEqual(bool(rows), should_warn)
+                if rows:
+                    self.assertEqual(rows[0]['entity'], 'ACME')
+                    self.assertEqual(rows[0]['evidence_refs'], ['ev.0'])
+
+    def test_typed_fact_entity_can_only_come_from_unique_source_record(self):
+        annual = report('FY2030', 'annual', '2031-02-01')
+        annual['entity'] = ''
+        req = dict(report('FY2030', 'annual', '2031-02-01'),
+                   source_refs=['statements'], require_structured=True)
+        run = run_with(facts=[annual], requirements=[req])
+        no_source = self.diagnostic(run)
+        self.assertFalse(no_source['latest'])
+        self.assertTrue(any(f['check_id'] == 'financial_coverage_entity_unknown'
+                            and f['ref_id'] == 'fact.0' for f in no_source['findings']))
+        self.assertEqual(no_source['requirements'][0]['status'], 'WARN')
+        self.assertEqual(no_source['requirements'][0]['reason'], 'structured_entity_unknown')
+        self.assertEqual(no_source['requirements'][0]['unknown_entity_fact_refs'], ['fact.0'])
+
+        run.records.append(SimpleNamespace(id='statements', subject_ticker='ACME', meta={}))
+        resolved = self.diagnostic(run)
+        self.assertEqual(resolved['latest'][0]['entity'], 'ACME')
+        self.assertEqual(resolved['requirements'][0]['status'], 'PASS')
+        self.assertEqual(resolved['requirements'][0]['fact_refs'], ['fact.0'])
+        self.assertEqual(resolved['coverage'][0]['entity_origin'], 'source_record.subject_ticker')
+        self.assertEqual(run.fact_store.get('fact.0').entity, '')  # view-only fallback
+
+        run.records.append(SimpleNamespace(id='statements', subject_ticker='SECOND', meta={}))
+        ambiguous = self.diagnostic(run)
+        self.assertFalse(ambiguous['latest'])
+        self.assertEqual(ambiguous['requirements'][0]['reason'], 'structured_entity_unknown')
+        # A different, unique source identity may not satisfy ACME's requirement.
+        run.records.pop()
+        run.records[-1].subject_ticker = 'SECOND'
+        wrong_company = self.diagnostic(run)
+        self.assertEqual(wrong_company['latest'][0]['entity'], 'SECOND')
+        self.assertNotEqual(wrong_company['requirements'][0]['status'], 'PASS')
+
+    def test_unknown_entity_typed_fact_not_attributed_to_primary_run_ticker(self):
+        annual = report('FY2030', 'annual', '2031-02-01')
+        annual.pop('entity')
+        run = run_with(facts=[annual])
+        run.manifest['subject'] = dict(ticker='ACME')
+        d = self.diagnostic(run)
+        self.assertFalse(d['latest'])
+        self.assertEqual([f['check_id'] for f in d['findings']].count(
+            'financial_coverage_entity_unknown'), 1)
+
+    def test_interim_unknown_not_misrepresented_as_absent(self):
+        d = self.diagnostic(run_with(
+            facts=[report('FY2030', 'annual', '2031-02-01')],
+            declarations=[report('FY2031-Q2', 'unknown', '2031-08-05')],
+            evidence=[dict(entity='ACME', published_or_filing_time='2031-08-09')]))
+        self.assertIn('interim_unknown', {r['category'] for r in d['latest']})
+        warnings = [f for f in d['findings']
+            if f['check_id'] == 'financial_coverage_untyped_newer_evidence']
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('Unclassified interim rows may exist', warnings[0]['reason'])
+
+    def test_warn_timestamp_boundaries_for_company_and_unattributed_news(self):
+        annual = report('FY2030', 'annual', '2031-02-01')
+        for entity in ('ACME', None):
+            for published, expected in [
+                ('2031-02-01', False),
+                ('2031-01-31', False),
+                ('2031-08-09', True),
+                ('2031-08-10', True),
+                ('2031-08-11', False),
+                ('', False)]:
+                with self.subTest(entity=entity, published=published):
+                    evidence = dict(published_or_filing_time=published)
+                    if entity is not None:
+                        evidence['entity'] = entity
+                    d = self.diagnostic(run_with(facts=[annual], evidence=[evidence]))
+                    rows = [f for f in d['findings']
+                        if f['check_id'] == 'financial_coverage_untyped_newer_evidence']
+                    self.assertEqual(bool(rows), expected)
+                    if rows:
+                        self.assertEqual(rows[0]['entity'], entity)
+                        self.assertEqual(rows[0]['evidence_refs'], ['ev.0'])
+
     def test_publication_asof_not_period_label_controls_eligibility(self):
         d = self.diagnostic(run_with(declarations=[report(published='2031-08-11'),
             report('FY2031-Q1', published='2031-05-06')]))

@@ -150,6 +150,39 @@ class TradeEvidence(unittest.TestCase):
         r = seeded(); r.orch.register_trade(r.run_id, trade)
         self.assertEqual(r.run.trade['planned_stop_loss']['value'], .84)
 
+    def test_maximum_loss_bound_disallows_unverifiable_arithmetic_metadata(self):
+        t = plan()
+        t['target_basis'] = dict(use='unknown', source_refs=[], bridge_refs=[])
+        t['maximum_loss_bound'] = dict(value=3, unit='portfolio_pct', proof_refs=['a'])
+        seeded().orch.register_trade('fixture', t)
+        for bad in (
+            dict(output_rounding=dict(decimal_places=0, rounding='half_up')),
+            dict(output_rounding=dict(decimal_places='bad', rounding='half_up')),
+            dict(output_rounding=None),
+            dict(tolerance=99),
+            dict(tolerance=0),
+        ):
+            with self.subTest(bad=bad):
+                t['maximum_loss_bound'] = dict(value=3, unit='portfolio_pct',
+                                               proof_refs=['a'], **bad)
+                with self.assertRaisesRegex(ValueError, 'maximum_loss_bound forbids'):
+                    seeded().orch.register_trade('fixture', t)
+
+    def test_legacy_trade_cannot_assume_favorable_fill(self):
+        for direction, stop, favorable in (
+            ('BUY', 50, 100), ('SHORT', 150, 100)):
+            with self.subTest(direction=direction):
+                t = plan()
+                t.pop('evidence_contract')
+                t.update(direction=direction, stop=stop,
+                    target=80 if direction == 'SHORT' else 120,
+                    target_basis=dict(use='unknown', source_refs=[], bridge_refs=[]),
+                    gap_stress_loss=None,
+                    planned_stop_loss=dict(value=0, unit='portfolio_pct'))
+                t['execution_assumption']['assumed_fill_price'] = favorable
+                with self.assertRaisesRegex(ValueError, 'adverse side'):
+                    seeded().orch.register_trade('fixture', t)
+
     def test_new_role_output_cannot_omit_trade_evidence_contract(self):
         trade = dict(direction='BUY', entry=100, stop=90, target=120, position_pct=10)
         r = seeded()

@@ -457,7 +457,7 @@ permission 判斷不再搜尋整個 step JSON，結構化 error_code 優先。�
 
 ### 財報覆蓋、交易期限與執行假設
 
-`financial-evidence/8` 沿用原有角色／atomic／deep／global 審查，不增加模型輪次。
+`financial-evidence/9` 沿用原有角色／atomic／deep／global 審查，不增加模型輪次。
 升級後舊版收據會失效，必須依新契約重驗；不要在無法接受重驗成本時中途更新進行中的 run。
 
 來源可在 manifest 的 source row 宣告 `financial_report_coverage` 陣列，欄位為
@@ -473,7 +473,8 @@ manifest 可另設 `financial_coverage_requirements`，例如：
 
 已知且在分析截止前公布的必需資料若未收到、或要求結構化卻沒有相符 Fact，會列明缺口並阻擋。
 沒有明示要求時只提供覆蓋診斷，不假定每家公司都須有美國 10-Q、不從當前年份推測最新財報。
-若目前僅有年度結構化資訊，且有發布日期更新、卻沒有期間 metadata 的新聞證據，預設發出 WARN：最新期中覆蓋尚未確認；不推造某季財報、更不自動 FAIL。
+WARN 檢查以同一主體的最新年報會計期間為錨點；比年報更早的季報，即使仍在 Fact Store 或晚發布，也不能掩蓋年報之後的期中覆蓋未知。若有更新、但沒有期間 metadata 的新聞證據，預設發出 WARN；已存在 period_coverage 未明確分類的期中列時，警告仍表明季度／YTD／TTM 的型別尚未驗證，而不是宣稱完全沒有期中資料。不推造某季財報、更不自動 FAIL。
+Fact entity 缺失時，僅可根據相符且唯一的 SourceRecord.subject_ticker 在 Coverage 視圖補齊（保留來源識別）；來源無法歸屬時發出專屬 WARN，不得默認為分析標的。要求明確公司且結構化 Fact 主體未知時不能認證 structured PASS，會以 WARN 表達缺口。
 `received` 不代表數字已抽取；`structured` 只代表同主體、期間、發布版本至少有一項 Fact，
 不認證全份報表或每個指標都齊全。quarter／YTD／TTM 不互相代替。歷史分析仍可用舊年度資料。
 
@@ -487,7 +488,7 @@ manifest 可另設 `financial_coverage_requirements`，例如：
 
 `planned_stop_loss`、`gap_stress_loss` 與 `maximum_loss_bound` 分開保存。
 損失以 `portfolio_pct` 為單位；依明示成交假設／情境重算，若儲存捨入值可附 `output_rounding`；`planned_stop_loss` 和 `gap_stress_loss` 最少保留 2 位小數。Legacy trade 若保留 `planned_stop_loss` 但沒有可驗證的成交假設，須拒絕重新註冊，不能將舊數值冒充通過驗算。
-未知硬上限用 null；宣稱硬上限或保證成交必須有 proof／guarantee refs，存在引用本身仍不是保證證明。
+未知硬上限用 null；宣稱硬上限或保證成交必須有 proof／guarantee refs，存在引用本身仍不是保證證明。maximum_loss_bound 不具可由 kernel 驗算的 expected，禁止使用 output_rounding／tolerance metadata 偽裝精度認證。
 停損指令、歷史最大跳空與使用者風險預算不能混為一談。WAIT 不要求捏造交易欄位。
 
 ### Native 狀態封存與補審 context

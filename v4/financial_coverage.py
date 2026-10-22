@@ -90,9 +90,12 @@ def financial_coverage_diagnostics(run):
                                  source_id=source_id, reason='report coverage row is not an object'))
             return
         values = dict(row)
-        if not values.get('entity') and entity:
+        original_subject, _, _ = _dimensions(values)
+        if original_subject is None and entity:
             values['entity'] = entity
         subject, period, category = _dimensions(values)
+        entity_origin = ('explicit' if original_subject is not None else
+                         'source_record.subject_ticker' if subject is not None else 'unknown')
         # Unrelated news and market-price observations are not report inventory.
         if category == 'unknown' and not (values.get('period_coverage') or values.get('fiscal_period')):
             # Never pretend prose proves a report period, but do not silently
@@ -105,16 +108,29 @@ def financial_coverage_diagnostics(run):
         stamp = _timestamp(published)
         availability = ('unknown' if stamp is None or cutoff is None else
                         'by_as_of' if stamp <= cutoff else 'after_as_of')
-        entry = dict(entity=subject, period=period, category=category,
+        entry = dict(entity=subject, entity_origin=entity_origin, period=period, category=category,
             period_coverage=values.get('period_coverage', 'unknown'),
             published_or_filing_time=published, source_id=source_id,
             ref_id=ref_id or source_id, origin=origin, availability=availability)
         entries.append(entry)
+        if origin == 'fact' and subject is None and category != 'unknown':
+            findings.append(dict(status='WARN', check_id='financial_coverage_entity_unknown',
+                source_id=source_id, ref_id=entry['ref_id'], period=period,
+                reason='Typed financial Fact has no verifiable issuer identity; it cannot establish entity-specific report coverage'))
         if availability == 'unknown' or subject is None or period is None or category in {'unknown', 'interim_unknown'}:
             findings.append(dict(status='WARN', check_id='financial_coverage_metadata_unknown',
                 source_id=source_id, ref_id=entry['ref_id'],
                 reason='report publication, entity, period or quarter/YTD/TTM coverage is unknown'))
 
+    # Resolve missing Fact entities only from a unique matching SourceRecord.
+    # Never assign the run's primary ticker to every Fact in a multi-issuer run.
+    source_subjects = {}
+    for rec in getattr(run, 'records', []):
+        subject = getattr(rec, 'subject_ticker', None)
+        if isinstance(subject, str) and subject.strip() and subject != 'unknown':
+            source_subjects.setdefault(rec.id, set()).add(subject)
+    source_entities = {source_id: next(iter(subjects))
+                       for source_id, subjects in source_subjects.items() if len(subjects) == 1}
     received_refs = {getattr(rec, 'id', '') for rec in getattr(run, 'records', [])}
     facts = _store_rows(run, 'fact_store')
     received_refs.update(row.get('source_id', '') for row in facts.values())
@@ -124,7 +140,8 @@ def financial_coverage_diagnostics(run):
     for fid, row in facts.items():
         if (row.get('source_id') in financial_sources or row.get('period_coverage')
                 in {'annual', 'single_period', 'year_to_date', 'rolling'}):
-            add(row, row.get('source_id', ''), 'fact', fid)
+            add(row, row.get('source_id', ''), 'fact', fid,
+                entity=source_entities.get(row.get('source_id', '')))
     for eid, row in _store_rows(run, 'evidence_store').items():
         received_refs.update((eid, row.get('source_id', '')))
         add(row, row.get('source_id', ''), 'evidence', eid)
@@ -213,6 +230,13 @@ def financial_coverage_diagnostics(run):
         unknown_fact_publication = any(compatible(target, e) and e['origin'] == 'fact'
             and refs_valid and (e['source_id'] in refs or e['ref_id'] in refs)
             and e['availability'] == 'unknown' for e in entries)
+        # Known report dimensions with unknown issuer do not prove coverage
+        # for the requested entity. Distinguish this from genuinely missing data.
+        unknown_entity_fact_refs = sorted({e['ref_id'] for e in entries
+            if e['origin'] == 'fact' and e['entity'] is None
+            and e['period'] == period and e['category'] == category
+            and refs_valid and (e['source_id'] in refs or e['ref_id'] in refs)
+            and pub is not None and _timestamp(e['published_or_filing_time']) == pub})
         if (entity is None or period is None or category in {'unknown', 'interim_unknown'}
                 or pub is None or cutoff is None or not refs_valid
                 or type(raw.get('require_structured')) is not bool):
@@ -223,12 +247,15 @@ def financial_coverage_diagnostics(run):
             status, reason = 'FAIL', 'required_report_not_received'
         elif raw['require_structured'] and not structured and unknown_fact_publication:
             status, reason = 'WARN', 'structured_publication_unknown'
+        elif raw['require_structured'] and not structured and unknown_entity_fact_refs:
+            status, reason = 'WARN', 'structured_entity_unknown'
         elif raw['require_structured'] and not structured:
             status, reason = 'FAIL', 'required_report_not_structured'
         else:
             status, reason = 'PASS', 'required_report_covered'
         requirements.append(dict(index=i, requirement=deepcopy(raw), status=status,
-            reason=reason, received=received, structured=structured, fact_refs=fact_refs))
+            reason=reason, received=received, structured=structured, fact_refs=fact_refs,
+            unknown_entity_fact_refs=unknown_entity_fact_refs))
     # A typed annual inventory does not establish that no subsequent interim
     # announcement appeared in untyped news. One WARN, no inferred quarter or
     # synthetic requirement: this is a review obligation, not a filing claim.
@@ -238,14 +265,36 @@ def financial_coverage_diagnostics(run):
     for row in typed_latest:
         if row['entity'] is not None:
             by_entity.setdefault(row['entity'], []).append(row)
+    def period_position(row):
+        period = row['period'].removeprefix('FY').split('-')
+        if not (len(period[0]) == 4 and period[0].isascii() and period[0].isdigit()):
+            return None
+        year = int(period[0])
+        suffix = period[1] if len(period) > 1 else ''
+        if row['category'] == 'annual' and not suffix:
+            return year, 4
+        quarter = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4}
+        if suffix in quarter:
+            return year, quarter[suffix]
+        # The end of a YTD/TTM interval cannot be inferred from its label.
+        # Only a strictly later fiscal year can safely establish recency.
+        return year, 0
+
     annual_only = {}
     for entity, rows in by_entity.items():
-        if {row['category'] for row in rows} != {'annual'}:
+        annual_rows = [row for row in rows if row['category'] == 'annual']
+        if not annual_rows:
             continue
-        dates = [_timestamp(row['published_or_filing_time']) for row in rows]
-        valid_dates = [stamp for stamp in dates if stamp is not None]
-        if valid_dates:
-            annual_only[entity] = max(valid_dates)
+        newest_annual = max(annual_rows, key=lambda row: period_position(row) or (0, 0))
+        annual_position = period_position(newest_annual)
+        if annual_position is None:
+            continue
+        if any(row['category'] != 'annual' and (position := period_position(row)) is not None
+               and position > annual_position for row in rows):
+            continue
+        annual_stamp = _timestamp(newest_annual['published_or_filing_time'])
+        if annual_stamp is not None:
+            annual_only[entity] = annual_stamp
 
     # A company's coverage must never be suppressed by a different company's
     # quarter or later annual report. Explicitly attributable evidence gets an
@@ -263,8 +312,9 @@ def financial_coverage_diagnostics(run):
             findings.append(dict(status='WARN',
                 check_id='financial_coverage_untyped_newer_evidence',
                 entity=entity, evidence_refs=refs,
-                reason='Newer untyped evidence for this entity is not a report inventory: '
-                       'interim coverage remains unverified; no period or filing is inferred'))
+                reason='Newer untyped evidence does not establish the latest typed '
+                       'quarter/YTD/TTM coverage. Unclassified interim rows may exist; '
+                       'their precise coverage remains unknown, and no filing is inferred'))
 
     # No entity ID means no company attribution. A global warning preserves the
     # default-flow non-silence guarantee without inventing ticker provenance.
@@ -275,8 +325,8 @@ def financial_coverage_diagnostics(run):
             findings.append(dict(status='WARN',
                 check_id='financial_coverage_untyped_newer_evidence',
                 entity=None, evidence_refs=refs,
-                reason='Newer untyped evidence has no known entity: interim coverage '
-                       'may be incomplete; source identity and period are unverified'))
+                reason='Newer untyped evidence has no known entity: typed quarter/YTD/TTM '
+                       'coverage may be incomplete; source identity and period are unverified'))
     inventory = {}
     for entry in entries:
         identity = tuple(entry[key] for key in ('entity', 'period', 'category',

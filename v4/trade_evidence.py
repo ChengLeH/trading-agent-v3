@@ -20,7 +20,7 @@ source_horizon 是預測本身的期限，不是文章發布日。長期目標�
 planned_stop_loss={value:非負數,unit:portfolio_pct} 是假設 assumed_fill_price 成交下的計畫損失，
 gap_stress_loss={value:非負數,unit:portfolio_pct,scenario_return_pct:帶方向的報酬率} 是特定情境損失，兩者可留 null。
 上述 value 若採捨入結果，另附 output_rounding={decimal_places:位數,rounding:half_up|half_even}；planned_stop_loss／gap_stress_loss 最少保留 2 位小數，不接受整數或 1 位小數捨入掩蓋損失；不能用任意 tolerance 放過錯算。
-maximum_loss_bound 未獲證明必須是 null；若宣稱有上限，填 {value,unit:portfolio_pct,proof_refs:[]}，
+maximum_loss_bound 未獲證明必須是 null；若宣稱有上限，填 {value,unit:portfolio_pct,proof_refs:[]}，不得附 output_rounding 或 tolerance 偽裝經算術認證；
 由既有語義驗證核對完整前提及適用範圍。歷史最大跳空、ATR、停損指令或預計成交價均不是損失上限證明。
 宣稱 fill_guaranteed=true 時必須另附 guarantee_refs，驗證員仍須核對保證是否確實存在及適用；程式不認證交易可成交。
 未知維度明寫 null/unknown，不能捏造日期、滑價、催化劑或使用者風險預算；WAIT 不必捏造上述交易條件。
@@ -134,6 +134,10 @@ def validate_trade_evidence(trade, known_refs):
             adverse = -move if trade['direction'] == 'BUY' else move
             expected = max(number(0), adverse * number(trade['position_pct']) / 100)
         if key == 'maximum_loss_bound':
+            # No arithmetic kernel certifies this semantic hard bound.
+            # A rounding declaration or tolerance would imply false precision.
+            if 'output_rounding' in row or 'tolerance' in row:
+                raise ValueError('trade.maximum_loss_bound forbids output_rounding and tolerance')
             references(row, 'proof_refs', required=True)
         if expected is not None:
             try:

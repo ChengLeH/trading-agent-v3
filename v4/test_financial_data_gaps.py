@@ -31,6 +31,45 @@ class FinancialSourceContracts(unittest.TestCase):
         report = orch.build_facts(rid)
         return orch, rid, report
 
+    def test_legacy_builder_view_strips_invalid_total_debt_without_mutating_raw(self):
+        # Regression for the distinct total_debt/reported_total_debt gap, not
+        # just invalid short/long component normalization in canonical Facts.
+        from copy import deepcopy
+        import math
+        from .financial_data import prepare_legacy_builder_view
+        for invalid in (-5, -0.5, float('nan'), float('inf'), 'bad'):
+            for field in ('total_debt', 'reported_total_debt'):
+                with self.subTest(invalid=repr(invalid), field=field):
+                    row = dict(fiscal_year=2025, long_term_debt=12,
+                               total_debt=20, reported_total_debt=20)
+                    row[field] = invalid
+                    original = fundamentals_record(dict(balance=[row], income=[], cash_flow=[]))
+                    copied = deepcopy(original)
+                    prepare_legacy_builder_view([copied])
+                    kept = copied.payload['balance'][0]
+                    self.assertNotIn(field, kept)
+                    self.assertEqual(kept['long_term_debt'], 12)
+                    other = 'reported_total_debt' if field == 'total_debt' else 'total_debt'
+                    self.assertEqual(kept[other], 20)
+                    raw = original.payload['balance'][0][field]
+                    if isinstance(invalid, float) and math.isnan(invalid):
+                        self.assertTrue(math.isnan(raw))
+                    else:
+                        self.assertEqual(raw, invalid)
+
+        original = fundamentals_record(dict(balance=[
+            dict(fiscal_year=2025, short_term_debt=-5,
+                 current_portion_of_long_term_debt=-0.5,
+                 long_term_debt=float('inf'),
+                 total_debt='invalid', reported_total_debt=-3)], income=[], cash_flow=[]))
+        copied = deepcopy(original)
+        prepare_legacy_builder_view([copied])
+        kept = copied.payload['balance'][0]
+        for field in ('short_term_debt', 'current_portion_of_long_term_debt',
+                      'long_term_debt', 'total_debt', 'reported_total_debt'):
+            self.assertNotIn(field, kept)
+            self.assertIn(field, original.payload['balance'][0])
+
     def test_row_dimensions_override_legacy_defaults_and_keep_availability(self):
         orch, rid, _ = self.build({
             "income": [{"fiscal_year": 2025, "total_revenue": 100,

@@ -38,6 +38,38 @@ class FinancialGate(unittest.TestCase):
         self.assertEqual(row['status'], 'WARN')
         self.assertFalse(blocked)
 
+    def test_coverage_warnings_reach_stage_findings_without_blocking(self):
+        from v3.facts import Fact
+        from v3.evidence import EvidencePacket
+        runner = seeded()
+        runner.run.manifest['as_of'] = '2031-08-10'
+        runner.run.fact_store.add(Fact('fact.annual', 100, 'USD', 'FY2030',
+            concept='Revenue', source_id='statements', entity='ACME',
+            period_coverage='annual', published_or_filing_time='2031-02-01'))
+        runner.run.evidence_store.add(EvidencePacket('ev.new', 'unspecified news',
+            'news', 'news_json', 'row.1', entity='ACME',
+            published_or_filing_time='2031-08-09'))
+        rows, blocked = runner.orch.validate_stage(runner.run_id, 'final')
+        warn = next(row for row in rows
+            if row['check_id'] == 'financial_coverage_untyped_newer_evidence')
+        self.assertEqual(warn['status'], 'WARN')
+        self.assertEqual(warn['entity'], 'ACME')
+        self.assertEqual(warn['evidence_refs'], ['ev.new'])
+        self.assertFalse(blocked)
+
+    def test_unknown_fact_entity_warning_reaches_stage(self):
+        from v3.facts import Fact
+        runner = seeded()
+        runner.run.manifest['as_of'] = '2031-08-10'
+        runner.run.fact_store.add(Fact('fact.no-issuer', 100, 'USD', 'FY2030',
+            concept='Revenue', source_id='statements', entity='',
+            period_coverage='annual', published_or_filing_time='2031-02-01'))
+        rows, blocked = runner.orch.validate_stage(runner.run_id, 'final')
+        warn = next(row for row in rows if row['check_id'] == 'financial_coverage_entity_unknown')
+        self.assertEqual(warn['status'], 'WARN')
+        self.assertEqual(warn['ref_id'], 'fact.no-issuer')
+        self.assertFalse(blocked)
+
     def test_fresh_manifest_preserves_evidence_only_report_declaration(self):
         with tempfile.TemporaryDirectory() as root:
             source = Path(root) / 'release.txt'

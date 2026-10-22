@@ -1,7 +1,7 @@
 """Shared semantic obligations for existing LLM stages, not a new classifier."""
-FINANCIAL_REVIEW_VERSION = 'financial-evidence/8'
+FINANCIAL_REVIEW_VERSION = 'financial-evidence/9'
 FINANCIAL_REVIEW_CONTRACT = '''
-金融證據契約 financial-evidence/8：這些是語義核對責任，不是以字詞命中判錯。
+金融證據契約 financial-evidence/9：這些是語義核對責任，不是以字詞命中判錯。
 來源原始值、計算值與展示值須區分；assertion.value 保留 canonical 值。
 可另附 assertion.presentation={value,unit,decimal_places,rounding:half_up|half_even} 明示換單位與捨入。
 合理四捨五入或不同抓取時點造成的小差異，若來源、時間與精度足以解釋，不列重大錯誤；
@@ -28,7 +28,7 @@ GAAP P/E 算對不代表已證明便宜；淨利減營業利益不等於可直�
 預測期間與交易持有期間須分開核對：長期目標價不能直接充當短期交易目標、到期前報酬或同一期間的風險報酬比；跨期間使用須明示時間橋接、催化事件、估值與退出假設，無依據時只能作背景或情境。交易有效期限、預計持有期、來源預測期間未知時不得補猜，也不得僅因引用長期預測就否決明確限定為背景的歷史分析。
 停損觸發價不是保證成交價；停損單、限價停損單、成交假設、滑價、流動性、跳空、盤中或盤外條件須分開說明。依觸發價計算的部位風險或帳戶損失只在明示成交假設下成立，不能直接稱為實際最大損失、保本或硬上限。
 歷史樣本不是未來最大損失的硬上限；歷史跌幅乘部位權重只代表該情境下、該分母與槓桿假設的帳戶損失，不是尾端風險保證、使用者可接受的風險預算或已證明能遵守的政策。不得從情境數字反推使用者政策；缺少實際明示的政策時，將部位與損失限定為分析者假設。
-目前財務或交易結論須核對截至 as_of 已發布且與命題相關的年度與期中資料，分開 received（來源或證據已收到）與 structured（同期間、版本已有結構化數值）。新聞提到最新報表不代表財務 Fact 已涵蓋；年度資料不能自動替代最新期中報表，單季、累計 YTD、滾動 TTM 不能互換。依明示 publication、period、coverage 與來源引用判斷；不得從年份、抓取日、公司所在地或文句猜最新應有報表或強制套用某國表單。未知可用性須說未知，已知本次未提供須說本次未提供。financial_coverage 診斷僅描述明示 metadata；WARN 不等於自動否決或語義合格，仍須在既有審查中核對用途。歷史分析仍可使用舊報表，須限定期間與用途；明示 financial_coverage_requirements 才構成對應的收件及結構化門檻，不得自行發明強制最新報表政策。
+目前財務或交易結論須核對截至 as_of 已發布且與命題相關的年度與期中資料，分開 received（來源或證據已收到）與 structured（同期間、版本已有結構化數值）。新聞提到最新報表不代表財務 Fact 已涵蓋；年度資料不能自動替代最新期中報表，單季、累計 YTD、滾動 TTM 不能互換。歷史季報不能證明最新年報之後已有期中覆蓋，不能因存有過期季度 Fact 而消除近期覆蓋的 WARN；期中資料期間分類未知也不代表完全沒有期中資料。主體缺失的 Fact 不得自動歸給分析標的，只有相符且唯一的來源身分可補足其歸屬；來源仍未知時只能標明未知，不能認證同主體 structured PASS。依明示 publication、period、coverage 與來源引用判斷；不得從年份、抓取日、公司所在地或文句猜最新應有報表或強制套用某國表單。未知可用性須說未知，已知本次未提供須說本次未提供。financial_coverage 診斷僅描述明示 metadata；WARN 不等於自動否決或語義合格，仍須在既有審查中核對用途。歷史分析仍可使用舊報表，須限定期間與用途；明示 financial_coverage_requirements 才構成對應的收件及結構化門檻，不得自行發明強制最新報表政策。
 '''.strip()
 
 from .trade_evidence import TRADE_EVIDENCE_INSTRUCTIONS
