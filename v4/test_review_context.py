@@ -13,6 +13,121 @@ from .test_integration import seeded, review_all, global_verdict
 
 
 class ReviewContext(unittest.TestCase):
+    def test_report_warning_joins_typed_report_refs_without_guessing_an_entity(self):
+        from .review_diagnostics import project_diagnostics
+        report = dict(entity='ACME', period='FY2030', category='annual', source_refs=['filing'],
+                      fact_refs=[], entity_provenance=[])
+        finding = dict(entity='ACME', period='FY2030', category='annual', status='WARN',
+                       check_id='latest_report_not_structured', reason='retain this warning')
+        section = dict(section='financial_coverage', latest=[report], findings=[finding])
+        local = project_diagnostics([section], [dict(refs=['filing'])], {})
+        self.assertEqual(local['findings'][0]['finding'], finding)
+        self.assertEqual(local['findings'][0]['report_context'], [report])
+        self.assertEqual(project_diagnostics([section], [dict(refs=['other'])], {})['findings'], [])
+
+    def test_diagnostics_select_typed_ids_and_dependencies_never_reason_prose(self):
+        from .review_diagnostics import project_diagnostics
+        rows = [dict(check_id=key, status='WARN', **fields) for key, fields in (
+            ('entity', dict(entity='ACME')),
+            ('source', dict(source_id='source.used', entity='OTHER')),
+            ('ref', dict(ref_id='fact.used')),
+            ('parent', dict(entity='PARENT')),
+            ('different_id', dict(ref_id=' fact.used ')),
+            ('prose', dict(entity='OTHER', reason='ACME fact.used source.used')))]
+        projected = project_diagnostics([dict(section='coverage', findings=rows)],
+            [dict(bindings=[dict(entity='ACME')]), dict(bindings=[dict(entity='PARENT')])],
+            {'fact.used': dict(kind='fact', value=dict(source_id='source.used'))})
+        self.assertEqual({r['check_id'] for r in projected['findings']},
+                         {'entity', 'source', 'ref', 'parent'})
+        self.assertFalse(projected['requires_scoped_review'])
+        literal_id = project_diagnostics([dict(section='coverage', findings=[dict(
+            ref_id='unknown', check_id='literal_source', status='WARN')])],
+            [dict(refs=['unknown'])], {})
+        self.assertEqual(literal_id['findings'][0]['check_id'], 'literal_source')
+
+    def test_requirement_failures_and_source_limitations_are_not_lost(self):
+        from .review_diagnostics import project_diagnostics
+        requirement = dict(status='FAIL', reason='not structured',
+                           requirement=dict(entity='ACME', source_refs=['filing']))
+        section = dict(section='cash_flow', source_id='filing', coverage=[dict(unrelated='inventory')],
+                       limitations=['Original source limitation, not a guessed finding.'])
+        view = project_diagnostics([dict(section='financial_coverage', requirements=[requirement]), section],
+                                   [dict(bindings=[dict(entity='ACME')])],
+                                   {'fact': dict(kind='fact', value=dict(source_id='filing'))})
+        self.assertEqual(view['findings'][0]['finding'], requirement)
+        context = next(r['finding'] for r in view['findings'] if r['collection'] == 'source_context')
+        self.assertEqual(context['limitations'], section['limitations'])
+        self.assertNotIn('coverage', context)
+
+    def test_related_diagnostics_exact_budget_and_fail_overflow_are_explicit(self):
+        from .review_diagnostics import project_diagnostics, canonical_bytes
+        finding = dict(check_id='bound', status='WARN', entity='ACME', reason='x' * 600)
+        diagnostics = [dict(section='coverage', findings=[finding])]
+        claims = [dict(bindings=[dict(entity='ACME')])]
+        complete = project_diagnostics(diagnostics, claims, {})
+        cap = len(canonical_bytes({key: complete[key] for key in ('findings', 'truncation')}))
+        fit = project_diagnostics(diagnostics, claims, {}, max_bytes=cap)
+        over = project_diagnostics(diagnostics, claims, {}, max_bytes=cap - 1)
+        self.assertFalse(fit['truncation']['truncated'])
+        self.assertTrue(over['truncation']['truncated'])
+        self.assertEqual(over['truncation']['omitted_check_ids'], ['bound'])
+        self.assertEqual(over['truncation']['omitted_count'], 1)
+        self.assertTrue(over['requires_scoped_review'])
+        finding['status'] = 'FAIL'
+        over = project_diagnostics(diagnostics, claims, {}, max_bytes=256)
+        self.assertEqual(over['findings'][0]['finding'], finding)
+        self.assertTrue(over['requires_scoped_review'])
+        self.assertFalse(over['truncation']['truncated'])
+        self.assertTrue(over['overflow'])
+
+    def test_report_sidecar_links_the_full_snapshot_diagnostics(self):
+        from .reporting import render_report
+        from .schema import digest
+        runner = seeded()
+        snapshot = runner.orch.snapshot(runner.run_id)
+        snapshot['ingestion_diagnostics'] = [dict(section='coverage', findings=[dict(
+            check_id='anything', status='WARN', entity='OTHER', reason='retain original')])]
+        sidecar = render_report(snapshot)['sidecar']
+        self.assertEqual(sidecar['diagnostics_sha256'], digest(snapshot['ingestion_diagnostics']))
+        self.assertEqual(sidecar['ingestion_diagnostics'], snapshot['ingestion_diagnostics'])
+        self.assertEqual(sidecar['diagnostics_mode'], 'summary+relevant')
+
+    def test_unrelated_diagnostics_never_change_atomic_wire_or_receipt_hash(self):
+        from .atomic_phase6 import build_atomic_prompt
+        from .agent_reviews import _item_wire_bytes
+        from .semantic_contracts import semantic_review_schema
+        from .schema import digest
+        runner = seeded()
+        rows = [dict(status='WARN', check_id='coverage_unknown', entity='OTHER',
+                     ref_id=f'other.{i}', reason='unchanged full diagnostic ' * 50)
+                for i in range(90)]
+        wires, hashes = [], []
+        for extra in (rows, rows + [dict(status='FAIL', check_id='other_failure', entity='OTHER',
+                                        ref_id='other.new', reason='not this claim')]):
+            with patch('v4.atomic_phase6.ingestion_diagnostics', return_value=[
+                    dict(section='financial_coverage', findings=extra)]):
+                task = build_atomic_tasks(runner.run)[0]
+            prompt = build_atomic_prompt(task, verification_epoch='fixed')
+            wires.append(prompt)
+            hashes.append(digest(task.to_dict()))
+            self.assertLessEqual(_item_wire_bytes(prompt, semantic_review_schema(task.claim)), 65536)
+        self.assertEqual(wires[0], wires[1])
+        self.assertEqual(hashes[0], hashes[1])
+
+    def test_related_diagnostics_are_complete_and_context_versioned(self):
+        runner = seeded()
+        cid = runner.run.claims[0]['claim_id']
+        runner.run.claims[0]['bindings'] = [dict(ref_id='fact.ref', entity='ACME')]
+        finding = dict(status='WARN', check_id='unknown_metric', entity='ACME',
+                       reason='Source text remains complete. Do not guess a metric.')
+        with patch('v4.atomic_phase6.ingestion_diagnostics', return_value=[
+                dict(section='financial_coverage', findings=[finding])]):
+            task = next(t for t in build_atomic_tasks(runner.run) if t.claim_id == cid)
+        view = task.context['evidence_scope']['ingestion_diagnostics']
+        self.assertEqual(view['mode'], 'summary+relevant')
+        self.assertEqual(view['findings'][0]['finding'], finding)
+        self.assertEqual(task.context['review_context_format'], 'v4-review-context/2')
+
     def test_global_and_completion_are_single_response_requests(self):
         from .review_context import SINGLE_REVIEW_INSTRUCTIONS
         runner = seeded(); review_all(runner)

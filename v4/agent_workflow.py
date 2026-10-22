@@ -24,6 +24,7 @@ from .runner import PHASE_2_ROLES, PHASE_3_ROLES, PipelineRunnerV4
 from .schema import Claim, digest
 from .storage import write_json
 from .financial_review import FINANCIAL_REVIEW_VERSION
+from .review_diagnostics import REVIEW_CONTEXT_FORMAT
 
 ROLE_GROUPS = (PHASE_2_ROLES, PHASE_3_ROLES, ("research_manager",), ("trader",), ("risk_manager",))
 ALL_ROLES = tuple(role for group in ROLE_GROUPS for role in group)
@@ -137,6 +138,7 @@ class NativeWorkflow:
         instance.queue.create(deepcopy(checkpoint), runner._hash())
         with instance.queue.transaction() as state:
             state["financial_review_contract"] = FINANCIAL_REVIEW_VERSION
+            state["review_context_format"] = REVIEW_CONTEXT_FORMAT
         return instance
 
     @classmethod
@@ -202,9 +204,16 @@ class NativeWorkflow:
                 previous.pop('financial_review_contract', None)
             else:
                 previous['financial_review_contract'] = old_version
-            if digest(previous) != state['input_hash'] or old_version == FINANCIAL_REVIEW_VERSION:
+            old_context = state.get('review_context_format')
+            if old_context is None:
+                previous.pop('review_context_format', None)
+            else:
+                previous['review_context_format'] = old_context
+            unchanged = old_version == FINANCIAL_REVIEW_VERSION and old_context == REVIEW_CONTEXT_FORMAT
+            if digest(previous) != state['input_hash'] or unchanged:
                 raise ValueError('native canonical hash mismatch; refuse implicit state migration')
             upgrade = dict(previous_contract=old_version, current_contract=FINANCIAL_REVIEW_VERSION,
+                previous_context_format=old_context, current_context_format=REVIEW_CONTEXT_FORMAT,
                 before_hash=state['input_hash'], after_hash=current_hash,
                 role_candidates=deepcopy(state.get('role_candidates', {})),
                 pending_patch=deepcopy(runner.pending_patch))
@@ -219,7 +228,9 @@ class NativeWorkflow:
             runner.status = 'resumed:requires_verification'
             for packet in state.get('packets', {}).values():
                 if not packet.get('retired'):
-                    packet.update(retired=True, retirement_reason='financial_review_contract_upgraded')
+                    packet.update(retired=True, retirement_reason=(
+                        'financial_review_contract_upgraded' if old_version != FINANCIAL_REVIEW_VERSION
+                        else 'review_context_format_upgraded'))
             state['active_packet_id'] = None
             for key in ('role_candidates', 'role_errors', 'group_error', 'patch_prompt', 'accepted_links',
                         'patch_blocked', 'link_blocked', 'review_blocked', 'global_blocked'):
@@ -232,6 +243,7 @@ class NativeWorkflow:
         state["checkpoint"] = json_read(self.checkpoint_path)
         state["input_hash"] = runner._hash()
         state["financial_review_contract"] = FINANCIAL_REVIEW_VERSION
+        state["review_context_format"] = REVIEW_CONTEXT_FORMAT
 
     def _expected_group(self, runner):
         completed = {claim["author_role"] for claim in runner.run.claims}

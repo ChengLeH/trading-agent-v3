@@ -7,6 +7,8 @@ from copy import deepcopy
 import json
 from .cloud import structured_prompt
 from .schema import digest
+from .review_diagnostics import DIAGNOSTICS_INSTRUCTIONS
+from .financial_review import FINANCIAL_REVIEW_CONTRACT
 from .semantic_contracts import REFERENCE_INSTRUCTIONS, SEMANTIC_REVIEW_CONTRACT, review_ref_ids, semantic_review_schema
 
 BATCH_INSTRUCTIONS = """你是 V4 語義驗證員。對 tasks 中每一條 Claim 分別完整審查，不得省略或以整批多數決。
@@ -24,7 +26,7 @@ resolved_ref_ids 指向 evidence_catalog；dependency_claim_ids 指向 dependenc
 "findings":[{"issue":"問題","evidence":"證據","suggested_fix":"必要修正"}],
 "clarity_notes":[{"issue":"輕微措辭提醒","reason":"不改變主張的原因"}]}]}。
 逐條回報，不能把不相關真實來源綁到錯誤命題而判 PASS。
-""" + REFERENCE_INSTRUCTIONS
+""" + REFERENCE_INSTRUCTIONS + '\n' + FINANCIAL_REVIEW_CONTRACT + '\n' + DIAGNOSTICS_INSTRUCTIONS
 
 
 def batch_schema(tasks):
@@ -114,3 +116,13 @@ def unpack_review_result(result, expected_ids):
             raise ValueError("unknown or duplicate batched review Claim ID")
         output[cid] = row
     return output
+
+
+def unpack_prepared_review_result(request, result):
+    """Honor the schema issued by prepare, including intact single-item fallback."""
+    ids = request['claim_ids']
+    if 'results' in request['response_schema'].get('properties', {}):
+        return unpack_review_result(result, ids)
+    if len(ids) != 1:
+        raise ValueError('single review schema requires exactly one Claim ID')
+    return unpack_review_result(dict(results=[result]), ids)

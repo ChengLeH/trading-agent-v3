@@ -127,6 +127,7 @@ def main(argv=None):
                 runner.review_batch_size = args.review_batch_size
             if args.review_batch_max_bytes is not None:
                 runner.review_batch_max_bytes = args.review_batch_max_bytes
+                runner.review_deep_batch_max_bytes = args.review_batch_max_bytes
             runner.journal = RunJournal(out, resume_from=args.resume, retry_roles=args.retry_role,
                                         continue_verification=not args.fresh_verification)
             patch_result = None
@@ -149,7 +150,8 @@ def main(argv=None):
                                       global_dependency_batch_size=args.global_dependency_batch_size or 12,
                                       max_contract_attempts=args.max_contract_attempts if args.max_contract_attempts is not None else 3,
                                       review_batch_size=args.review_batch_size or 1,
-                                      review_batch_max_bytes=args.review_batch_max_bytes or 65536)
+                                      review_batch_max_bytes=args.review_batch_max_bytes or 65536,
+                                      review_deep_batch_max_bytes=args.review_batch_max_bytes or 131072)
             runner.journal = RunJournal(out, retry_roles=args.retry_role)
             clients = _cloud_clients(args, out)
             result = runner.execute(manifest["subject"]["ticker"], manifest, clients["author"], clients["verifier"], clients["deep"], clients["global"])

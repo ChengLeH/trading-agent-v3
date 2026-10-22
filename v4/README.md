@@ -412,13 +412,47 @@ python -m v4.agent_cli next --work-dir RUN
 
 ### Native 審查與來源修復入口
 
-審查預算分為單項 context（`review_batch_max_bytes`）與整包（`review_packet_max_bytes`）。
+審查預算分為單項 context 與整包（`review_packet_max_bytes`）。atomic 的
+`review_batch_max_bytes` 預設 65,536 bytes；deep 的 `review_deep_batch_max_bytes`
+獨立預設 131,072 bytes。checkpoint 保存兩者，舊 checkpoint 缺少 deep 設定時採新預設。
 Native 與直接執行均先保存可審項目的收據，超限項保持未驗證並列出 ID／實際 UTF-8 bytes；不截斷內容、不預設 PASS。
 `init` 可帶 `--review-batch-max-bytes`／`--review-packet-max-bytes`；既有 run 用正式入口調整，不能手改 agent-state/checkpoint：
 
 ```sh
 python -m v4.agent_cli configure-reviews --work-dir RUN --review-batch-max-bytes 131072 --review-packet-max-bytes 262144 --reason "operator approved context capacity"
 ```
+
+`configure-reviews` 的明示單項上限會同時套用 atomic 與 deep，整包上限仍另行限制。
+超限診斷列出 `own_evidence_bytes`、`shared_context_bytes`、`schema_bytes`；三者合計
+為實際 `wire_bytes`。own 是 Claim、相依論述及引用物件的 canonical JSON 內容，
+shared 是扣除上述內容及 schema 後的 wire 餘額，包含指令與格式開銷。
+
+`v4-review-context/2` 的 atomic/deep item 不再內嵌整份 ingestion diagnostics。
+只依明示 entity、source/ref ID 與依賴物件取局部投影，不從 finding prose 猜歸屬；
+coverage requirements 的 FAIL 與來源層 limitations 也保留。局部 hash、計數與全文
+只描述這個投影；無關診斷的新增不會改變該 item 或它的收據 hash。
+「無關」須無重疊的 typed entity/source/ref；共用來源的同業警告仍屬相關。
+既有的小型全 run catalog metadata（計數、概念、來源摘要）維持不變，用於資料缺漏
+陳述的核對；因此新增 Fact/SourceRecord 仍可能使收據失效。本輪不將該既有契約
+改成完全局部資料目錄，嚴格的「新增任何無關資料也不改 item」尚非本版保證。
+完整診斷仍留在 snapshot、global review 與 sidecar；sidecar 的 `diagnostics_index`、
+`diagnostics_sha256` 可核對該完整副本，`diagnostics_mode` 為 `summary+relevant`。
+
+相關診斷預算常數 `RELATED_DIAGNOSTICS_MAX_BYTES` 預設 16,384 bytes。
+整筆保留、FAIL 優先，不切斷診斷原文；若任何項目無法附全，會明示
+`truncation.omitted_check_ids/omitted_count`，FAIL 本身超限則保留 FAIL 並標明 overflow。
+該 item 以 `related_diagnostics_incomplete` 保持未驗證，其他可審 item 可繼續，
+不能僅提高一般封包上限就假裝補齊診斷。須縮小結構化範圍或明示調整相關診斷預算。
+升級 context 格式會使舊審查收據失效，需重驗；不修改原始 Claim、來源或既有交付檔案。
+
+離線量測入口（唯讀 checkpoint、不呼叫模型、不重發舊裁決收據）：
+
+```sh
+python -m v4.replay_review_diagnostics RUN/checkpoint.json > review-context-measurement.json
+```
+
+輸出包含逐條 wire bytes、超預算數與省略數。`full_embedding_estimate_bytes` 是使用
+目前 boilerplate 模擬整份內嵌的估計，不是歷史 wire；量測不等於真實模型語義驗收。
 
 Claim 的 `kind=event` 只能綁定已註冊目錄事件，不能把新聞 evidence ID 當 event ID，或將一般新聞全部標成 aggregate。
 一般敘述可使用 `kind=text`；需要量化事件及合計關係時，主 Agent 提供完整 catalog：

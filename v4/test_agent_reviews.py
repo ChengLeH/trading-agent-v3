@@ -181,9 +181,17 @@ print(json.dumps(dict(result=result, serialized_definitions=json.dumps(definitio
 
     def test_oversized_first_claim_does_not_starve_siblings_and_budget_is_resumable(self):
         from .agent_reviews import configure_review_budget
+        from v3.evidence import EvidencePacket
         with tempfile.TemporaryDirectory() as root:
             r = seeded()
-            r.run.claims[0]['text'] = 'long evidence analysis ' * 6000
+            claim_a = next(c for c in r.run.claims if c['claim_id'] == 'independent')
+            evidence_id = 'evidence.large-review-input'
+            r.run.evidence_store.add(EvidencePacket(
+                evidence_id=evidence_id, claim_candidate='x' * (70 * 1024),
+                source_id='fixture.large', source_type='news_json', source_span='fixture span'))
+            claim_a['refs'].append(evidence_id)
+            claim_a['bindings'].append(dict(ref_id=evidence_id,
+                **{name: 'unknown' for name in ('entity','concept','period','scope','unit','basis')}))
             source = Path(root) / 'large.json'; save_checkpoint(r, source)
             w = NativeReviewWorkflow.from_checkpoint(source, Path(root) / 'native')
             accepted = []
@@ -192,19 +200,33 @@ print(json.dumps(dict(result=result, serialized_definitions=json.dumps(definitio
                 if packet.get('blocked'):
                     break
                 self.assertEqual(packet['kind'], 'atomic', packet)
-                self.assertNotIn('a', packet['items'])
+                self.assertNotIn('independent', packet['items'])
                 accepted.extend(packet['items'])
                 w.submit(packet['packet_id'], {cid: response(cid, item) for cid,item in packet['items'].items()},
                          'host/test', packet['input_hash'])
             self.assertTrue(accepted)
             self.assertEqual(packet['status'], 'blocked:review_context_budget')
-            self.assertIn('a', [x['claim_id'] for x in packet['oversized_items']])
-            changed = configure_review_budget(w, max_item_bytes=500000, max_packet_bytes=700000,
+            self.assertIn('independent', [x['claim_id'] for x in packet['oversized_items']])
+            blocked_item = next(row for row in packet['oversized_items'] if row['claim_id'] == 'independent')
+            self.assertGreater(blocked_item['own_evidence_bytes'], 70 * 1024)
+            self.assertEqual(blocked_item['wire_bytes'], blocked_item['own_evidence_bytes'] +
+                             blocked_item['shared_context_bytes'] + blocked_item['schema_bytes'])
+            changed = configure_review_budget(w, max_item_bytes=128 * 1024, max_packet_bytes=700000,
                                              reason='operator approved larger review context')
             self.assertEqual(changed['status'], 'review_budget_updated')
+            with w.queue.transaction() as state:
+                configured = w._load(state)
+                self.assertEqual(configured.review_batch_max_bytes, 128 * 1024)
+                self.assertEqual(configured.review_deep_batch_max_bytes, 128 * 1024)
             next_packet = NativeReviewWorkflow(w.directory).next()
-            self.assertIn('a', next_packet['items'])
+            self.assertIn('independent', next_packet['items'])
             self.assertFalse(set(accepted).intersection(next_packet['items']))
+            w.submit(next_packet['packet_id'], {'independent': response('independent',
+                     next_packet['items']['independent'], 'SUSPICIOUS')},
+                     'host/test', next_packet['input_hash'])
+            deep_packet = NativeReviewWorkflow(w.directory).next()
+            self.assertEqual(deep_packet.get('kind'), 'deep', deep_packet)
+            self.assertIn('independent', deep_packet['items'])
 
     def test_cli_review_budget_flags_are_available_without_changing_claim_hash(self):
         from .agent_cli import main

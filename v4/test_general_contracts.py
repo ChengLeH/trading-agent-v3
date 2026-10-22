@@ -527,6 +527,61 @@ else:
 
 
 class RoleAndPendingUpgrade(unittest.TestCase):
+    def test_context_only_upgrade_retires_old_checkpoint_progress_and_pending_patch(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from .test_integration import review_all, global_verdict
+        from .checkpoint import save_checkpoint, load_checkpoint
+        from .schema import digest
+        for stage in ('global_progress', 'pending_patch'):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as root:
+                runner = seeded(); review_all(runner)
+                if stage == 'global_progress':
+                    runner.prepare_phase6_global_sweep()
+                    result = global_verdict(runner)
+                    result['dependency_reviews'] = result['dependency_reviews'][:1]
+                    runner.collect_phase6_global_sweep(result, model_identity='test/global')
+                else:
+                    runner.prepare_phase6_revision_v4([dict(claim_id='a', issue='unresolved premise',
+                        evidence='fixture', suggested_fix='correct')])
+                path = Path(root) / 'legacy.json'; save_checkpoint(runner, path)
+                data = json.loads(path.read_text())
+                old_state = runner._state(); old_state.pop('review_context_format')
+                data.pop('review_context_format', None)
+                key = 'global_review_progress' if stage == 'global_progress' else 'pending_patch'
+                data[key]['input_hash'] = digest(old_state)
+                path.write_text(json.dumps(data))
+                resumed = load_checkpoint(path)
+                self.assertIsNone(resumed.global_review_progress)
+                self.assertIsNone(resumed.pending_patch)
+                self.assertTrue(resumed.contract_migrations)
+                if stage == 'pending_patch':
+                    self.assertTrue(any(f['issue'] == 'unresolved premise'
+                                        for f in resumed.deferred_global_findings))
+
+    def test_context_only_upgrade_retires_native_packets_without_bricking_next(self):
+        import tempfile
+        from .test_agent_reviews import NativeReviews
+        from .schema import digest
+        with tempfile.TemporaryDirectory() as root:
+            workflow = NativeReviews().bootstrap(root)
+            packet = workflow.next()
+            with workflow.queue.transaction() as state:
+                runner = workflow._load(state)
+                old_state = runner._state(); old_state.pop('review_context_format')
+                old_hash = digest(old_state)
+                state['input_hash'] = old_hash
+                state.pop('review_context_format', None)
+                state['checkpoint'].pop('review_context_format', None)
+                state['packets'][packet['packet_id']]['input_hash'] = old_hash
+            current = workflow.next()
+            self.assertEqual(current['kind'], 'atomic', current)
+            self.assertNotEqual(current['packet_id'], packet['packet_id'])
+            with workflow.queue.transaction() as state:
+                self.assertTrue(state['packets'][packet['packet_id']]['retired'])
+                self.assertEqual(state['review_context_format'], 'v4-review-context/2')
+
     def old_contract(self):
         from contextlib import ExitStack
         from unittest.mock import patch

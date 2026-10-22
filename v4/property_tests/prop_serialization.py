@@ -1,5 +1,6 @@
 """Exercise real atomic request construction, including unknown operations."""
 import unittest
+from unittest.mock import patch
 
 from hypothesis import given, strategies as st
 
@@ -30,6 +31,18 @@ def request(order):
 
 
 class AtomicSerializationProperties(unittest.TestCase):
+    @given(st.lists(st.text(alphabet='abcXYZ012_-', min_size=1, max_size=20), max_size=120))
+    def test_unrelated_diagnostic_counts_and_names_preserve_wire_and_hash(self, names):
+        run = make_run([claim('candidate')])
+        results = []
+        for rows in ([], [dict(entity='UNRELATED', ref_id='unbound.' + name,
+                               check_id=name, status='WARN', reason='original text') for name in names]):
+            with patch('v4.atomic_phase6.ingestion_diagnostics', return_value=[
+                    dict(section='coverage', findings=rows)]):
+                task, = build_atomic_tasks(run)
+            results.append((build_atomic_prompt(task, verification_epoch='fixed'), digest(task.to_dict())))
+        self.assertEqual(results[0], results[1])
+
     @given(st.permutations(KINDS))
     def test_calc_insertion_order_preserves_wire_request_and_hash(self, order):
         self.assertEqual(request(order), request(KINDS))

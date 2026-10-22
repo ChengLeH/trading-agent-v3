@@ -23,6 +23,8 @@ from .semantic_contracts import (REFERENCE_INSTRUCTIONS, EVIDENCE_INSTRUCTIONS, 
 
 from .financial_review import FINANCIAL_REVIEW_CONTRACT, FINANCIAL_REVIEW_VERSION, ingestion_diagnostics
 from .source_lineage import project_source_lineage
+from .review_diagnostics import (REVIEW_CONTEXT_FORMAT, DIAGNOSTICS_INSTRUCTIONS,
+                                 project_diagnostics)
 
 CATALOG_DETAIL_MAX_BYTES = 4096
 
@@ -94,12 +96,10 @@ def _evidence_scope(run, facts, calcs, evidence, events):
     calculations = [c for cid, c in calcs.items() if cid not in trade_calcs]
     records = [dict(id=r.id, type=r.type, source_hash=r.source_hash)
                for r in getattr(run, "records", []) if hasattr(r, "source_hash")]
-    diagnostics = ingestion_diagnostics(run)
     concepts = sorted({f["concept"] for f in inputs if f.get("concept")})
     include_concepts = len(json.dumps(concepts, ensure_ascii=False).encode("utf-8")) <= CATALOG_DETAIL_MAX_BYTES
     return dict(scope="current_ingested_catalog_metadata", includes_source_contents=False,
                 counts=dict(facts=len(inputs), calcs=len(calculations), evidence=len(evidence), events=len(events)),
-                **({'ingestion_diagnostics': diagnostics} if diagnostics else {}),
                 fact_concepts=concepts if include_concepts else None,
                 fact_concept_count=len(concepts), fact_concepts_hash=digest(concepts),
                 source_record_count=len(records), source_types=sorted({r["type"] for r in records}),
@@ -141,6 +141,7 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
     evidence = _evidence_dict(run.evidence_store)
     events = getattr(run, "events", {})
     evidence_scope = _evidence_scope(run, facts, calcs, evidence, events)
+    diagnostics = ingestion_diagnostics(run)
     from .financial_statements import source_declarations
     declarations = source_declarations(run)
     claims = claim_index(run.claims)
@@ -216,12 +217,15 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
             resolved_refs=deepcopy(resolved),
             dependency_claims=deps,
             unresolved_refs=unresolved,
-            context={"financial_review_contract": FINANCIAL_REVIEW_VERSION, "as_of": getattr(run, "manifest", {}).get("as_of"),
+            context={"financial_review_contract": FINANCIAL_REVIEW_VERSION,
+                     "review_context_format": REVIEW_CONTEXT_FORMAT,
+                     "as_of": getattr(run, "manifest", {}).get("as_of"),
                      **({'source_declarations': declarations} if declarations else {}),
                      **({"calculation_definitions": definitions} if definitions else {}),
                      **({'indicator_definitions': indicators} if indicators else {}),
                      **({'source_lineage': source_lineage} if source_lineage else {}),
-                     "evidence_scope": deepcopy(evidence_scope),
+                     "evidence_scope": {**deepcopy(evidence_scope),
+                         "ingestion_diagnostics": project_diagnostics(diagnostics, [claim] + deps, resolved)},
                      "trade": deepcopy(getattr(run, "trade", {}))
                      if claim.get("author_role") in {"trader", "risk_manager"} else {}},
         ))
@@ -264,7 +268,7 @@ ATOMIC_INSTRUCTIONS = r"""
   "clarity_notes": [{"issue":"不影響事實或決策的輕微表達提醒","reason":"為何合理解讀不會改變主張"}]
 }
 clarity_notes 可省略。PASS 時 findings 必須是空陣列；小幅措辭提醒不算 finding。
-""".strip() + "\n\n" + REFERENCE_INSTRUCTIONS + "\n" + FINANCIAL_REVIEW_CONTRACT + "\n" + EVIDENCE_REQUEST_INSTRUCTIONS
+""".strip() + "\n\n" + REFERENCE_INSTRUCTIONS + "\n" + FINANCIAL_REVIEW_CONTRACT + "\n" + EVIDENCE_REQUEST_INSTRUCTIONS + "\n" + DIAGNOSTICS_INSTRUCTIONS
 
 
 def build_atomic_prompt(task: AtomicTask, *, verification_epoch=None) -> str:

@@ -10,7 +10,11 @@ from uuid import uuid4
 from .atomic_phase6 import (build_atomic_tasks, build_atomic_prompt, build_reference_supplement_prompt,
                             build_reference_verdict_repair_prompt,
                             summarize_atomic_results)
-from .review_batches import pack_review_requests, unpack_review_result
+from .review_batches import pack_review_requests, unpack_review_result, unpack_prepared_review_result
+from .review_budget import (DEFAULT_ATOMIC_REVIEW_MAX_BYTES, DEFAULT_DEEP_REVIEW_MAX_BYTES,
+                            review_budget_for, review_budget_row,
+                            review_wire_breakdown, task_requires_scoped_review)
+from .review_diagnostics import DIAGNOSTICS_INSTRUCTIONS, REVIEW_CONTEXT_FORMAT
 from .pipeline import OrchestratorV4, ClaimSourceError
 from .reporting import render_report
 from .schema import Claim, claim_index, descendants, digest, id_list
@@ -99,7 +103,9 @@ def require_model_identity(identity):
 
 
 class PipelineRunnerV4:
-    def __init__(self, *, max_revisions=3, max_workers=4, review_batch_size=1, review_batch_max_bytes=65536, max_contract_attempts=3,
+    def __init__(self, *, max_revisions=3, max_workers=4, review_batch_size=1,
+                 review_batch_max_bytes=DEFAULT_ATOMIC_REVIEW_MAX_BYTES,
+                 review_deep_batch_max_bytes=DEFAULT_DEEP_REVIEW_MAX_BYTES, max_contract_attempts=3,
                  global_dependency_batch_size=12):
         if type(max_revisions) is not int or max_revisions < 0:
             raise ValueError("invalid max_revisions")
@@ -115,7 +121,11 @@ class PipelineRunnerV4:
             raise ValueError("review_batch_size must be 1..16")
         if type(review_batch_max_bytes) is not int or review_batch_max_bytes < 1024:
             raise ValueError("review_batch_max_bytes must be >=1024")
-        self.review_batch_size, self.review_batch_max_bytes = review_batch_size, review_batch_max_bytes
+        if type(review_deep_batch_max_bytes) is not int or review_deep_batch_max_bytes < 1024:
+            raise ValueError("review_deep_batch_max_bytes must be >=1024")
+        self.review_batch_size = review_batch_size
+        self.review_batch_max_bytes = review_batch_max_bytes
+        self.review_deep_batch_max_bytes = review_deep_batch_max_bytes
         self._pending_batch_requests = None
         self._pending_deep_batch_requests = None
         self.orch = OrchestratorV4()
@@ -204,7 +214,8 @@ class PipelineRunnerV4:
         return {**{k: s.get(k) for k in ("claims", "facts", "calcs", "evidence", "events", "trade", "as_of")},
                 **({'source_declarations': declarations} if declarations else {}),
                 **({'source_lineage': deepcopy(lineage)} if lineage else {}),
-                "financial_review_contract": FINANCIAL_REVIEW_VERSION}
+                "financial_review_contract": FINANCIAL_REVIEW_VERSION,
+                "review_context_format": REVIEW_CONTEXT_FORMAT}
 
     def _hash(self, state=None):
         return digest(self._state() if state is None else state)
@@ -547,34 +558,122 @@ class PipelineRunnerV4:
         prompts = [(cid, request[0]) for cid, request in requests.items()]
         schemas = {cid: request[1] for cid, request in requests.items()}
         if enforce_budget:
-            self._check_review_budget(prompts, schemas)
+            self._check_review_budget(prompts, schemas, layer="atomic")
         return dict(atomic_prompts=prompts,
                     claim_count=len(pending), total_claim_count=len(tasks), binding_findings=findings,
                     response_contract=SEMANTIC_REVIEW_CONTRACT,
                     response_schemas=schemas)
 
-    def _check_review_budget(self, prompts, schemas):
-        oversized = self._oversized_reviews(prompts, schemas)
+    def _check_review_budget(self, prompts, schemas, *, layer):
+        oversized = self._oversized_reviews(prompts, schemas, layer=layer)
         if oversized:
             row = oversized[0]
-            raise ValueError(f"review_context_too_large: {row['claim_id']} has {row['wire_bytes']} UTF-8 bytes; "
-                             f"budget={self.review_batch_max_bytes}; provide scoped structured evidence")
+            if row["reason"] == "related_diagnostics_incomplete":
+                advice = ("related diagnostics are incomplete; reduce structured refs or adjust the related "
+                          "diagnostics cap; increasing the general item budget cannot restore omitted diagnostics")
+                error = (f"related_diagnostics_incomplete: {row['claim_id']} has incomplete related review evidence; "
+                         f"wire_bytes={row['wire_bytes']}; budget={row['budget_bytes']}; "
+                         f"own_evidence_bytes={row['own_evidence_bytes']}; "
+                         f"shared_context_bytes={row['shared_context_bytes']}; "
+                         f"schema_bytes={row['schema_bytes']}; {advice}")
+            else:
+                error = (f"review_context_too_large: {row['claim_id']} has {row['wire_bytes']} UTF-8 bytes; "
+                         f"budget={row['budget_bytes']}; own_evidence_bytes={row['own_evidence_bytes']}; "
+                         f"shared_context_bytes={row['shared_context_bytes']}; "
+                         f"schema_bytes={row['schema_bytes']}; reason={row['reason']}; "
+                         "provide scoped structured evidence")
+            raise ValueError(error)
 
-    def _oversized_reviews(self, prompts, schemas):
+    def _oversized_reviews(self, prompts, schemas, *, layer):
         oversized = []
+        budget = review_budget_for(self, layer)
         for cid, prompt in prompts:
-            wire = structured_prompt(prompt, json.dumps(schemas[cid], ensure_ascii=False, separators=(",", ":")))
-            size = len(wire.encode("utf-8"))
-            if size > self.review_batch_max_bytes:
-                oversized.append(dict(claim_id=cid, wire_bytes=size, budget_bytes=self.review_batch_max_bytes))
+            row = review_budget_row(cid, prompt, schemas[cid], budget)
+            if row is not None:
+                oversized.append(row)
         return oversized
+
+    def _related_diagnostics_rows(self, tasks, claim_ids, layer):
+        rows = []
+        budget = review_budget_for(self, layer)
+        for cid in claim_ids:
+            task = tasks.get(cid)
+            if task is None or not task_requires_scoped_review(task):
+                continue
+            prompt, schema = self._reference_review_request(
+                task, layer,
+                first_review=self.receipts[cid]["result"] if layer == "deep" else None)
+            row = review_budget_row(cid, prompt, schema, budget)
+            if row is None:
+                row = dict(claim_id=cid, **review_wire_breakdown(prompt, schema),
+                           budget_bytes=budget,
+                           reason="related_diagnostics_incomplete", budget_exceeded=False,
+                           next_action="reduce_structured_refs_or_adjust_related_diagnostics_cap")
+            rows.append(row)
+        return rows
+
+    def _block_related_diagnostics(self, layer, claim_ids, tasks, *, allow_partial=False):
+        rows = self._related_diagnostics_rows(tasks, claim_ids, layer)
+        blocked_ids = [row["claim_id"] for row in rows]
+        if not blocked_ids:
+            return None
+        accepted = self.receipts if layer == "atomic" else self.deep_receipts
+        pending_name = "pending_atomic" if layer == "atomic" else "pending_deep"
+        pending = {cid: h for cid, h in (getattr(self, pending_name) or {}).items()
+                   if cid not in accepted}
+        setattr(self, pending_name, pending)
+        if allow_partial and set(pending) - set(blocked_ids):
+            self.status = layer
+            self._persist()
+            return dict(blocked=False, complete=False, partial=True, status=layer,
+                        pending_claim_ids=list(pending),
+                        related_diagnostics_blocked_claim_ids=blocked_ids)
+        self.status = "blocked:review_context_budget"
+        self._persist()
+        return dict(blocked=True, status=self.status, layer=layer,
+                    reason=("related_diagnostics_incomplete: review evidence was omitted; reduce structured refs "
+                            "or adjust the related diagnostics cap; increasing the general item budget cannot "
+                            "restore omitted diagnostics"),
+                    blocked_claim_ids=blocked_ids, oversized_items=rows,
+                    accepted_claim_ids=sorted(accepted),
+                    next_action="reduce_structured_refs_or_adjust_related_diagnostics_cap")
 
     def _review_requests(self, prompts, layer, *, tasks=None):
         tasks = self._tasks() if tasks is None else tasks
         requests = pack_review_requests([tasks[cid] for cid, _ in prompts], batch_size=self.review_batch_size,
-                                    max_bytes=self.review_batch_max_bytes, verification_epoch=self._verification_epoch,
+                                    max_bytes=review_budget_for(self, layer), verification_epoch=self._verification_epoch,
                                     layer=layer, first_reviews={cid: r["result"] for cid, r in self.receipts.items()})
         return requests
+
+    def _bound_prepared_review_requests(self, requests, prompts, schemas, layer):
+        """Ensure prepared transport batches obey the same layer cap as items.
+
+        The packer retains an oversized single task intact. Prepared public
+        batch APIs instead fall back to the already budget-checked per-Claim
+        prompt so callers never receive a request above that layer's limit.
+        """
+        budget = review_budget_for(self, layer)
+        prompt_by_id = dict(prompts)
+        bounded = []
+        for request in requests:
+            schema = json.dumps(request["response_schema"], ensure_ascii=False,
+                                separators=(",", ":"))
+            wire = structured_prompt(request["prompt"], schema)
+            if len(wire.encode("utf-8")) <= budget:
+                bounded.append(request)
+                continue
+            for cid in request["claim_ids"]:
+                prompt = prompt_by_id[cid]
+                response_schema = schemas[cid]
+                row = review_budget_row(cid, prompt, response_schema, budget)
+                if row is not None:
+                    raise ValueError(f"review_context_too_large: {cid} has {row['wire_bytes']} UTF-8 bytes; "
+                                     f"budget={budget}; own_evidence_bytes={row['own_evidence_bytes']}; "
+                                     f"shared_context_bytes={row['shared_context_bytes']}; "
+                                     f"schema_bytes={row['schema_bytes']}; reason={row['reason']}")
+                bounded.append(dict(request_id=cid, claim_ids=[cid], prompt=prompt,
+                                    response_schema=response_schema))
+        return bounded
 
     def prepare_phase6_atomic_batches(self):
         tasks = self._tasks()
@@ -585,6 +684,8 @@ class PipelineRunnerV4:
                         for cid, prompt in prepared["atomic_prompts"]]
         else:
             requests = self._review_requests(prepared["atomic_prompts"], "atomic", tasks=tasks)
+        requests = self._bound_prepared_review_requests(
+            requests, prepared["atomic_prompts"], prepared["response_schemas"], "atomic")
         self._pending_batch_requests = requests
         return {**prepared, "review_batches": requests, "request_count": len(requests)}
 
@@ -596,7 +697,7 @@ class PipelineRunnerV4:
         results = {}
         for request in self._pending_batch_requests:
             if request["request_id"] in results_by_batch:
-                results.update(unpack_review_result(results_by_batch[request["request_id"]], request["claim_ids"]))
+                results.update(unpack_prepared_review_result(request, results_by_batch[request["request_id"]]))
         summary = self.collect_phase6_atomic(results, model_identity=model_identity)
         self._pending_batch_requests = None
         return summary
@@ -704,10 +805,19 @@ class PipelineRunnerV4:
         tasks = self._tasks()
         all_pending = self.pending_atomic
         pending = self._received_review_scope(all_pending, results_by_claim, allow_partial)
+        related_diagnostics_ids = [cid for cid in all_pending
+                                   if cid in tasks and task_requires_scoped_review(tasks[cid])]
+        pending = {cid: h for cid, h in pending.items() if cid not in related_diagnostics_ids}
+        accepted_results = {cid: row for cid, row in results_by_claim.items()
+                            if cid not in related_diagnostics_ids}
+        if not pending:
+            blocked = self._block_related_diagnostics("atomic", related_diagnostics_ids, tasks, allow_partial=allow_partial)
+            if blocked is not None:
+                return blocked
         if any(cid not in tasks or digest(tasks[cid].to_dict()) != h for cid, h in pending.items()):
             raise ValueError("state changed while atomic review was in flight")
         expected_refs = {cid: review_ref_ids(task.claim) for cid, task in tasks.items()}
-        merged_results, supplement_errors = self._merge_reference_supplements("atomic", results_by_claim, model_identity)
+        merged_results, supplement_errors = self._merge_reference_supplements("atomic", accepted_results, model_identity)
         summary = summarize_atomic_results(pending, merged_results, expected_refs_by_claim=expected_refs,
                                             report_invalid=True)
         summary["supplement_errors"] = supplement_errors
@@ -719,8 +829,18 @@ class PipelineRunnerV4:
         if not summary["complete"]:
             remaining = summary["missing_claim_ids"] + summary["invalid_claim_ids"]
             self.pending_atomic = ({cid: value for cid, value in all_pending.items() if cid not in summary["results"]}
-                                   if allow_partial else {cid: pending[cid] for cid in remaining})
-            return self._contract_retry(summary, tasks, model_identity, "atomic", results_by_claim=merged_results)
+                                   if allow_partial else
+                                   {cid: pending[cid] for cid in remaining} |
+                                   {cid: all_pending[cid] for cid in related_diagnostics_ids})
+            retry = self._contract_retry(summary, tasks, model_identity, "atomic", results_by_claim=merged_results)
+            if related_diagnostics_ids:
+                retry["related_diagnostics_blocked_claim_ids"] = related_diagnostics_ids
+                retry["related_diagnostics_next_action"] = "reduce_structured_refs_or_adjust_related_diagnostics_cap"
+            return retry
+        if related_diagnostics_ids:
+            blocked = self._block_related_diagnostics("atomic", related_diagnostics_ids, tasks, allow_partial=allow_partial)
+            if blocked is not None:
+                return {**summary, **blocked}
         missing = set(tasks) - self.receipts.keys()
         if missing:
             if allow_partial:
@@ -763,7 +883,7 @@ class PipelineRunnerV4:
         prompts = [(cid, request[0]) for cid, request in requests.items()]
         schemas = {cid: request[1] for cid, request in requests.items()}
         if enforce_budget:
-            self._check_review_budget(prompts, schemas)
+            self._check_review_budget(prompts, schemas, layer="deep")
         return dict(deep_prompts=prompts, deep_review_claim_ids=wanted,
                     response_contract=SEMANTIC_REVIEW_CONTRACT,
                     response_schemas=schemas)
@@ -777,6 +897,8 @@ class PipelineRunnerV4:
                         for cid, prompt in prepared["deep_prompts"]]
         else:
             requests = self._review_requests(prepared["deep_prompts"], "deep", tasks=tasks)
+        requests = self._bound_prepared_review_requests(
+            requests, prepared["deep_prompts"], prepared["response_schemas"], "deep")
         self._pending_deep_batch_requests = requests
         return {**prepared, "review_batches": requests, "request_count": len(requests)}
 
@@ -788,7 +910,7 @@ class PipelineRunnerV4:
         results = {}
         for request in self._pending_deep_batch_requests:
             if request["request_id"] in results_by_batch:
-                results.update(unpack_review_result(results_by_batch[request["request_id"]], request["claim_ids"]))
+                results.update(unpack_prepared_review_result(request, results_by_batch[request["request_id"]]))
         summary = self.collect_phase6_deep_review(results, model_identity=model_identity)
         self._pending_deep_batch_requests = None
         return summary
@@ -809,6 +931,7 @@ class PipelineRunnerV4:
                 "claim_id/verdict(PASS|SUSPICIOUS|FAIL)/findings/可選 clarity_notes。PASS 的 findings=[]；"
                 "其他 verdict 至少一項 finding，包含 issue/evidence/suggested_fix。\n"
                 + REFERENCE_INSTRUCTIONS + "\n" + FINANCIAL_REVIEW_CONTRACT + "\n"
+                + DIAGNOSTICS_INSTRUCTIONS + "\n"
                 + EVIDENCE_REQUEST_INSTRUCTIONS, payload)
         return structured_prompt(text, json.dumps(semantic_review_schema(task.claim), ensure_ascii=False, separators=(",", ":")))
 
@@ -819,9 +942,18 @@ class PipelineRunnerV4:
         tasks = self._require_atomic()
         all_pending = self.pending_deep
         pending = self._received_review_scope(all_pending, results_by_claim, allow_partial)
+        related_diagnostics_ids = [cid for cid in all_pending
+                                   if cid in tasks and task_requires_scoped_review(tasks[cid])]
+        pending = {cid: h for cid, h in pending.items() if cid not in related_diagnostics_ids}
+        accepted_results = {cid: row for cid, row in results_by_claim.items()
+                            if cid not in related_diagnostics_ids}
+        if not pending:
+            blocked = self._block_related_diagnostics("deep", related_diagnostics_ids, tasks, allow_partial=allow_partial)
+            if blocked is not None:
+                return blocked
         if any(digest(tasks[cid].to_dict()) != h for cid, h in pending.items()):
             raise ValueError("state changed during deep review")
-        merged_results, supplement_errors = self._merge_reference_supplements("deep", results_by_claim, model_identity)
+        merged_results, supplement_errors = self._merge_reference_supplements("deep", accepted_results, model_identity)
         summary = summarize_atomic_results(pending, merged_results,
                                             expected_refs_by_claim={cid: review_ref_ids(t.claim) for cid, t in tasks.items()},
                                             report_invalid=True)
@@ -833,8 +965,18 @@ class PipelineRunnerV4:
         if not summary["complete"]:
             remaining = summary["missing_claim_ids"] + summary["invalid_claim_ids"]
             self.pending_deep = ({cid: value for cid, value in all_pending.items() if cid not in summary["results"]}
-                                 if allow_partial else {cid: pending[cid] for cid in remaining})
-            return self._contract_retry(summary, tasks, model_identity, "deep", results_by_claim=merged_results)
+                                 if allow_partial else
+                                 {cid: pending[cid] for cid in remaining} |
+                                 {cid: all_pending[cid] for cid in related_diagnostics_ids})
+            retry = self._contract_retry(summary, tasks, model_identity, "deep", results_by_claim=merged_results)
+            if related_diagnostics_ids:
+                retry["related_diagnostics_blocked_claim_ids"] = related_diagnostics_ids
+                retry["related_diagnostics_next_action"] = "reduce_structured_refs_or_adjust_related_diagnostics_cap"
+            return retry
+        if related_diagnostics_ids:
+            blocked = self._block_related_diagnostics("deep", related_diagnostics_ids, tasks, allow_partial=allow_partial)
+            if blocked is not None:
+                return {**summary, **blocked}
         missing = [cid for cid in tasks if self.receipts[cid]["result"]["verdict"] != "PASS"
                    and cid not in self.deep_receipts]
         if allow_partial and missing:
@@ -1979,7 +2121,7 @@ class PipelineRunnerV4:
         require_model_identity(client.identity)
         tasks = self._tasks()
         schemas = {cid:self._reference_review_schema(tasks[cid], layer) for cid,_ in prompts}
-        oversized = self._oversized_reviews(prompts, schemas)
+        oversized = self._oversized_reviews(prompts, schemas, layer=layer)
         excluded = {row['claim_id'] for row in oversized}
         prompts = [(cid,prompt) for cid,prompt in prompts if cid not in excluded]
         for cid, _ in prompts:
@@ -2002,7 +2144,7 @@ class PipelineRunnerV4:
                 for request in batched_requests:
                     wire = structured_prompt(request['prompt'], json.dumps(request['response_schema'],
                         ensure_ascii=False, separators=(',', ':')))
-                    if len(wire.encode('utf-8')) > self.review_batch_max_bytes:
+                    if len(wire.encode('utf-8')) > review_budget_for(self, layer):
                         single_prompts.extend((cid, prompt_index[cid]) for cid in request['claim_ids'])
                     else:
                         bounded.append(request)
@@ -2046,10 +2188,18 @@ class PipelineRunnerV4:
             if oversized:
                 self.status = 'blocked:review_context_budget'
                 self._persist()
+                diagnostic_block = any(row["reason"] == "related_diagnostics_incomplete"
+                                       for row in oversized)
                 return dict(blocked=True, status=self.status, oversized_items=oversized,
-                    reason=f'review_context_too_large: {len(oversized)} items exceed the declared byte budget',
+                    reason=("related_diagnostics_incomplete: review evidence was omitted; reduce structured refs "
+                            "or adjust the related diagnostics cap; increasing the general item budget cannot "
+                            "restore omitted diagnostics"
+                            if diagnostic_block else
+                            f'review_context_too_large: {len(oversized)} items exceed the declared byte budget'),
                     accepted_claim_ids=sorted(self.receipts if layer == 'atomic' else self.deep_receipts),
-                    next_action='increase_review_byte_budget_or_reduce_structured_context')
+                    next_action=("reduce_structured_refs_or_adjust_related_diagnostics_cap"
+                                 if diagnostic_block else
+                                 "increase_review_byte_budget_or_reduce_structured_context"))
             summary = collector(results, model_identity=client.identity)
             if not summary.get("needs_retry"):
                 return summary

@@ -12,20 +12,284 @@ from .checkpoint import load_checkpoint, save_checkpoint
 from .journal import RunJournal
 from .semantic_contracts import semantic_review_schema
 from .schema import digest
+from v3.evidence import EvidencePacket
+from .cloud import structured_prompt
 
 
 class ReviewBatches(unittest.TestCase):
+    def test_prepared_single_fallback_results_follow_the_issued_response_schema(self):
+        from unittest.mock import patch
+        from . import runner as runner_module
+        pack = runner_module.pack_review_requests
+        def padded(*args, **kwargs):
+            requests = pack(*args, **kwargs)
+            for request in requests:
+                request['prompt'] += ' ' * (kwargs['max_bytes'] + 1)
+            return requests
+        for layer in ('atomic', 'deep'):
+            with self.subTest(layer=layer):
+                r = seeded()
+                if layer == 'deep':
+                    r.prepare_phase6_atomic()
+                    r.collect_phase6_atomic({cid: verdict(cid, 'SUSPICIOUS',
+                        ref_ids=reference_ids(task.claim)) for cid, task in r._tasks().items()},
+                        model_identity='test/first')
+                prepare = r.prepare_phase6_atomic_batches if layer == 'atomic' else r.prepare_phase6_deep_review_batches
+                with patch('v4.runner.pack_review_requests', side_effect=padded):
+                    requests = prepare()['review_batches']
+                self.assertTrue(all('claim_id' in req['response_schema']['properties'] for req in requests))
+                replies = {req['request_id']: verdict(req['claim_ids'][0],
+                    ref_ids=reference_ids(r._tasks()[req['claim_ids'][0]].claim)) for req in requests}
+                collect = r.collect_phase6_atomic_batches if layer == 'atomic' else r.collect_phase6_deep_review_batches
+                result = collect(replies, model_identity='test/reviewer')
+                self.assertFalse(result['blocked'], result)
+                receipts = r.receipts if layer == 'atomic' else r.deep_receipts
+                self.assertEqual(set(receipts), set(r._tasks()))
+
     def tasks(self, count):
         r = seeded()
         r.run.claims = [claim(f"claim.{i}") for i in range(count)]
         return r, build_atomic_tasks(r.run)
 
+    def runner_with_large_evidence(self):
+        r = seeded()
+        claim_a = next(c for c in r.run.claims if c["claim_id"] == "independent")
+        evidence_id = "evidence.large-review-input"
+        r.run.evidence_store.add(EvidencePacket(
+            evidence_id=evidence_id,
+            claim_candidate="x" * (70 * 1024),
+            source_id="fixture.large",
+            source_type="news_json",
+            source_span="fixture span",
+        ))
+        claim_a["refs"].append(evidence_id)
+        claim_a["bindings"].append(dict(
+            ref_id=evidence_id,
+            **{name: "unknown" for name in ("entity", "concept", "period", "scope", "unit", "basis")},
+        ))
+        return r
+
+    def test_atomic_and_deep_use_independent_budgets_with_exact_evidence_accounting(self):
+        r = self.runner_with_large_evidence()
+        self.assertEqual(r.review_batch_max_bytes, 64 * 1024)
+        self.assertEqual(r.review_deep_batch_max_bytes, 128 * 1024)
+
+        with self.assertRaisesRegex(ValueError, "own_evidence_bytes"):
+            r.prepare_phase6_atomic_batches()
+
+        atomic = r._prepare_phase6_atomic(r._tasks(), enforce_budget=False)
+        client = CloudDouble()
+        blocked = r._execute_review_batch(client, atomic["atomic_prompts"], r.collect_phase6_atomic,
+                                          layer="atomic")
+        self.assertTrue(blocked["blocked"], blocked)
+        row = next(row for row in blocked["oversized_items"] if row["claim_id"] == "independent")
+        prompt = dict(atomic["atomic_prompts"])["independent"]
+        schema = atomic["response_schemas"]["independent"]
+        wire = structured_prompt(prompt, json.dumps(schema, ensure_ascii=False, separators=(",", ":")))
+        self.assertEqual(row["wire_bytes"], len(wire.encode("utf-8")))
+        self.assertEqual(row["schema_bytes"], len(json.dumps(schema, ensure_ascii=False,
+                                                             separators=(",", ":")).encode("utf-8")))
+        self.assertGreater(row["own_evidence_bytes"], 70 * 1024)
+        self.assertEqual(row["wire_bytes"], row["own_evidence_bytes"] +
+                         row["shared_context_bytes"] + row["schema_bytes"])
+        self.assertEqual(row["budget_bytes"], 64 * 1024)
+        sent_ids = []
+        for sent in client.calls:
+            payload = json.loads(sent.split("```json\n")[1].split("\n```", 1)[0])
+            if "tasks" in payload:
+                sent_ids.extend(row["claim"]["claim_id"] for row in payload["tasks"])
+            if "claim_id" in payload:
+                sent_ids.append(payload["claim_id"])
+        self.assertNotIn("independent", sent_ids)
+
+        tasks = r._tasks()
+        atomic_results = {
+            cid: verdict(cid, "SUSPICIOUS" if cid == "independent" else "PASS",
+                         ref_ids=reference_ids(task.claim))
+            for cid, task in tasks.items()
+        }
+        r.collect_phase6_atomic(atomic_results, model_identity="test/first")
+        deep = r.prepare_phase6_deep_review_batches(["independent"])
+        self.assertEqual(deep["request_count"], 1)
+        class DeepClient(CloudDouble):
+            def complete(self, prompt):
+                self.calls.append(prompt)
+                payload = json.loads(prompt.split("<context-data>\n")[1].split("\n</context-data>")[0])
+                task = payload["task"]
+                return verdict(task["claim_id"], ref_ids=reference_ids(task["claim"]))
+
+        deep_result = r._execute_review_batch(DeepClient(), deep["deep_prompts"],
+                                              r.collect_phase6_deep_review, layer="deep")
+        self.assertFalse(deep_result["blocked"], deep_result)
+        self.assertIn("independent", r.deep_receipts)
+
+    def test_deep_budget_checkpoint_is_persistent_and_old_checkpoints_default_to_128_kib(self):
+        r = seeded()
+        self.assertEqual(r.review_deep_batch_max_bytes, 128 * 1024)
+        r.review_batch_max_bytes = 12345
+        r.review_deep_batch_max_bytes = 196608
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "checkpoint.json"
+            save_checkpoint(r, path)
+            restored = load_checkpoint(path)
+            self.assertEqual(restored.review_batch_max_bytes, 12345)
+            self.assertEqual(restored.review_deep_batch_max_bytes, 196608)
+
+            old = json.loads(path.read_text())
+            old.pop("review_deep_batch_max_bytes")
+            path.write_text(json.dumps(old))
+            legacy = load_checkpoint(path)
+            self.assertEqual(legacy.review_batch_max_bytes, 12345)
+            self.assertEqual(legacy.review_deep_batch_max_bytes, 128 * 1024)
+
+    def test_long_claim_and_premise_are_counted_as_item_evidence(self):
+        r = seeded()
+        child = next(row for row in r.run.claims if row["claim_id"] == "b")
+        premise = next(row for row in r.run.claims if row["claim_id"] == "a")
+        child["dependencies"] = ["a"]
+        child["text"] += " child-premise " + "c" * (20 * 1024)
+        premise["text"] += " parent-premise " + "p" * (45 * 1024)
+        tasks = r._tasks()
+        prompt, schema = r._reference_review_request(tasks["b"], "atomic")
+        from .review_budget import review_wire_breakdown
+        row = review_wire_breakdown(prompt, schema)
+        self.assertGreater(row["own_evidence_bytes"], 65 * 1024)
+        self.assertEqual(row["wire_bytes"], row["own_evidence_bytes"] +
+                         row["shared_context_bytes"] + row["schema_bytes"])
+
+    def test_review_context_format_is_part_of_global_state_hash(self):
+        from unittest.mock import patch
+        r = seeded()
+        before = r._hash()
+        with patch("v4.runner.REVIEW_CONTEXT_FORMAT", "v4-review-context/test-next"):
+            after = r._hash()
+        self.assertNotEqual(before, after)
+
+    def test_prepared_batches_fall_back_to_layer_capped_per_claim_requests(self):
+        from unittest.mock import patch
+        r = seeded()
+        r.review_batch_size = 4
+        oversized_batch_schema = {"type": "object", "description": "x" * (70 * 1024)}
+        with patch("v4.review_batches.batch_schema", return_value=oversized_batch_schema):
+            prepared = r.prepare_phase6_atomic_batches()
+        self.assertEqual(prepared["request_count"], len(r._tasks()))
+        for request in prepared["review_batches"]:
+            wire = structured_prompt(request["prompt"], json.dumps(
+                request["response_schema"], ensure_ascii=False, separators=(",", ":")))
+            self.assertLessEqual(len(wire.encode("utf-8")), r.review_batch_max_bytes)
+
+    def test_incomplete_related_diagnostics_blocks_sync_and_native_dispatch_under_budget(self):
+        from .agent_reviews import NativeReviewWorkflow
+        r = seeded()
+        tasks = r._tasks()
+        diagnostics = tasks["independent"].context["evidence_scope"]["ingestion_diagnostics"]
+        diagnostics["truncation"] = dict(truncated=True, omitted_count=2, omitted_check_ids=["check.one"])
+        diagnostics["requires_scoped_review"] = True
+        prepared = r._prepare_phase6_atomic(tasks, enforce_budget=False)
+        prompts = dict(prepared["atomic_prompts"])
+        schemas = prepared["response_schemas"]
+        prompt = prompts["independent"]
+        schema = schemas["independent"]
+        client = CloudDouble()
+        sync = r._execute_review_batch(client, list(prompts.items()),
+                                       r.collect_phase6_atomic, layer="atomic")
+        self.assertTrue(sync["blocked"], sync)
+        self.assertIn("related_diagnostics_incomplete",
+                      {row["reason"] for row in sync["oversized_items"]})
+        row = next(row for row in sync["oversized_items"]
+                   if row["claim_id"] == "independent")
+        self.assertLess(row["wire_bytes"], 64 * 1024)
+        sent_ids = []
+        for sent in client.calls:
+            payload = json.loads(sent.split("```json\n")[1].split("\n```", 1)[0])
+            sent_ids.append(payload["claim"]["claim_id"])
+        self.assertNotIn("independent", sent_ids)
+        self.assertTrue(sent_ids, "unrelated siblings should remain reviewable")
+        self.assertIn("adjust the related diagnostics cap", sync["reason"])
+        self.assertNotIn("increase the general item budget", sync["reason"].split("cannot restore")[0])
+
+        with tempfile.TemporaryDirectory() as root:
+            workflow = NativeReviewWorkflow(Path(root) / "native")
+            state = dict(packets={}, active_packet_id=None, input_hash="fixture")
+            native = workflow._issue_review_packet(
+                state, r, "atomic", prompts, schemas,
+                size=16, cap=262144, tasks=tasks)
+        self.assertEqual(native["status"], "reviews", native)
+        self.assertNotIn("independent", native["items"])
+        self.assertEqual(native["oversized_items"][0]["reason"], "related_diagnostics_incomplete")
+        self.assertEqual(native["next_action"], "reduce_structured_refs_or_adjust_related_diagnostics_cap")
+
+    def test_partial_collector_keeps_all_unreceived_siblings_until_they_finish(self):
+        for layer in ('atomic', 'deep'):
+            with self.subTest(layer=layer):
+                runner = seeded()
+                if layer == 'deep':
+                    runner.prepare_phase6_atomic()
+                    runner.collect_phase6_atomic({cid: verdict(cid, 'SUSPICIOUS',
+                        ref_ids=reference_ids(task.claim)) for cid, task in runner._tasks().items()},
+                        model_identity='test/first')
+                tasks = runner._tasks()
+                tasks['independent'].context['evidence_scope']['ingestion_diagnostics']['requires_scoped_review'] = True
+                runner._tasks = lambda: tasks
+                prepare = runner._prepare_phase6_atomic if layer == 'atomic' else runner._prepare_phase6_deep_review
+                prepare(tasks, enforce_budget=False)
+                collect = runner.collect_phase6_atomic if layer == 'atomic' else runner.collect_phase6_deep_review
+                receipts = runner.receipts if layer == 'atomic' else runner.deep_receipts
+                expected = [cid for cid in tasks if cid != 'independent']
+                for index, cid in enumerate(expected):
+                    outcome = collect({cid: verdict(cid, ref_ids=reference_ids(tasks[cid].claim))},
+                                      model_identity='test/reviewer', allow_partial=True)
+                    self.assertIn(cid, receipts)
+                    if index < len(expected) - 1:
+                        self.assertFalse(outcome['blocked'], outcome)
+                        self.assertIn(expected[index + 1], getattr(runner, 'pending_' + layer))
+                self.assertEqual(set(receipts), set(expected))
+                self.assertEqual(outcome['status'], 'blocked:review_context_budget')
+                self.assertEqual(set(getattr(runner, 'pending_' + layer)), {'independent'})
+
+    def test_collectors_never_accept_a_diagnostics_incomplete_pass_but_keep_siblings(self):
+        r = seeded()
+        tasks = r._tasks()
+        diagnostics = tasks["independent"].context["evidence_scope"]["ingestion_diagnostics"]
+        diagnostics["requires_scoped_review"] = True
+        r._tasks = lambda: tasks
+        r._prepare_phase6_atomic(tasks, enforce_budget=False)
+        results = {cid: verdict(cid, ref_ids=reference_ids(task.claim))
+                   for cid, task in tasks.items()}
+        summary = r.collect_phase6_atomic(results, model_identity="test/first")
+        self.assertEqual(r.receipts.keys(), tasks.keys() - {"independent"})
+        self.assertTrue(summary["blocked"], summary)
+        self.assertEqual(summary["status"], "blocked:review_context_budget")
+        self.assertIn("independent", summary["blocked_claim_ids"])
+
+        deep_runner = seeded()
+        deep_tasks = deep_runner._tasks()
+        deep_tasks["independent"].context["evidence_scope"]["ingestion_diagnostics"][
+            "requires_scoped_review"] = True
+        deep_runner._tasks = lambda: deep_tasks
+        deep_runner.receipts = {
+            cid: dict(input_hash=digest(task.to_dict()),
+                      result=verdict(cid, "SUSPICIOUS" if cid == "independent" else "PASS",
+                                     ref_ids=reference_ids(task.claim)),
+                      model="test/first")
+            for cid, task in deep_tasks.items()
+        }
+        deep_runner.prepare_phase6_deep_review(["independent"], enforce_budget=False)
+        deep_result = deep_runner.collect_phase6_deep_review(
+            {"independent": verdict("independent", ref_ids=reference_ids(deep_tasks["independent"].claim))},
+            model_identity="test/deep")
+        self.assertNotIn("independent", deep_runner.deep_receipts)
+        self.assertTrue(deep_result["blocked"], deep_result)
+        self.assertEqual(deep_result["status"], "blocked:review_context_budget")
+
     def test_87_claims_require_22_requests_and_each_has_own_schema(self):
+        from .financial_review import FINANCIAL_REVIEW_CONTRACT
         _, tasks = self.tasks(87)
         requests = pack_review_requests(tasks, batch_size=4, max_bytes=65536, verification_epoch="epoch")
         self.assertEqual(len(requests), 22)
         self.assertEqual([cid for req in requests for cid in req["claim_ids"]], [t.claim_id for t in tasks])
         for req in requests:
+            self.assertIn(FINANCIAL_REVIEW_CONTRACT, req['prompt'])
             self.assertLessEqual(len(req["claim_ids"]), 4)
             self.assertEqual(req["response_schema"]["properties"]["results"]["minItems"], len(req["claim_ids"]))
 
@@ -39,6 +303,10 @@ class ReviewBatches(unittest.TestCase):
         data = json.loads(request["prompt"].split("```json\n")[1].split("\n```")[0])
         self.assertEqual(data["evidence_catalog"]["source.shared"], evidence)
         self.assertEqual(len(data["tasks"]), 4)
+        from .review_budget import review_wire_breakdown
+        own = review_wire_breakdown(request['prompt'], request['response_schema'])['own_evidence_bytes']
+        size = lambda value: len(json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
+        self.assertEqual(own, size(evidence) + sum(size(task.claim) for task in tasks))
         for row, task in zip(data["tasks"], tasks):
             self.assertEqual(row["claim"], task.claim)
             self.assertEqual(row["resolved_ref_ids"], ["source.shared"])
@@ -278,7 +546,8 @@ class ReviewBatches(unittest.TestCase):
             save_checkpoint(r, path)
             seen = []
             def execute(runner, *clients):
-                seen.append((runner.review_batch_size, runner.review_batch_max_bytes, runner.max_workers))
+                seen.append((runner.review_batch_size, runner.review_batch_max_bytes,
+                             runner.review_deep_batch_max_bytes, runner.max_workers))
                 return dict(blocked=True, status="test-stop")
             args = ["--resume", str(path), "--out", str(Path(temp)/"out"), "--author-model", "m",
                     "--verifier-model", "m", "--deep-model", "m", "--global-model", "m",
@@ -287,7 +556,7 @@ class ReviewBatches(unittest.TestCase):
             with patch("v4.__main__.AntigravityCloudClient", return_value=CloudDouble()) as factory, \
                  patch("v4.runner.PipelineRunnerV4.resume", execute), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(main(args), 2)
-            self.assertEqual(seen, [(3, 32000, 2)])
+            self.assertEqual(seen, [(3, 32000, 32000, 2)])
             self.assertEqual(len(factory.call_args_list), 4)
             self.assertTrue(all(c.kwargs["timeout"] == 1500 for c in factory.call_args_list))
 

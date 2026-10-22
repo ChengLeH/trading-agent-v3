@@ -11,6 +11,7 @@ from v3.sources import SourceRecord, SourceError
 from .runner import PipelineRunnerV4
 from .schema import digest
 from .financial_review import FINANCIAL_REVIEW_VERSION
+from .review_diagnostics import REVIEW_CONTEXT_FORMAT
 from .source_lineage import validate_run_source_lineage
 
 
@@ -240,6 +241,7 @@ def _verified_reference_supplement(run_dir, run_id, cid, task, supplement, layer
 
 def save_checkpoint(runner, path):
     write_json(path, dict(format="v4-checkpoint/1", financial_review_contract=FINANCIAL_REVIEW_VERSION,
+                          review_context_format=REVIEW_CONTEXT_FORMAT,
                           contract_migrations=getattr(runner, "contract_migrations", []), state=runner.orch.snapshot(runner.run_id),
                           status=runner.status, verification_epoch=runner._verification_epoch,
                           contract_attempts=runner._contract_attempts,
@@ -254,6 +256,7 @@ def save_checkpoint(runner, path):
                           max_revisions=runner.max_revisions, max_workers=runner.max_workers,
                           max_contract_attempts=runner.max_contract_attempts,
                           review_batch_size=runner.review_batch_size, review_batch_max_bytes=runner.review_batch_max_bytes,
+                          review_deep_batch_max_bytes=runner.review_deep_batch_max_bytes,
                           global_dependency_batch_size=runner.global_dependency_batch_size,
                           review_sources=runner._latest_review_sources,
                           audit=dict(atomic=runner.receipts, deep=runner.deep_receipts, global_review=runner.global_receipt)))
@@ -335,6 +338,7 @@ def load_checkpoint(path, *, continue_verification=True):
                          review_batch_size=data.get("review_batch_size", 1),
                          max_contract_attempts=data.get("max_contract_attempts", 3),
                          review_batch_max_bytes=data.get("review_batch_max_bytes", 65536),
+                         review_deep_batch_max_bytes=data.get("review_deep_batch_max_bytes", 128 * 1024),
                          global_dependency_batch_size=data.get("global_dependency_batch_size", 12))
     if continue_verification:
         from uuid import UUID
@@ -541,12 +545,18 @@ def load_checkpoint(path, *, continue_verification=True):
         previous_state.pop('financial_review_contract', None)
     else:
         previous_state['financial_review_contract'] = prior_contract
+    prior_context = data.get('review_context_format')
+    if prior_context is None:
+        previous_state.pop('review_context_format', None)
+    else:
+        previous_state['review_context_format'] = prior_context
     prior_hash = digest(previous_state)
-    migrating = prior_contract != FINANCIAL_REVIEW_VERSION
+    migrating = prior_contract != FINANCIAL_REVIEW_VERSION or prior_context != REVIEW_CONTEXT_FORMAT
     r.contract_migrations = deepcopy(data.get('contract_migrations', []))
     progress = data.get("global_review_progress")
     if migrating and isinstance(progress, dict) and progress.get('input_hash') == prior_hash:
         r.contract_migrations.append(dict(previous_contract=prior_contract,
+            previous_context_format=prior_context, current_context_format=REVIEW_CONTEXT_FORMAT,
             current_contract=FINANCIAL_REVIEW_VERSION, retired_global_progress=deepcopy(progress)))
         progress = None
     if progress is not None and continue_verification:
@@ -622,6 +632,7 @@ def load_checkpoint(path, *, continue_verification=True):
             raise ValueError(f"invalid pending claim repair: {exc}") from exc
         if retire_pending:
             r.contract_migrations.append(dict(previous_contract=prior_contract,
+                previous_context_format=prior_context, current_context_format=REVIEW_CONTEXT_FORMAT,
                 current_contract=FINANCIAL_REVIEW_VERSION, retired_pending_patch=deepcopy(data['pending_patch'])))
             known_findings = {f.get('finding_id') for f in r.deferred_global_findings}
             for finding in deepcopy(findings):

@@ -14,9 +14,9 @@ from uuid import uuid4
 from types import SimpleNamespace
 
 from .agent_workflow import NativeWorkflow, json_read, _require_identity
-from .cloud import structured_prompt
 from .journal import RunJournal
 from .schema import digest
+from .review_budget import review_budget_for, review_budget_row, review_wire_breakdown
 
 DEFAULT_REVIEW_GROUP_SIZE = 8
 DEFAULT_REVIEW_PACKET_MAX_BYTES = 262144
@@ -28,8 +28,7 @@ PATCH_WAIT_STATUSES = {"blocked:pending_revision", "blocked:revision_limit",
 
 
 def _item_wire_bytes(prompt, schema):
-    wire = structured_prompt(prompt, json.dumps(schema, ensure_ascii=False, separators=(",", ":")))
-    return len(wire.encode("utf-8"))
+    return review_wire_breakdown(prompt, schema)["wire_bytes"]
 
 
 def configure_review_budget(workflow, *, max_item_bytes=None, max_packet_bytes=None, reason):
@@ -42,9 +41,11 @@ def configure_review_budget(workflow, *, max_item_bytes=None, max_packet_bytes=N
     with workflow.queue.transaction() as state:
         runner = workflow._load(state)
         before = dict(max_item_bytes=runner.review_batch_max_bytes,
+                      max_deep_item_bytes=runner.review_deep_batch_max_bytes,
                       max_packet_bytes=workflow._options(state)[1])
         if max_item_bytes is not None:
             runner.review_batch_max_bytes = max_item_bytes
+            runner.review_deep_batch_max_bytes = max_item_bytes
         if max_packet_bytes is not None:
             state.setdefault('options', {})['review_packet_max_bytes'] = max_packet_bytes
         for packet in state.get('packets', {}).values():
@@ -52,7 +53,10 @@ def configure_review_budget(workflow, *, max_item_bytes=None, max_packet_bytes=N
                 packet.update(retired=True, retirement_reason='review_budget_changed')
                 if state.get('active_packet_id') == packet['packet_id']:
                     state['active_packet_id'] = None
-        event = dict(before=before, after={**before, **changes}, reason=reason.strip())
+        after = dict(max_item_bytes=runner.review_batch_max_bytes,
+                     max_deep_item_bytes=runner.review_deep_batch_max_bytes,
+                     max_packet_bytes=workflow._options(state)[1])
+        event = dict(before=before, after=after, reason=reason.strip())
         state.setdefault('review_budget_changes', []).append(event)
         workflow._save(state, runner)
         return dict(status='review_budget_updated', **event)
@@ -92,26 +96,45 @@ class NativeReviewWorkflow(NativeWorkflow):
             context = runner.review_context_for(layer, [cid], tasks=tasks)
             item = dict(prompt=prompts[cid], schema=deepcopy(schemas[cid]), review_context=context)
             if cid not in items:
-                item_bytes = _item_wire_bytes(item["prompt"], item["schema"])
-                if item_bytes > min(cap, runner.review_batch_max_bytes):
-                    oversized.append(dict(claim_id=cid, wire_bytes=item_bytes,
-                        budget_bytes=min(cap, runner.review_batch_max_bytes)))
+                budget = min(cap, review_budget_for(runner, layer))
+                budget_row = review_budget_row(cid, item["prompt"], item["schema"], budget)
+                if budget_row is not None:
+                    oversized.append(budget_row)
                     continue
+                item_bytes = _item_wire_bytes(item["prompt"], item["schema"])
                 if items and used_bytes + item_bytes > cap:
                     break
                 items[cid] = item
                 used_bytes += item_bytes
         if oversized and not items:
+            diagnostic_block = any(row["reason"] == "related_diagnostics_incomplete" for row in oversized)
             return dict(blocked=True, status="blocked:review_context_budget", layer=layer,
-                        reason=(f"review_context_too_large: {len(oversized)} items exceed the declared context budget; "
+                        reason=("related_diagnostics_incomplete: omitted related diagnostics require a narrower "
+                                "structured ref set or a relevant diagnostics-cap change; increasing the general "
+                                "item budget cannot restore omitted diagnostics"
+                                if diagnostic_block else
+                                f"review_context_too_large: {len(oversized)} items exceed the declared context budget; "
                                 f"budget={cap}; no evidence or IDs were truncated"),
-                        oversized_items=oversized, next_action="configure-reviews_or_reduce_structured_context")
+                        oversized_items=oversized,
+                        next_action=("reduce_structured_refs_or_adjust_related_diagnostics_cap"
+                                     if diagnostic_block else
+                                     "configure_reviews_or_reduce_structured_context"))
         packet_id = uuid4().hex
         state["packets"][packet_id] = dict(packet_id=packet_id, kind=layer,
                                            input_hash=state["input_hash"], items=items, received={})
         state["active_packet_id"] = packet_id
-        return dict(status="reviews", packet_id=packet_id, kind=layer,
-                    input_hash=state["input_hash"], items=deepcopy(items), oversized_items=oversized)
+        response = dict(status="reviews", packet_id=packet_id, kind=layer,
+                        input_hash=state["input_hash"], items=deepcopy(items), oversized_items=oversized)
+        if oversized:
+            diagnostic_block = any(row["reason"] == "related_diagnostics_incomplete" for row in oversized)
+            response["next_action"] = ("reduce_structured_refs_or_adjust_related_diagnostics_cap"
+                                       if diagnostic_block else
+                                       "configure_reviews_or_reduce_structured_context")
+            if diagnostic_block:
+                response["reason"] = ("related_diagnostics_incomplete: omitted related diagnostics require a narrower "
+                                       "structured ref set or a relevant diagnostics-cap change; increasing the general "
+                                       "item budget cannot restore omitted diagnostics")
+        return response
 
     def next(self):
         result = self._next()
@@ -988,7 +1011,11 @@ class NativeReviewWorkflow(NativeWorkflow):
                 processed[cid] = packet_id
                 continue
             processed[cid] = packet_id
-            if summary.get("blocked"):
+            accepted = runner.receipts if layer == 'atomic' else runner.deep_receipts
+            if accepted.get(cid, {}).get('input_hash') == task_hash:
+                review_errors.pop(cid, None)
+                blocked.pop(cid, None)
+            elif summary.get("blocked"):
                 review_errors[cid] = dict(executor=row["executor"],
                                           reason=summary.get("validation_errors", {}).get(cid, "pending retry"))
                 if not summary.get("needs_retry", True):

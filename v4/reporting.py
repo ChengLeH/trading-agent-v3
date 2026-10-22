@@ -4,6 +4,7 @@ import json
 from copy import deepcopy
 from urllib.parse import urlsplit
 from .schema import digest
+from .review_diagnostics import diagnostics_index, REVIEW_CONTEXT_FORMAT
 
 
 _MARKDOWN_ESCAPES = str.maketrans({char: "\\" + char for char in r"\`*_{}[]()#+-.!|"})
@@ -245,4 +246,7 @@ def render_report(snapshot):
                    indicator_definitions=methods, issuer_identity=snapshot.get('issuer_identity', []), ingestion_diagnostics=snapshot.get('ingestion_diagnostics', []),
                    verification=dict(status='unverified', delivery_ready=False, global_review_complete=False),
                    report_hash=digest(report), total_claims=len(claims))
+    index = diagnostics_index(snapshot.get('ingestion_diagnostics', []))
+    sidecar.update(diagnostics_sha256=index['sha256'], diagnostics_mode='summary+relevant',
+                   diagnostics_index=index, review_context_format=REVIEW_CONTEXT_FORMAT)
     return dict(report_markdown=report, sidecar=sidecar)
