@@ -509,6 +509,7 @@ manifest 可另設 `financial_coverage_requirements`，例如：
 沒有明示要求時只提供覆蓋診斷，不假定每家公司都須有美國 10-Q、不從當前年份推測最新財報。
 WARN 檢查以同一主體的最新年報會計期間為錨點；比年報更早的季報，即使仍在 Fact Store 或晚發布，也不能掩蓋年報之後的期中覆蓋未知。若有更新、但沒有期間 metadata 的新聞證據，預設發出 WARN；已存在 period_coverage 未明確分類的期中列時，警告仍表明季度／YTD／TTM 的型別尚未驗證，而不是宣稱完全沒有期中資料。不推造某季財報、更不自動 FAIL。
 Fact entity 缺失時，僅可根據相符且唯一的 SourceRecord.subject_ticker 在 Coverage 視圖補齊（保留來源識別）；來源無法歸屬時發出專屬 WARN，不得默認為分析標的。要求明確公司且結構化 Fact 主體未知時不能認證 structured PASS，會以 WARN 表達缺口。
+新 manifest 進入角色派發前會經 package acceptance gate：`financial_coverage_metadata_unknown` 必須為零，否則 `PipelineRunnerV4.prepare()` 回 `blocked:ingest` 並列出原始診斷及來源／期間欄位。這只檢查明示報表的主體、期間、發布時間與期間型別 metadata；`latest_report_not_structured`、權益歸屬等其他警告仍保留 WARN，不會被此閘升級。季度或年度標籤搭配 `point_in_time` 會分類為 `instant`，不再因日期標籤長相被誤判為未知。ISO 日期型期間以觀察日期排序；日曆日期與財年標籤無法通用地換算時，分開回報各自最新項並附 WARN，不虛構兩種格式的排序關係。
 `received` 不代表數字已抽取；`structured` 只代表同主體、期間、發布版本至少有一項 Fact，
 不認證全份報表或每個指標都齊全。quarter／YTD／TTM 不互相代替。歷史分析仍可用舊年度資料。
 

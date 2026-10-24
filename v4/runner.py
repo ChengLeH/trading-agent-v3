@@ -150,6 +150,7 @@ class PipelineRunnerV4:
         self.journal = None
         self._contract_attempts = {}
         self._verification_epoch = uuid4().hex  # retained only for explicit same-execution continuation
+        self.package_acceptance_blocked = False
 
     def _persist(self):
         if self.journal is not None:
@@ -485,10 +486,17 @@ class PipelineRunnerV4:
         self.orch.ingest(self.run_id)
         self.orch.build_facts(self.run_id)
         failures, blocked = self.orch.validate_stage(self.run_id, "ingest")
+        from .financial_coverage import package_acceptance_findings
+        package_failures = package_acceptance_findings(failures)
+        failures.extend(package_failures)
+        self.package_acceptance_blocked = bool(package_failures)
+        if package_failures:
+            self.run.findings = failures
+        blocked = blocked or bool(package_failures)
         if blocked:
             self.status = "blocked:ingest"
             self._persist()
-            return dict(blocked=True, findings=failures)
+            return dict(blocked=True, status=self.status, findings=failures)
         self.status = "roles"
         self._persist()
         return self._role_prompts(PHASE_2_ROLES)
@@ -2341,6 +2349,30 @@ class PipelineRunnerV4:
             raise ValueError("role author must be an explicit cloud client")
         require_model_identity(author.identity)
         try:
+            # A fresh package explicitly rejected by prepare() must remain
+            # blocked after checkpoint loading resets transient status. The
+            # durable marker avoids retroactively applying this new-package
+            # gate to older/in-progress checkpoints.
+            if self.package_acceptance_blocked:
+                package_failures = [finding for finding in self.run.findings
+                    if finding.get("check_id") == "package_financial_coverage_metadata"]
+                if not package_failures:
+                    from .financial_coverage import financial_coverage_diagnostics, package_acceptance_findings
+                    coverage = financial_coverage_diagnostics(self.run)
+                    coverage_findings = [finding for section in coverage
+                        if section.get("section") == "financial_coverage"
+                        for finding in section.get("findings", [])]
+                    package_failures = package_acceptance_findings(coverage_findings)
+                if not package_failures:
+                    package_failures = [dict(status="FAIL", check_id="package_financial_coverage_metadata",
+                        reason="run was rejected by package acceptance; initialize a fresh run after correcting metadata")]
+                known = {digest(finding) for finding in self.run.findings}
+                self.run.findings.extend(finding for finding in package_failures
+                    if digest(finding) not in known)
+                self.status = "blocked:ingest"
+                self._persist()
+                return dict(blocked=True, status=self.status, findings=package_failures,
+                    next_action="correct financial coverage metadata and initialize a fresh run")
             pending_revision = self._pending_revision_block()
             if pending_revision:
                 return pending_revision

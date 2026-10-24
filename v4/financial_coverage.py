@@ -67,6 +67,8 @@ def _dimensions(row):
     if ((coverage == 'annual' and part in {'Q1', 'Q2', 'Q3', 'Q4', 'H1', 'H2', 'YTD', 'TTM'})
             or (annual_period and coverage in {'single_period', 'year_to_date', 'rolling'})):
         category = 'unknown'
+    elif coverage == 'point_in_time':
+        category = 'instant'
     elif coverage == 'annual' or annual_period:
         category = 'annual'
     elif coverage == 'rolling' or part == 'TTM':
@@ -93,8 +95,10 @@ def _store_rows(run, name):
 def financial_coverage_diagnostics(run):
     """Return one optional-context diagnostic; never alter or reject a run.
 
-    ``latest`` selects the newest explicit fiscal period per entity/coverage
-    category available by as_of, then its latest known version, retaining ties.
+    ``latest`` selects the newest explicit period per entity/coverage category
+    and comparable period format available by as_of, then its latest known
+    version, retaining ties. Calendar dates and fiscal labels are not ordered
+    against each other because their fiscal-calendar relationship is unknown.
     ``structured`` means at least one fact
     from the same report period/publication; it does not certify all metrics,
     comparability or complete statements. ``requirements`` can be consumed by
@@ -141,7 +145,9 @@ def financial_coverage_diagnostics(run):
                 reason='Typed financial Fact has no verifiable issuer identity; it cannot establish entity-specific report coverage'))
         if availability == 'unknown' or subject is None or period is None or category in {'unknown', 'interim_unknown'}:
             findings.append(dict(status='WARN', check_id='financial_coverage_metadata_unknown',
-                source_id=source_id, ref_id=entry['ref_id'],
+                source_id=source_id, ref_id=entry['ref_id'], entity=subject, period=period,
+                period_coverage=values.get('period_coverage', 'unknown'), category=category,
+                published_or_filing_time=published, availability=availability,
                 reason='report publication, entity, period or quarter/YTD/TTM coverage is unknown'))
 
     # Resolve missing Fact entities only from a unique matching SourceRecord.
@@ -173,9 +179,10 @@ def financial_coverage_diagnostics(run):
         if isinstance(declarations, list):
             for row in declarations:
                 add(row, rec.id, 'source_declaration', entity=getattr(rec, 'subject_ticker', None))
-        elif declarations:
+        elif 'financial_report_coverage' in meta:
             findings.append(dict(status='WARN', check_id='financial_coverage_metadata_unknown',
-                                 source_id=rec.id, reason='financial_report_coverage must be a list'))
+                                 source_id=rec.id, declaration_type=type(declarations).__name__,
+                                 reason='financial_report_coverage must be a list'))
         for key in _EXTRACTORS:
             extraction = meta.get(key)
             if not isinstance(extraction, dict):
@@ -192,26 +199,32 @@ def financial_coverage_diagnostics(run):
     eligible = [e for e in entries if e['availability'] == 'by_as_of'
                 and e['entity'] is not None and e['period'] is not None]
     def report_order(entry):
-        parts = entry['period'].removeprefix('FY').split('-')
-        year = int(parts[0]) if len(parts[0]) == 4 and parts[0].isascii() and parts[0].isdigit() else 0
-        part = parts[1] if len(parts) > 1 else ''
-        ordinal = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4, 'H1': 1, 'H2': 2}.get(part, 0)
-        return year, ordinal, _timestamp(entry['published_or_filing_time'])
+        period_value = entry['period']
+        try:
+            observation_date = date.fromisoformat(period_value)
+        except ValueError:
+            parts = period_value.removeprefix('FY').split('-')
+            year = int(parts[0]) if len(parts[0]) == 4 and parts[0].isascii() and parts[0].isdigit() else 0
+            part = parts[1] if len(parts) > 1 else ''
+            ordinal = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4, 'H1': 1, 'H2': 2}.get(part, 0)
+            return 'fiscal', (year, ordinal, _timestamp(entry['published_or_filing_time']))
+        return 'date', (observation_date.toordinal(), _timestamp(entry['published_or_filing_time']))
 
     groups = {}
     for e in eligible:
         if e['category'] == 'unknown':
             continue
-        key = e['entity'], e['category']
-        stamp = report_order(e)
+        family, stamp = report_order(e)
+        key = e['entity'], e['category'], family
         best = groups.get(key)
         if best is None or stamp > best:
             groups[key] = stamp
     latest = []
     seen = set()
     for e in eligible:
-        key = e['entity'], e['category']
-        if key not in groups or report_order(e) != groups[key]:
+        family, stamp = report_order(e)
+        key = e['entity'], e['category'], family
+        if key not in groups or stamp != groups[key]:
             continue
         identity = (*key, e['period'], _timestamp(e['published_or_filing_time']))
         if identity in seen:
@@ -229,6 +242,18 @@ def financial_coverage_diagnostics(run):
             findings.append(dict(status='WARN', check_id='latest_report_not_structured',
                 entity=e['entity'], period=e['period'], category=e['category'],
                 reason='known report is received without same-period/version structured facts'))
+
+    period_families = {}
+    for e in eligible:
+        if e['category'] == 'unknown':
+            continue
+        family, _ = report_order(e)
+        period_families.setdefault((e['entity'], e['category']), set()).add(family)
+    for (entity, category), families in sorted(period_families.items()):
+        if len(families) > 1:
+            findings.append(dict(status='WARN', check_id='financial_coverage_period_order_ambiguous',
+                entity=entity, category=category, period_families=sorted(families),
+                reason='financial coverage uses incomparable calendar-date and fiscal-period labels; latest is reported separately for each explicit period format'))
 
     requirements = []
     declared = manifest.get('financial_coverage_requirements', [])
@@ -368,3 +393,23 @@ def financial_coverage_diagnostics(run):
             'absence is not proof that no report was published. Structured means at least one '
             'same-period/version fact, not complete statement or metric coverage. '
             'Annual, quarter, YTD, interim-unknown and TTM are not substitutes.'])]
+
+
+def package_acceptance_findings(ingestion_findings):
+    """Fail a fresh package only when explicit report metadata is unknown.
+
+    Reuse the completed ingest findings instead of recalculating the coverage
+    inventory. Other financial coverage findings remain review warnings; this
+    gate checks package declaration quality, not report completeness.
+    """
+    failures = []
+    for row in ingestion_findings:
+        if row.get('check_id') != 'financial_coverage_metadata_unknown':
+            continue
+        failures.append(dict(status='FAIL', check_id='package_financial_coverage_metadata',
+            original_check_id=row['check_id'], source_id=row.get('source_id'),
+            ref_id=row.get('ref_id'), period=row.get('period'),
+            reason=('package acceptance requires zero financial coverage metadata unknowns; '
+                    + row.get('reason', 'financial report metadata is incomplete')),
+            diagnostic=deepcopy(row)))
+    return failures

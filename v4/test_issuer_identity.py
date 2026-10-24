@@ -79,7 +79,8 @@ class IssuerIdentityContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)
             (root/'sec.json').write_text(json.dumps(self.registry()))
-            payload={'_metadata':{'ticker':'TEST'},'fundamentals':{'income':[
+            payload={'_metadata':{'ticker':'TEST'},'fundamentals':{
+                'financial_statement_metadata':{'published_or_filing_time':'2026-02-01'},'income':[
                 {'fiscal_year':2025,'total_revenue':10}], 'cash_flow':[
                 {'fiscal_year':2025,'operating_cash_flow':5,'capex':-1,'share_repurchases':-2}]}}
             (root/'fund.json').write_text(json.dumps(payload))

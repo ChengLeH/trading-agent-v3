@@ -230,6 +230,49 @@ class FinancialCoverage(unittest.TestCase):
         self.assertEqual([f['check_id'] for f in d['findings']].count(
             'financial_coverage_entity_unknown'), 1)
 
+    def test_point_in_time_reports_are_instant_for_supported_period_shapes(self):
+        rows = [
+            report('FY2031-Q2', 'point_in_time', '2031-08-05'),
+            report('FY2031', 'point_in_time', '2031-02-01'),
+            dict(entity='ACME', fiscal_year=2031, fiscal_period='Q2',
+                 period_coverage='point_in_time', published_or_filing_time='2031-08-05'),
+        ]
+        for row in rows:
+            with self.subTest(row=row):
+                diagnostic = self.diagnostic(run_with(declarations=[row]))
+                self.assertEqual([item['category'] for item in diagnostic['latest']], ['instant'])
+                self.assertFalse(any(item['check_id'] == 'financial_coverage_metadata_unknown'
+                                     for item in diagnostic['findings']))
+
+        extracted = run_with()
+        extracted.records[0].meta['financial_statement_extraction'] = dict(coverage=[
+            dict(section='balance', period='2031-Q2', fiscal_year=2031, fiscal_period='Q2',
+                 period_coverage='point_in_time', entity='ACME',
+                 published_or_filing_time='2031-08-05')])
+        diagnostic = self.diagnostic(extracted)
+        self.assertEqual([item['category'] for item in diagnostic['latest']], ['instant'])
+        self.assertFalse(any(item['check_id'] == 'financial_coverage_metadata_unknown'
+                             for item in diagnostic['findings']))
+
+    def test_point_in_time_date_period_orders_by_observation_date(self):
+        diagnostic = self.diagnostic(run_with(declarations=[
+            report('2031-06-30', 'point_in_time', '2031-08-05'),
+            report('2031-09-30', 'point_in_time', '2031-10-01'),
+            report('2031-06-30', 'point_in_time', '2031-10-10'),
+        ], as_of='2031-10-11'))
+        self.assertEqual([row['period'] for row in diagnostic['latest']], ['2031-09-30'])
+
+    def test_latest_keeps_incomparable_period_formats_separate(self):
+        diagnostic = self.diagnostic(run_with(declarations=[
+            report('2031-09-30', 'point_in_time', '2031-10-01'),
+            report('FY2031-Q3', 'point_in_time', '2031-10-02'),
+        ], as_of='2031-10-11'))
+        self.assertEqual({row['period'] for row in diagnostic['latest']},
+                         {'2031-09-30', '2031-Q3'})
+        warning = next(row for row in diagnostic['findings']
+                       if row['check_id'] == 'financial_coverage_period_order_ambiguous')
+        self.assertEqual(warning['period_families'], ['date', 'fiscal'])
+
     def test_interim_unknown_not_misrepresented_as_absent(self):
         d = self.diagnostic(run_with(
             facts=[report('FY2030', 'annual', '2031-02-01')],

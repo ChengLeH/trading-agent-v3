@@ -244,6 +244,7 @@ def save_checkpoint(runner, path):
                           review_context_format=REVIEW_CONTEXT_FORMAT,
                           contract_migrations=getattr(runner, "contract_migrations", []), state=runner.orch.snapshot(runner.run_id),
                           status=runner.status, verification_epoch=runner._verification_epoch,
+                          package_acceptance_blocked=runner.package_acceptance_blocked,
                           contract_attempts=runner._contract_attempts,
                           records=[dict(kind=type(r).__name__, value=asdict(r)) for r in runner.run.records],
                           revision_round=runner.revision_round, history=runner.history,
@@ -351,6 +352,10 @@ def load_checkpoint(path, *, continue_verification=True):
         r._verification_epoch = epoch
         r._contract_attempts = attempts
     r.run_id = state["run_id"]
+    package_gate = data.get("package_acceptance_blocked", False)
+    if type(package_gate) is not bool:
+        raise ValueError("invalid package acceptance checkpoint marker")
+    r.package_acceptance_blocked = package_gate
     run = RunState(run_id=r.run_id, ticker=state["ticker"], manifest=state["manifest"])
     run.events = {}
     r.orch.runs[r.run_id] = run
