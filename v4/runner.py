@@ -318,6 +318,24 @@ class PipelineRunnerV4:
                                        claim_ids=sorted(matched)))
         return output
 
+    def _existing_evidence_links(self, finding):
+        """Recorded new links to sources that existed when the finding arose."""
+        baseline = finding.get("resolution_baseline", {})
+        existing_sources = set(baseline.get("source_ids", []))
+        index = claim_index(self.run.claims)
+        links = {}
+        for cid in self._finding_claim_ids(finding):
+            original = next((change["before"] for entry in self.history
+                for change in entry.get("claim_changes", [])
+                if change.get("claim_id") == cid and isinstance(change.get("before"), dict)
+                and digest(change["before"]) == baseline.get("claim_hashes", {}).get(cid)), None)
+            if original is None or cid not in index:
+                continue
+            before = set(original.get("refs", []) + original.get("fact_refs", []))
+            current = set(index[cid].get("refs", []) + index[cid].get("fact_refs", []))
+            links[cid] = sorted((current - before) & existing_sources)
+        return links
+
     def _external_resolution_candidates(self, findings, *, state=None, task_hashes=None,
                                        received_attempts=None):
         state = self._state() if state is None else state
@@ -333,6 +351,7 @@ class PipelineRunnerV4:
             row = dict(finding_id=finding.get("finding_id"), resolution_route=route)
             if route == "evidence_needed":
                 row["new_source_ids"] = sorted(source_ids - set(baseline.get("source_ids", [])))
+                row["existing_source_links"] = self._existing_evidence_links(finding)
                 progress = finding.get("resolution_progress")
                 if self._resolution_progress_is_current(finding, progress):
                     row["claim_revision_progress"] = dict(
@@ -1420,9 +1439,13 @@ class PipelineRunnerV4:
             '若 route 不是 claim_patch，另含 resolution_reason；evidence_needed 必須附 evidence_request，欄位為 proposition、refs、entity、metric、period、unit、basis、scope、known_data_range。'
             '另回傳 resolved_external_findings 陣列，無則 []。evidence_needed 若原 finding 有明確 target，claim_ids 必須恰好涵蓋全部 target；'
             '若原 finding unresolved 且沒有 target，new_evidence 可依結構化引用選出實際受影響 Claim，並須逐條具備新來源引用與 fresh review；'
-            'claim_revised 只能用原 finding 已明確列出的 target，沒有 target 時不可用此模式。'
+            'existing_evidence 與 claim_revised 只能用原 finding 已明確列出的 target，沒有 target 時不可用此模式。'
             '若 resolution_mode=new_evidence，格式為 {finding_id,resolution_mode,evidence,reason,claim_ids,resolution_refs}；'
             '只能引用新加入 canonical state 且被每個 target Claim 實際引用的來源 ID。'
+            '若 resolution_mode=existing_evidence，格式為 {finding_id,resolution_mode,evidence,reason,claim_ids,resolution_refs}；'
+            '用於原本已在 canonical catalog 內、但缺少引用的來源。來源必須在 finding baseline 就存在，'
+            '並經正式 patch 新增到每個原 target 的 refs/fact_refs，逐條完成 fresh atomic 及必要 deep 的 SUPPORTS 檢查。'
+            '你仍須理解來源是否實際補足原命題；ID 存在、搜尋記錄或連結註記都不能單獨結案。'
             '若 resolution_mode=claim_revised，格式為 {finding_id,resolution_mode,evidence,reason,claim_ids,resolution_refs:[],target_reviews}；'
             'claim_ids 必須涵蓋全部原 target；target_reviews 對每個 target 回 {claim_id,status:resolved|unresolved,reason}。'
             'claim_revised 只在原缺證據命題已因目標 Claim 或其已宣告因果前提的修訂而實際縮小／撤回時才可 resolved；'
@@ -1743,6 +1766,32 @@ class PipelineRunnerV4:
                     else:
                         rejected.append(dict(finding_id=finding_id,
                                              reason="new evidence must be canonical, newly added, and bound to every target"))
+                    continue
+
+                if mode == "existing_evidence":
+                    refs = set(resolution_refs)
+                    valid = (bool(prior_claim_ids) and bool(refs) and refs <= sources
+                             and refs <= set(baseline.get("source_ids", [])))
+                    used_refs = set()
+                    linked_sources = self._existing_evidence_links(finding)
+                    for cid in target_ids:
+                        receipt = self.receipts[cid]
+                        if receipt["result"].get("verdict") != "PASS":
+                            receipt = self.deep_receipts[cid]
+                        supported = {check.get("ref_id") for check in receipt["result"].get("reference_checks", [])
+                                     if check.get("relation") == "SUPPORTS"}
+                        linked = refs & set(linked_sources.get(cid, [])) & supported
+                        if not linked:
+                            valid = False
+                        used_refs.update(linked)
+                    valid = valid and used_refs == refs
+                    if valid:
+                        normalized.append(dict(finding_id=finding_id, evidence=row["evidence"],
+                            reason=row["reason"], claim_ids=claim_ids, resolution_refs=resolution_refs,
+                            resolution_mode="existing_evidence"))
+                    else:
+                        rejected.append(dict(finding_id=finding_id,
+                            reason="existing evidence requires canonical baseline sources newly linked and semantically supported for every target"))
                     continue
 
                 if resolution_refs:

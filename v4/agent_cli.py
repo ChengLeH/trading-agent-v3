@@ -126,10 +126,12 @@ def main(argv=None):
     declaration.add_argument('--basis')
     declaration.add_argument('--reason', required=True)
 
-    evidence_patch = sub.add_parser("repair-evidence", help="request Claim patches after new evidence and atomic review")
+    evidence_patch = sub.add_parser("repair-evidence", help="request Claim patches using new or explicitly selected existing evidence")
     evidence_patch.add_argument("--work-dir", required=True)
     evidence_patch.add_argument("--claim-id", action="append", required=True)
     evidence_patch.add_argument("--request-id", help="bind the repair to one exact evidence request")
+    evidence_patch.add_argument("--source-ref", action="append",
+        help="exact existing canonical source ID; repeat as needed; requires --request-id")
     evidence_patch.add_argument("--reason", required=True)
 
     args = parser.parse_args(argv)
@@ -200,7 +202,7 @@ def main(argv=None):
         if args.command == "repair-evidence":
             from .evidence_repair import prepare_evidence_patch
             return _result_exit(prepare_evidence_patch(NativeReviewWorkflow(args.work_dir), args.claim_id,
-                reason=args.reason, request_id=args.request_id))
+                reason=args.reason, request_id=args.request_id, source_refs=args.source_ref))
         if args.command == "next":
             payload = NativeReviewWorkflow(args.work_dir).next()
             if args.prompt_files and payload.get('kind') == 'roles':

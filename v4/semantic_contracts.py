@@ -79,7 +79,10 @@ source_evidence 必須指出 context 內的實際證據；不相關的真實摘�
 來源矛盾回 CONTRADICTS 且 verdict=FAIL；證據不足回 INSUFFICIENT，禁止 PASS。
 無任何引用或相依時可省略 reference_checks 或回 []，仍需完整審查 Claim 語義；有任何引用時不可省略或少審。"""
 
-EVIDENCE_REQUEST_INSTRUCTIONS = """只有在你已完成當前層級的語義判斷，並明確判定問題需要缺少的外部來源資料時，finding 才可標 resolution_route="evidence_needed"；這不是 claim_patch 能修正的文字／口徑問題。此時附上 resolution_reason 及 evidence_request：proposition 用一句話寫明待查命題，refs 只列你在 context 中能精確識別的相關 ID，entity/metric/period/unit/basis/scope 與 known_data_range 只填已知值，未知留空。不可從 finding prose 猜 ID、不可捏造來源或把搜尋結果當證據。補證據紀錄不代表問題已解決；仍須由主 Agent 匯入來源、修訂 Claim，並完成必要重驗與 Global。
+EVIDENCE_REQUEST_INSTRUCTIONS = """完成當前層級的語義判斷後，若原命題需要補足來源證據才可標 resolution_route="evidence_needed"；只改文字／口徑能修正的問題使用 claim_patch。
+先區分「目前局部 context 沒附證據」、「已匯入但 Claim 未引用」與「需要補外部資料」。能在提供的內容中確認既有 canonical ID 且只需補引用時，使用 claim_patch 並點名該 ID，不要求重複匯入。
+evidence_scope 僅是目錄中繼資料，未出現不證明整個 catalog 不存在。局部 context 看不到必要證據時仍可提出 evidence_needed，但 resolution_reason 必須限定可見範圍；請主 Agent 先核對 canonical catalog，已有來源就補引用，確實未匯入才搜尋及新增來源。不可要求本次審查員自行呼叫工具或假裝看過完整 catalog。
+evidence_needed 須附 resolution_reason 及 evidence_request：proposition 用一句話寫明待查命題，refs 只列你在 context 中能精確識別的相關 ID，entity/metric/period/unit/basis/scope 與 known_data_range 只填已知值，未知留空。不可從 finding prose 猜 ID、不可捏造來源或把搜尋結果當證據。補證據紀錄不代表問題已解決；仍須修訂 Claim，並完成必要重驗與 Global。
 """
 
 

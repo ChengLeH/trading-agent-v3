@@ -466,7 +466,8 @@ class NativeReviewWorkflow(NativeWorkflow):
                     prepared = runner.prepare_phase6_global_sweep()
                 except ValueError as exc:
                     return dict(status="blocked:global_preflight", blocked=True, reason=str(exc))
-                if self._matches_global(runner, active, prepared):
+                if (self._matches_global(runner, active, prepared)
+                        and active["items"][key]["prompt"] == prepared[1]):
                     self._save(state, runner)
                     return dict(status="global", kind="global", packet_id=active["packet_id"],
                                 input_hash=state["input_hash"], items=deepcopy(active["items"]))

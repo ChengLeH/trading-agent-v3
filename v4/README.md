@@ -393,7 +393,15 @@ python -m v4.agent_cli next --work-dir RUN
 支援原有 adapter，`generic_text` 全文也會進 canonical EvidenceStore。
 來源或 Fact/Calc/Evidence ID 衝突會拒絕，既有數據不可被默默覆寫。
 原 findings、修補次數與歷史保留；新增文件本身不算問題已解決。Claim 修補後仍重驗受影響 Claim、dependency descendants 與 Global。
-`evidence_needed` finding 可由兩種有證據的方式結案：`new_evidence` 必須引用新加入 canonical state、且實際綁定每個 finding target 的來源；`claim_revised` 必須使用原 finding 明列的所有 target，並由 Global 語義審查逐一確認，不能只靠新增來源或手動文字變更。
+`evidence_needed` finding 可由三種有證據的方式結案：`new_evidence` 必須引用新加入 canonical state、且實際綁定每個 finding target 的來源；`claim_revised` 必須使用原 finding 明列的所有 target，並由 Global 語義審查逐一確認，不能只靠新增來源或手動文字變更。
+來源已在 catalog、只缺引用時，不需重複 `add-evidence` 或建立連結註記。主 Agent 先核對 canonical ID，使用：
+
+```sh
+python -m v4.agent_cli repair-evidence --work-dir RUN --request-id REQUEST_ID --claim-id CLAIM_ID --source-ref CANONICAL_ID --reason '補入已核對的既有引用'
+```
+
+`--source-ref` 可重複；Claim IDs 必須涵蓋 request 的全部 targets，所選 IDs 必須已在 canonical catalog。入口只建立 surgical patch，不改來源、不清除 finding、不自動貼引用。正式 patch 後仍重驗 Claim 與 descendants，再完成 Global。Global 可回 `resolution_mode=existing_evidence`、全部原 target IDs 與 `resolution_refs`；程式要求來源在原 finding baseline 已存在、每個 target 有可追溯的新引用且 fresh semantic reference check 為 SUPPORTS。Global 仍須確認這些來源真正解決原問題。未知 ID、未綁定來源、過期收據與只改標籤皆不能結案。這是增補修復路徑，沒有減少原有語義驗證義務。
+
 `claim_revised` 還要求相關 target 或其已宣告因果前提有可追溯的修訂紀錄，並具備 target 的新 atomic 與必要 deep 收據。逐 target 的部分審查會持久保存，續跑只補缺漏 target；只有全部 target 都有新鮮審查且判為 resolved 才能結案。改標籤、刪引用、加免責句或改無關文字不能解除 finding。
 本契約版本參與 task/state 雜湊；舊契約收據不會冒充新檢查結果。
 

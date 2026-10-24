@@ -1,5 +1,6 @@
 """Global evidence resolutions require complete, state-bound target proofs."""
 import json
+from copy import deepcopy
 import tempfile
 import unittest
 from pathlib import Path
@@ -167,6 +168,75 @@ class GlobalEvidenceResolutions(unittest.TestCase):
                     with workflow.queue.transaction() as state:
                         self.assertEqual(state['packets'][final_id]['retirement_reason'],
                                          'verification_epoch_changed')
+
+    def test_unanswered_legacy_global_prompt_is_reissued_without_losing_receipts(self):
+        with tempfile.TemporaryDirectory() as root:
+            workflow = self._bootstrap(root)
+            original = self._reach_global(workflow)
+            with workflow.queue.transaction() as state:
+                role = next(iter(state['packets'][original['packet_id']]['items']))
+                state['packets'][original['packet_id']]['items'][role]['prompt'] = 'Legacy global instructions'
+                receipts = deepcopy(workflow._load(state).receipts)
+            packet = NativeReviewWorkflow(workflow.directory).next()
+            self.assertNotEqual(packet['packet_id'], original['packet_id'])
+            self.assertIn('existing_evidence', packet['items'][role]['prompt'])
+            with workflow.queue.transaction() as state:
+                self.assertTrue(state['packets'][original['packet_id']]['retired'])
+                self.assertEqual(workflow._load(state).receipts, receipts)
+            self.assertEqual(NativeReviewWorkflow(workflow.directory).next()['packet_id'], packet['packet_id'])
+            response = self._native_global_response(workflow)
+            result = workflow.submit(packet['packet_id'], {role: response}, 'host/test', packet['input_hash'])
+            self.assertEqual(result['status'], 'verified', result)
+            self.assertEqual(NativeReviewWorkflow(workflow.directory).next()['status'], 'complete')
+
+    def test_existing_evidence_requires_new_links_and_fresh_support_for_every_target(self):
+        from v3.facts import Fact
+        from .schema import digest
+        for case in ('valid', 'unknown_ref', 'not_in_baseline', 'unbound', 'unchanged',
+                     'stale_receipt', 'unsupported', 'partial_targets', 'duplicate_refs', 'missing_deep'):
+            with self.subTest(case=case):
+                runner = seeded()
+                runner.run.fact_store.add(Fact('available.amount', 42, 'USD', 'FY2025',
+                    entity='TEST', concept='Revenue', basis='gaap', scope='consolidated', source_id='fixture'))
+                runner.run.fact_store.add(Fact('available.unbound', 99, 'USD', 'FY2024',
+                    entity='TEST', concept='Revenue', basis='gaap', scope='consolidated', source_id='fixture'))
+                review_all(runner)
+                finding_id = self._first_global(runner, self._finding(['a', 'independent']))
+                original = deepcopy(runner.deferred_global_findings)
+                runner.prepare_phase6_revision_v4([dict(claim_id=cid, issue='Missing citation',
+                    evidence='The source already exists.', suggested_fix='Link the canonical fact.')
+                    for cid in ('a', 'independent')])
+                runner.collect_phase6_revision([dict(claim_id=cid, refs=['available.amount'],
+                    bindings=[dict(ref_id='available.amount', entity='TEST', concept='Revenue',
+                        period='FY2025', scope='consolidated', unit='USD', basis='gaap')])
+                    for cid in ('a', 'independent')])
+                review_all(runner)
+                proof = dict(finding_id=finding_id, resolution_mode='existing_evidence',
+                    claim_ids=['a', 'independent'], resolution_refs=['available.amount'],
+                    evidence='The canonical fact supports each repaired target.', reason='Semantic review completed.')
+                if case == 'unknown_ref':
+                    proof['resolution_refs'] = ['missing.source']
+                elif case == 'not_in_baseline':
+                    original[0]['resolution_baseline']['source_ids'] = []
+                elif case == 'unbound':
+                    proof['resolution_refs'] = ['available.unbound']
+                elif case == 'unchanged':
+                    current = next(c for c in runner.run.claims if c['claim_id'] == 'a')
+                    original[0]['resolution_baseline']['claim_hashes']['a'] = digest(current)
+                elif case == 'stale_receipt':
+                    runner.receipts['a']['input_hash'] = 'stale'
+                elif case == 'unsupported':
+                    runner.receipts['a']['result']['reference_checks'][0]['relation'] = 'INSUFFICIENT'
+                elif case == 'partial_targets':
+                    proof['claim_ids'] = ['a']
+                elif case == 'duplicate_refs':
+                    proof['resolution_refs'] *= 2
+                elif case == 'missing_deep':
+                    runner.receipts['a']['result']['verdict'] = 'SUSPICIOUS'
+                accepted, rejected, _ = runner._validate_external_resolutions(
+                    [proof], original, model_identity='test/global')
+                self.assertEqual(bool(accepted), case == 'valid', (accepted, rejected))
+                self.assertEqual(bool(rejected), case != 'valid', (accepted, rejected))
 
     def test_claim_revised_requires_all_targets_and_relevant_history(self):
         runner = seeded()

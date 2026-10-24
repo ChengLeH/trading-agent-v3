@@ -182,6 +182,105 @@ class EvidenceRecoveryContracts(unittest.TestCase):
                 self.assertEqual(r.deferred_global_findings[0]['finding_id'],'gap.1')
                 self.assertIsNone(r.global_receipt)
 
+    def test_existing_source_repair_cli_survives_reload_without_duplicate_addition(self):
+        import contextlib, io, json, tempfile
+        from pathlib import Path
+        from .agent_cli import main
+        from .agent_reviews import NativeReviewWorkflow
+        from .checkpoint import save_checkpoint
+        from .test_global_resolutions import GlobalEvidenceResolutions
+        harness = GlobalEvidenceResolutions()
+        for targets in (['a'], ['a', 'independent']):
+            with self.subTest(targets=targets), tempfile.TemporaryDirectory() as root:
+                r = seeded()
+                r.run.fact_store.add(Fact('available.amount', 42, 'USD', 'FY2025',
+                    entity='TEST', concept='Revenue', basis='gaap', scope='consolidated', source_id='fixture'))
+                source = Path(root) / 'source.json'
+                save_checkpoint(r, source)
+                workflow = NativeReviewWorkflow.from_checkpoint(source, Path(root) / 'native')
+                packet = harness._reach_global(workflow)
+                response = harness._native_global_response(workflow)
+                response['findings'] = [harness._finding(targets)]
+                workflow.submit(packet['packet_id'], {next(iter(packet['items'])): response},
+                                'host/test', packet['input_hash'])
+                self.assertEqual(workflow.next()['status'], 'evidence_recovery')
+                with workflow.queue.transaction() as state:
+                    runner = workflow._load(state)
+                    request_id = runner.evidence_requests[0]['request_id']
+                    finding_id = runner.deferred_global_findings[0]['finding_id']
+                    before_sources = runner.run.fact_store.to_dict()
+                    before_receipts = deepcopy(runner.receipts)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    code = main(['repair-evidence', '--work-dir', str(workflow.directory),
+                        '--request-id', request_id, '--source-ref', 'available.amount',
+                        '--reason', 'Link the existing source'] +
+                        [arg for cid in targets for arg in ('--claim-id', cid)])
+                outcome = json.loads(output.getvalue())
+                self.assertEqual(code, 0, outcome)
+                self.assertIn('revision_prompts', outcome)
+                self.assertIn('available.amount', outcome['revision_prompts'][0][1])
+                workflow = NativeReviewWorkflow(workflow.directory)
+                with workflow.queue.transaction() as state:
+                    runner = workflow._load(state)
+                    self.assertEqual(runner.run.fact_store.to_dict(), before_sources)
+                    self.assertEqual(runner.receipts, before_receipts)
+                    self.assertFalse(state.get('evidence_additions'))
+                    self.assertTrue(runner.deferred_global_findings)
+                packet = workflow.next()
+                self.assertEqual(packet['kind'], 'patch')
+                workflow.submit_patch(packet['packet_id'], [dict(claim_id=cid, refs=['available.amount'],
+                    bindings=[dict(ref_id='available.amount', entity='TEST', concept='Revenue',
+                        period='FY2025', scope='consolidated', unit='USD', basis='gaap')]) for cid in targets],
+                    'host/test', packet['input_hash'])
+                with workflow.queue.transaction() as state:
+                    runner = workflow._load(state)
+                    self.assertTrue(({'a', 'b', 'c'} | set(targets)).isdisjoint(runner.receipts))
+                    self.assertEqual(runner.receipts['role.market_analyst'], before_receipts['role.market_analyst'])
+                    self.assertEqual(runner.run.fact_store.to_dict(), before_sources)
+                from .evidence_repair import prepare_evidence_patch
+                before_retry = workflow.queue.state_path.read_bytes()
+                with self.assertRaisesRegex(ValueError, 'stale'):
+                    prepare_evidence_patch(workflow, targets, request_id=request_id,
+                        source_refs=['available.amount'], reason='Cannot reuse a stale request')
+                self.assertEqual(workflow.queue.state_path.read_bytes(), before_retry)
+                packet = harness._reach_global(workflow)
+                response = harness._native_global_response(workflow)
+                response['resolved_external_findings'] = [dict(finding_id=finding_id,
+                    resolution_mode='existing_evidence', claim_ids=targets, resolution_refs=['available.amount'],
+                    evidence='The newly linked canonical fact supports the proposition.',
+                    reason='Reviewed source entailment after the reference repair.')]
+                result = workflow.submit(packet['packet_id'], {next(iter(packet['items'])): response},
+                                         'host/test', packet['input_hash'])
+                self.assertEqual(result['status'], 'verified', result)
+                for _ in range(2):
+                    self.assertEqual(NativeReviewWorkflow(workflow.directory).next()['status'], 'complete')
+
+    def test_existing_source_repair_rejects_invalid_scope_without_mutating_state(self):
+        import tempfile
+        from .test_agent_reviews import NativeReviews
+        from .evidence_repair import prepare_evidence_patch
+        with tempfile.TemporaryDirectory() as root:
+            workflow = NativeReviews().bootstrap(root)
+            NativeReviews()._reach_global(workflow)
+            with workflow.queue.transaction() as state:
+                runner = workflow._load(state)
+                finding = dict(finding_id='existing.gap', claim_ids=['a'],
+                    issue='Missing citation', resolution_route='evidence_needed',
+                    evidence_request=dict(proposition='Find supporting evidence.'))
+                request_id = runner.prepare_evidence_work([finding])['evidence_requests'][0]['request_id']
+                workflow._save(state, runner)
+            for request, ids, refs, message in (
+                (None, ['a'], ['absent'], 'request_id'),
+                (request_id, ['a'], [], 'nonempty source'),
+                (request_id, ['a'], ['absent'], 'unknown canonical'),
+                (request_id, ['b'], ['absent'], 'exactly match'),
+            ):
+                before = workflow.queue.state_path.read_bytes()
+                with self.assertRaisesRegex(ValueError, message):
+                    prepare_evidence_patch(workflow, ids, request_id=request, source_refs=refs, reason='test')
+                self.assertEqual(workflow.queue.state_path.read_bytes(), before)
+
     def test_evidence_reopen_paths_preserve_their_cleanup_contracts(self):
         import tempfile
         from copy import deepcopy

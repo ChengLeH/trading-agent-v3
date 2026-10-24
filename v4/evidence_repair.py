@@ -219,7 +219,7 @@ def register_event_catalog(workflow, events, *, reason):
         return dict(status='events_registered', findings_resolved=False, **event)
 
 
-def prepare_evidence_patch(workflow, claim_ids, *, reason, request_id=None):
+def prepare_evidence_patch(workflow, claim_ids, *, reason, request_id=None, source_refs=None):
     """Explicit main-Agent repair scope; never guess Claim IDs from prose."""
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError('operator reason required')
@@ -233,16 +233,30 @@ def prepare_evidence_patch(workflow, claim_ids, *, reason, request_id=None):
         request = _evidence_request(runner, request_id) if request_id is not None else None
         if request is not None and ids != request['claim_ids']:
             raise ValueError('Claim IDs must exactly match the evidence request targets')
+        from .pipeline import source_catalog
+        from .schema import id_list
+        catalog = source_catalog(runner.run)
+        existing_refs = id_list(source_refs, 'existing source refs') if source_refs is not None else []
+        if source_refs is not None:
+            if not existing_refs or request is None:
+                raise ValueError('existing-source repair requires nonempty source refs and an exact request_id')
+            missing = set(existing_refs) - catalog.keys()
+            if missing:
+                raise ValueError(f'unknown canonical source refs: {sorted(missing)}')
         addition = None
-        if request is not None:
+        if existing_refs:
+            selected_refs = existing_refs
+        elif request is not None:
             addition = next((row for row in reversed(state.get('evidence_additions', []))
                              if row.get('request_id') == request['request_id']), None)
             if addition is None or not set(request['submitted_source_ids']).intersection(addition['source_ids']):
                 raise ValueError('append canonical sources for this evidence request before requesting a patch')
         elif state.get('evidence_additions'):
             addition = state['evidence_additions'][-1]
-        if addition is None:
-            raise ValueError('append evidence before requesting an evidence repair')
+        if not existing_refs:
+            if addition is None:
+                raise ValueError('append evidence or select existing canonical source refs before requesting an evidence repair')
+            selected_refs = addition['canonical_refs']
         if runner.pending_patch is not None:
             raise ValueError('finish the current pending patch first')
         tasks = runner._tasks()
@@ -262,13 +276,12 @@ def prepare_evidence_patch(workflow, claim_ids, *, reason, request_id=None):
             return dict(status='reviews_pending', blocked=False, layer='deep',
                         pending_claim_ids=missing_deep, next_action='next')
         findings = [dict(claim_id=cid, category='evidence_recovery', resolution_route='claim_patch',
-            issue='主 Agent 要求核對新增證據對此主張的影響；不是已認定錯誤',
-            evidence=dict(addition=deepcopy(addition)),
+            issue='主 Agent 要求核對所選證據對此主張的影響；來源存在不代表支持主張',
+            evidence=dict(addition=deepcopy(addition), source_refs=list(selected_refs),
+                          request_id=request_id, repair_mode='existing_evidence' if existing_refs else 'new_evidence'),
             suggested_fix=reason.strip()) for cid in ids]
-        from .pipeline import source_catalog
-        catalog = source_catalog(runner.run)
         findings[0]['evidence']['sources'] = {ref: deepcopy(catalog[ref])
-            for ref in addition['canonical_refs']}
+            for ref in selected_refs}
         outcome = runner.prepare_phase6_revision_v4(findings)
         if 'revision_prompts' in outcome:
             runner.pending_global = runner.global_review_progress = None

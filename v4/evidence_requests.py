@@ -14,7 +14,7 @@ _REQUEST_FIELDS = frozenset({
 })
 _DIMENSION_FIELDS = ("entity", "metric", "period", "unit", "basis", "scope")
 _SEARCH_OUTCOMES = frozenset({"found", "not_found", "unavailable"})
-RESOLUTION_MODES = frozenset({"new_evidence", "claim_revised"})
+RESOLUTION_MODES = frozenset({"new_evidence", "existing_evidence", "claim_revised"})
 _TARGET_REVIEW_STATUSES = frozenset({"resolved", "unresolved"})
 _RECORD_FIELDS = frozenset({
     "request_id", "finding_id", "claim_ids", "claim_hashes", "issue", "evidence_request",
