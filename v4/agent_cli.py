@@ -29,6 +29,7 @@ def _result_exit(payload):
 
 def main(argv=None):
     from .agent_reviews import NativeReviewWorkflow
+    from .agent_workflow import json_read
 
     parser = argparse.ArgumentParser(prog="python -m v4.agent_cli",
                                      description="Experimental native checkpoint exchange; no model is started.")
@@ -65,6 +66,37 @@ def main(argv=None):
     submit.add_argument("--responses", required=True,
                         help="path to a JSON object mapping exact item IDs to JSON objects/arrays")
 
+    claim = sub.add_parser("claim-reviews", help="reserve disjoint bounded review batches for this executor")
+    claim.add_argument('--work-dir', required=True)
+    claim.add_argument('--executor', required=True)
+    claim.add_argument('--max-items', type=int, default=4, choices=range(1,17))
+    claim.add_argument('--batch-size', type=int, default=4, choices=range(1,17))
+    claim.add_argument('--lease-seconds', type=float, default=3600)
+    claim.add_argument('--takeover-incomplete', action='store_true', help='fresh full review after explicit reviewer handoff; accepted receipts are retained')
+
+    dependency_claim = sub.add_parser('claim-dependencies', help='reserve an independent dependency completion chunk')
+    dependency_claim.add_argument('--work-dir', required=True)
+    dependency_claim.add_argument('--executor', required=True)
+    dependency_claim.add_argument('--max-items', type=int, default=12, choices=range(1,65))
+    dependency_claim.add_argument('--lease-seconds', type=float, default=3600)
+
+    submit_request = sub.add_parser('submit-review-request', help='submit the actual raw wire-batch answer')
+    submit_request.add_argument('--work-dir', required=True)
+    submit_request.add_argument('--executor', required=True)
+    submit_request.add_argument('--packet-id', required=True)
+    submit_request.add_argument('--request-id', required=True)
+    submit_request.add_argument('--input-hash', required=True)
+    submit_request.add_argument('--response', required=True, help='JSON object returned by the model')
+
+    for operation in ('renew-reviews', 'release-reviews'):
+        lease_parser = sub.add_parser(operation, help='renew/release an executor reservation')
+        lease_parser.add_argument('--work-dir', required=True)
+        lease_parser.add_argument('--executor', required=True)
+        lease_parser.add_argument('--packet-id', required=True)
+        lease_parser.add_argument('--lease-id', required=True)
+        if operation == 'renew-reviews':
+            lease_parser.add_argument('--lease-seconds', type=float, default=3600)
+
     retry = sub.add_parser("retry-role", help="discard uncommitted candidates for one role")
     retry.add_argument("--work-dir", required=True)
     retry.add_argument("--role", required=True)
@@ -82,7 +114,10 @@ def main(argv=None):
     secondary.add_argument("--work-dir", required=True)
     secondary.add_argument("--agy-model", required=True, help="explicit AGY secondary model ID")
     secondary.add_argument("--max-workers", type=int, default=4, choices=range(1, 9))
-    secondary.add_argument("--max-items", type=int, default=16, choices=range(1, 17))
+    secondary.add_argument("--max-items", type=int, default=16, help="positive total Claim budget for this dispatch window")
+    secondary.add_argument('--batch-size', type=int, default=4, choices=range(1,17))
+    secondary.add_argument('--single-packet', action='store_true', help='stop at the initial packet boundary')
+    secondary.add_argument('--lease-seconds', type=float, default=3600)
 
     retry_link = sub.add_parser("retry-link", help="retry a rejected finding linker mapping")
     retry_link.add_argument("--work-dir", required=True)
@@ -203,6 +238,23 @@ def main(argv=None):
             from .evidence_repair import prepare_evidence_patch
             return _result_exit(prepare_evidence_patch(NativeReviewWorkflow(args.work_dir), args.claim_id,
                 reason=args.reason, request_id=args.request_id, source_refs=args.source_ref))
+        if args.command == 'claim-dependencies':
+            return _result_exit(NativeReviewWorkflow(args.work_dir).claim_dependency_reviews(args.executor,
+                max_items=args.max_items, lease_seconds=args.lease_seconds))
+        if args.command == 'claim-reviews':
+            return _result_exit(NativeReviewWorkflow(args.work_dir).claim_reviews(args.executor,
+                max_items=args.max_items, batch_size=args.batch_size, lease_seconds=args.lease_seconds,
+                takeover_incomplete=args.takeover_incomplete))
+        if args.command == 'submit-review-request':
+            response = json_read(args.response)
+            return _result_exit(NativeReviewWorkflow(args.work_dir).submit_review_request(
+                args.packet_id, args.request_id, response, args.executor, args.input_hash))
+        if args.command in ('renew-reviews', 'release-reviews'):
+            queue = NativeReviewWorkflow(args.work_dir).queue
+            result = (queue.renew_items(args.packet_id, args.executor, args.lease_id, args.lease_seconds)
+                      if args.command == 'renew-reviews' else
+                      queue.release_items(args.packet_id, args.executor, args.lease_id))
+            return _result_exit(dict(status=args.command, **result))
         if args.command == "next":
             payload = NativeReviewWorkflow(args.work_dir).next()
             if args.prompt_files and payload.get('kind') == 'roles':
@@ -247,22 +299,31 @@ def main(argv=None):
             from .agent_dispatch import dispatch_secondary_reviews
             workflow = NativeReviewWorkflow(args.work_dir)
             pending = workflow.next()
-            if pending.get("kind") not in ("atomic", "deep"):
+            dependency_ready = (pending.get("kind") == "dependency" or
+                (pending.get("kind") == "global" and
+                 set(pending.get("items", {})) == {"global_dependency_completion"}))
+            if pending.get("kind") not in ("atomic", "deep") and not dependency_ready:
                 return _result_exit(dict(status="host_owned", packet=pending,
                                          reason="current work belongs to the host Agent"))
             try:
                 from .cloud import AntigravityCloudClient
                 client = AntigravityCloudClient(args.agy_model)
             except (RuntimeError, ValueError) as exc:
+                with workflow.queue.transaction() as state:
+                    identity = 'antigravity/' + args.agy_model
+                    previous = state.setdefault('secondary_availability', {}).get(identity, {})
+                    state['secondary_availability'][identity] = dict(status='unavailable',
+                        reason_code='secondary_unavailable', generation=previous.get('generation', 0))
                 return _result_exit(dict(status="fallback_to_main",
                                          reason=f"{type(exc).__name__}: {exc}",
                                          warnings=[workflow.record_secondary_event(pending, code='secondary_unavailable',
                                              requested_identity='antigravity/' + args.agy_model,
-                                             failed_claim_ids=pending['items'])],
+                                             failed_claim_ids=pending.get('items', {}))],
                                          packet=pending))
             return _result_exit(dispatch_secondary_reviews(
                 workflow, client, max_workers=args.max_workers,
-                max_items=args.max_items))
+                max_items=args.max_items, batch_size=args.batch_size,
+                continuous=not args.single_packet, lease_seconds=args.lease_seconds))
         if args.command == "retry-global":
             return _result_exit(NativeReviewWorkflow(args.work_dir).retry_global(args.reason))
         if args.command == "retry-patch":

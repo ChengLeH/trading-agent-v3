@@ -104,25 +104,33 @@ def pack_review_requests(tasks, *, batch_size, max_bytes, verification_epoch, la
     return output
 
 
-def unpack_review_result(result, expected_ids):
+def unpack_review_result(result, expected_ids, *, preserve_unambiguous=False):
     if not isinstance(result, dict) or not isinstance(result.get("results"), list):
         return {}  # contract retry must ask the LLM, never invent a verdict
-    output = {}
+    output, ambiguous = {}, set()
     for row in result["results"]:
         if not isinstance(row, dict) or not isinstance(row.get("claim_id"), str):
             continue  # unidentifiable row is a missing Claim, not prose routing
         cid = row["claim_id"]
-        if cid not in expected_ids or cid in output:
+        if cid not in expected_ids:
+            if preserve_unambiguous:
+                continue
+            raise ValueError("unknown or duplicate batched review Claim ID")
+        if cid in output or cid in ambiguous:
+            if preserve_unambiguous:
+                output.pop(cid, None)
+                ambiguous.add(cid)
+                continue
             raise ValueError("unknown or duplicate batched review Claim ID")
         output[cid] = row
     return output
 
 
-def unpack_prepared_review_result(request, result):
+def unpack_prepared_review_result(request, result, *, preserve_unambiguous=False):
     """Honor the schema issued by prepare, including intact single-item fallback."""
     ids = request['claim_ids']
     if 'results' in request['response_schema'].get('properties', {}):
-        return unpack_review_result(result, ids)
+        return unpack_review_result(result, ids, preserve_unambiguous=preserve_unambiguous)
     if len(ids) != 1:
         raise ValueError('single review schema requires exactly one Claim ID')
-    return unpack_review_result(dict(results=[result]), ids)
+    return unpack_review_result(dict(results=[result]), ids, preserve_unambiguous=preserve_unambiguous)

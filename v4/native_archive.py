@@ -141,7 +141,7 @@ class NativeArchive:
     @staticmethod
     def _slot(state, path):
         if (not isinstance(path, list) or not all(isinstance(part, str) for part in path)
-                or not ((len(path) == 3 and path[0] == 'packets' and path[2] in ('items', 'received'))
+                or not ((len(path) == 3 and path[0] == 'packets' and path[2] in ('items', 'received', 'wire_requests', 'batch_sources', 'wire_outcomes'))
                         or (len(path) == 2 and path[0] == 'patch_outcomes'))):
             raise ValueError('native archive reference has an unsupported path')
         try:
@@ -158,7 +158,7 @@ class NativeArchive:
     def _payload_slots(state):
         for packet_id, packet in state.get('packets', {}).items():
             if isinstance(packet, dict):
-                for field in ('items', 'received'):
+                for field in ('items', 'received', 'wire_requests', 'batch_sources', 'wire_outcomes'):
                     if field in packet:
                         yield ['packets', packet_id, field], packet, field
         for packet_id in state.get('patch_outcomes', {}):

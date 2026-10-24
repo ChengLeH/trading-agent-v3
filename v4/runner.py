@@ -895,15 +895,40 @@ class PipelineRunnerV4:
         return tasks
 
     def prepare_phase6_deep_review(self, claim_ids=None, *, enforce_budget=True):
-        return self._prepare_phase6_deep_review(self._require_atomic(), claim_ids,
+        return self._prepare_phase6_deep_review(self._tasks(), claim_ids,
                                                 enforce_budget=enforce_budget)
 
-    def _prepare_phase6_deep_review(self, tasks, claim_ids=None, *, enforce_budget=True):
-        tasks = self._require_atomic(tasks)
-        eligible = [cid for cid in tasks if self.receipts[cid]["result"]["verdict"] != "PASS"]
-        wanted = eligible if claim_ids is None else id_list(list(claim_ids), "deep claim IDs")
-        if not wanted or set(wanted) - set(eligible):
+    def _deep_review_scope(self, tasks, claim_ids=None):
+        if not tasks:
+            raise ValueError("cannot deep-review an empty claim graph")
+        if claim_ids is None:
+            self._require_atomic(tasks)
+            wanted = []
+            for cid in tasks:
+                result = self.receipts[cid].get("result")
+                verdict = result.get("verdict") if isinstance(result, dict) else None
+                if verdict == "PASS":
+                    continue
+                if verdict not in {"SUSPICIOUS", "FAIL"}:
+                    raise ValueError("deep review accepts only first-layer SUSPICIOUS/FAIL")
+                wanted.append(cid)
+        else:
+            wanted = id_list(list(claim_ids), "deep claim IDs")
+        if not wanted or set(wanted) - set(tasks):
             raise ValueError("deep review accepts only first-layer SUSPICIOUS/FAIL")
+        for cid in wanted:
+            receipt = self.receipts.get(cid)
+            if not isinstance(receipt, dict):
+                raise ValueError("each deep-reviewed Claim requires its atomic review")
+            require_model_identity(receipt.get("model"))
+            result = receipt.get("result")
+            if (not isinstance(result, dict) or result.get("claim_id") != cid
+                    or result.get("verdict") not in {"SUSPICIOUS", "FAIL"}):
+                raise ValueError("deep review accepts only first-layer SUSPICIOUS/FAIL")
+        return wanted
+
+    def _prepare_phase6_deep_review(self, tasks, claim_ids=None, *, enforce_budget=True):
+        wanted = self._deep_review_scope(tasks, claim_ids)
         self.pending_deep = {cid: digest(tasks[cid].to_dict()) for cid in wanted}
         requests = {cid: self._reference_review_request(
             tasks[cid], "deep", first_review=self.receipts[cid]["result"]) for cid in wanted}
@@ -916,7 +941,7 @@ class PipelineRunnerV4:
                     response_schemas=schemas)
 
     def prepare_phase6_deep_review_batches(self, claim_ids=None):
-        tasks = self._require_atomic()
+        tasks = self._tasks()
         prepared = self._prepare_phase6_deep_review(tasks, claim_ids)
         if any(cid in self.reference_supplements["deep"] for cid, _ in prepared["deep_prompts"]):
             requests = [dict(request_id=cid, claim_ids=[cid], prompt=prompt,
@@ -966,11 +991,15 @@ class PipelineRunnerV4:
         require_model_identity(model_identity)
         if not self.pending_deep:
             raise ValueError("prepare deep review first")
-        tasks = self._require_atomic()
         all_pending = self.pending_deep
+        tasks = self._tasks()
+        self._deep_review_scope(tasks, list(all_pending))
+        if any(cid not in tasks or digest(tasks[cid].to_dict()) != item_hash
+               for cid, item_hash in all_pending.items()):
+            raise ValueError("state changed during deep review")
         pending = self._received_review_scope(all_pending, results_by_claim, allow_partial)
         related_diagnostics_ids = [cid for cid in all_pending
-                                   if cid in tasks and task_requires_scoped_review(tasks[cid])]
+                                   if task_requires_scoped_review(tasks[cid])]
         pending = {cid: h for cid, h in pending.items() if cid not in related_diagnostics_ids}
         accepted_results = {cid: row for cid, row in results_by_claim.items()
                             if cid not in related_diagnostics_ids}
@@ -982,7 +1011,8 @@ class PipelineRunnerV4:
             raise ValueError("state changed during deep review")
         merged_results, supplement_errors = self._merge_reference_supplements("deep", accepted_results, model_identity)
         summary = summarize_atomic_results(pending, merged_results,
-                                            expected_refs_by_claim={cid: review_ref_ids(t.claim) for cid, t in tasks.items()},
+                                            expected_refs_by_claim={cid: review_ref_ids(tasks[cid].claim)
+                                                                    for cid in pending},
                                             report_invalid=True)
         summary["supplement_errors"] = supplement_errors
         self._bind_completed_reference_sources("deep", summary["results"])
@@ -1004,14 +1034,27 @@ class PipelineRunnerV4:
             blocked = self._block_related_diagnostics("deep", related_diagnostics_ids, tasks, allow_partial=allow_partial)
             if blocked is not None:
                 return {**summary, **blocked}
-        missing = [cid for cid in tasks if self.receipts[cid]["result"]["verdict"] != "PASS"
-                   and cid not in self.deep_receipts]
-        if allow_partial and missing:
-            self.pending_deep = {cid: digest(tasks[cid].to_dict()) for cid in missing}
-            self.status = "deep"
+
+        # Keep only already-issued, unreceived deep work in pending_deep. Other
+        # ready claims remain visible to the caller but must be prepared first.
+        unreceived_prepared = [cid for cid in all_pending if cid not in self.deep_receipts]
+        self.pending_deep = ({cid: digest(tasks[cid].to_dict()) for cid in unreceived_prepared}
+                             if unreceived_prepared else None)
+        pending_atomic = [cid for cid in tasks if cid not in self.receipts]
+        pending_deep = [cid for cid in tasks
+                        if cid in self.receipts
+                        and self.receipts[cid]["result"]["verdict"] != "PASS"
+                        and cid not in self.deep_receipts]
+        if pending_atomic or pending_deep:
+            self.status = "atomic" if pending_atomic else "deep"
             self._persist()
+            pending_ids = [cid for cid in tasks if cid in set(pending_atomic) | set(pending_deep)]
             return {**summary, "blocked": False, "complete": False, "partial": True,
-                    "pending_claim_ids": missing}
+                    "status": self.status, "pending_claim_ids": pending_ids,
+                    "pending_atomic_claim_ids": pending_atomic,
+                    "pending_deep_claim_ids": pending_deep,
+                    "needs_deep_review": bool(pending_deep)}
+
         self.pending_deep = None
         claim_findings = self._claim_review_findings()
         deferred = {row.get("finding_id"): deepcopy(row) for row in self.deferred_global_findings
@@ -1325,7 +1368,7 @@ class PipelineRunnerV4:
         if missing:
             raise ValueError(f"incomplete role generation; missing {sorted(missing)}; restart role generation from manifest")
 
-    def prepare_phase6_global_sweep(self):
+    def prepare_phase6_global_sweep(self, *, dependency_claim_ids=None):
         snapshot = self.orch.snapshot(self.run_id)
         state = self._state(snapshot)
         tasks = self._tasks(snapshot=snapshot, state=state)
@@ -1360,8 +1403,21 @@ class PipelineRunnerV4:
             if status["missing_dependency_claim_ids"]:
                 if not status["needs_retry"]:
                     return status
-                target_ids = status["missing_dependency_claim_ids"][:self.global_dependency_batch_size]
+                missing_ids = status["missing_dependency_claim_ids"]
+                if dependency_claim_ids is None:
+                    target_ids = missing_ids[:self.global_dependency_batch_size]
+                else:
+                    if (not isinstance(dependency_claim_ids, (list, tuple)) or not dependency_claim_ids
+                            or len(dependency_claim_ids) > self.global_dependency_batch_size):
+                        raise ValueError("dependency_claim_ids must be a nonempty list within the configured batch size")
+                    target_ids = id_list(list(dependency_claim_ids), "dependency_claim_ids")
+                    if len(set(target_ids)) != len(target_ids):
+                        raise ValueError("dependency_claim_ids must not contain duplicates")
+                    if set(target_ids) - set(missing_ids):
+                        raise ValueError("dependency_claim_ids must be currently missing dependency reviews")
             else:
+                if dependency_claim_ids is not None:
+                    raise ValueError("dependency completion cannot be scoped when no claims are missing")
                 return status
             self.pending_global["target_claim_ids"] = target_ids
             self.status = "global_dependency_completion"
@@ -1374,8 +1430,7 @@ class PipelineRunnerV4:
             external_candidates = self._external_resolution_candidates(
                 self.deferred_global_findings, state=state, task_hashes=task_hashes,
                 received_attempts=received_attempts)
-            return ("global_dependency_completion", json_prompt(
-                SINGLE_REVIEW_INSTRUCTIONS + FINANCIAL_REVIEW_CONTRACT + EVIDENCE_REQUEST_INSTRUCTIONS +
+            dependency_prompt = (
                 '先前全局跨章掃描已完成，本次只回傳 target_claim_ids 所列的 dependency_reviews，'
                 '保留既有 findings，不重做全文掃描、不重回已審列、不把漏審視為無依賴。'
                 'original_resolved_external_findings 會由系統與本次結果合併；本次 resolved_external_findings 只列新項，'
@@ -1386,7 +1441,19 @@ class PipelineRunnerV4:
                 '回傳 JSON object：findings（本次新發現的問題，無則 []）及 dependency_reviews。'
                 '對 target_claim_ids 每個恰回 {claim_id,required_dependencies:[精確ID],unresolved:boolean,reason:簡短語義理由}。'
                 '只列指定 ID，不回傳其他 Claim 的審查列；理由限於必要因果，勿複述整段原文。'
-                'required_dependencies 可指向 claim_catalog 的任何合法前提，不能指自己或後續結論。',
+                'required_dependencies 可指向 claim_catalog 的任何合法前提，不能指自己或後續結論。')
+            if dependency_claim_ids is not None:
+                dependency_prompt = (
+                    '此為獨立並行的窄範圍 dependency completion；只審 target_claim_ids 列出的 Claims。'
+                    'findings 必須回傳空陣列 []，resolved_external_findings 必須回傳空陣列 []；'
+                    '不得重新評估全局 findings、外部 resolution 或任何範圍外 Claim。'
+                    '每個 target_claim_ids 項目都必須回傳一筆 dependency_reviews；若不能判定，填 unresolved=true。'
+                    '回傳 JSON object：findings、resolved_external_findings、dependency_reviews。'
+                    'dependency_reviews 每項格式為 {claim_id,required_dependencies:[精確ID],unresolved:boolean,reason:簡短語義理由}。'
+                    'dependency_claim_ids 是本次核准範圍，不能回傳範圍外的 Claim。')
+            return ("global_dependency_completion", json_prompt(
+                SINGLE_REVIEW_INSTRUCTIONS + FINANCIAL_REVIEW_CONTRACT + EVIDENCE_REQUEST_INSTRUCTIONS +
+                dependency_prompt,
                 dict(review_scope="dependency_completion", target_claim_ids=target_ids,
                      coverage_round=self.pending_global["coverage_round"] + 1,
                      verification_epoch=self._verification_epoch, state=global_state,
@@ -1939,18 +2006,55 @@ class PipelineRunnerV4:
             prior["target_reviews"] = old_reviews
         return merged
 
-    def collect_phase6_global_sweep(self, findings, *, model_identity=None):
+    def collect_phase6_global_sweep(self, findings, *, model_identity=None,
+                                    dependency_reviewer=None, dependency_claim_ids=None):
         require_model_identity(model_identity)
+        if (dependency_claim_ids is None) != (dependency_reviewer is None):
+            raise ValueError("dependency_reviewer and dependency_claim_ids must be supplied together")
+        parallel_dependency = dependency_claim_ids is not None
+        if parallel_dependency:
+            require_model_identity(dependency_reviewer)
+            if (not isinstance(dependency_claim_ids, (list, tuple)) or not dependency_claim_ids
+                    or len(dependency_claim_ids) > self.global_dependency_batch_size):
+                raise ValueError("dependency_claim_ids must be a nonempty list within the configured batch size")
+            dependency_claim_ids = id_list(list(dependency_claim_ids), "dependency_claim_ids")
+            if len(set(dependency_claim_ids)) != len(dependency_claim_ids):
+                raise ValueError("dependency_claim_ids must not contain duplicates")
         self._ready_for_global()
         if (not self.pending_global or self.pending_global["input_hash"] != self._hash()
                 or self.pending_global["history_hash"] != digest(self.history)):
             raise ValueError("stale or unprepared global sweep")
         prior = self.pending_global.get("review")
-        requested = self.pending_global.get("target_claim_ids", list(claim_index(self.run.claims)))
+        requested = (dependency_claim_ids if parallel_dependency else
+                     self.pending_global.get("target_claim_ids", list(claim_index(self.run.claims))))
         returned_ids = {row.get("claim_id") for row in findings.get("dependency_reviews", []) if isinstance(row, dict)} if isinstance(findings, dict) else set()
         completed_batches = self.pending_global.get("completed_batches", 0) + int(set(requested) <= returned_ids)
         prior_deferred = deepcopy(self.deferred_global_findings)
         resolution_completion = self.pending_global.get("resolution_completion") if prior else None
+        if parallel_dependency:
+            if not prior or resolution_completion:
+                raise ValueError("parallel dependency completion requires a pending full-global review")
+            current_missing = set(self._global_coverage_status()["missing_dependency_claim_ids"])
+            if set(dependency_claim_ids) - current_missing:
+                raise ValueError("parallel dependency chunk is stale or includes an already reviewed Claim")
+            if (not isinstance(findings, dict)
+                    or findings.get("findings", []) != []
+                    or not isinstance(findings.get("findings", []), list)
+                    or findings.get("resolved_external_findings", []) != []
+                    or not isinstance(findings.get("resolved_external_findings", []), list)):
+                raise ValueError("parallel dependency chunks must not return findings or external resolutions")
+            normalize_dependency_review(self.run.claims, findings, allow_partial=True,
+                                        expected_claim_ids=dependency_claim_ids)
+        first_sweep_response_hash = (digest(deepcopy(findings)) if prior is None else
+                                     self.pending_global.get("sweep_response_hash")
+                                     or digest(prior["response"]))
+        dependency_reviewers = deepcopy(self.pending_global.get("dependency_reviewers", {}))
+        if prior and not dependency_reviewers:
+            dependency_reviewers = {row["claim_id"]: prior["model"]
+                                    for row in prior["response"].get("dependency_reviews", [])
+                                    if isinstance(row, dict) and isinstance(row.get("claim_id"), str)}
+        newly_accepted_reviews = (deepcopy(findings.get("dependency_reviews", []))
+                                  if isinstance(findings, dict) else [])
         if prior:
             if prior["model"] != model_identity:
                 raise ValueError("dependency completion model differs from saved global reviewer")
@@ -1988,6 +2092,16 @@ class PipelineRunnerV4:
                 findings = dict(findings=deepcopy(prior["response"]["findings"]),
                                 dependency_reviews=deepcopy(prior["response"]["dependency_reviews"]),
                                 resolved_external_findings=merged_resolutions)
+            elif parallel_dependency:
+                findings = dict(
+                    findings=deepcopy(prior["response"]["findings"]),
+                    dependency_reviews=deepcopy(prior["response"]["dependency_reviews"])
+                        + newly_accepted_reviews,
+                    resolved_external_findings=deepcopy(
+                        prior["response"].get("resolved_external_findings", [])))
+                for row in newly_accepted_reviews:
+                    if isinstance(row, dict) and isinstance(row.get("claim_id"), str):
+                        dependency_reviewers[row["claim_id"]] = dependency_reviewer
             else:
                 missing = self._global_coverage_status()["missing_dependency_claim_ids"]
                 normalize_dependency_review(self.run.claims, findings, allow_partial=True, expected_claim_ids=missing)
@@ -1996,6 +2110,13 @@ class PipelineRunnerV4:
                                 resolved_external_findings=deepcopy(
                                     prior["response"].get("resolved_external_findings", [])
                                     + findings.get("resolved_external_findings", [])))
+                for row in newly_accepted_reviews:
+                    if isinstance(row, dict) and isinstance(row.get("claim_id"), str):
+                        dependency_reviewers[row["claim_id"]] = model_identity
+        else:
+            for row in newly_accepted_reviews:
+                if isinstance(row, dict) and isinstance(row.get("claim_id"), str):
+                    dependency_reviewers[row["claim_id"]] = model_identity
         audit = normalize_dependency_review(self.run.claims, findings, allow_partial=True)
         self._validate_global_findings(findings["findings"])
         resolved_external, rejected_external, resolution_progress = self._validate_external_resolutions(
@@ -2010,7 +2131,9 @@ class PipelineRunnerV4:
         coverage_round = self.pending_global["coverage_round"] + 1
         if audit["missing_dependency_claim_ids"]:
             self.pending_global.update(review=dict(model=model_identity, response=deepcopy(findings)), coverage_round=coverage_round,
-                                       completed_batches=completed_batches)
+                                       completed_batches=completed_batches,
+                                       dependency_reviewers=dependency_reviewers,
+                                       sweep_response_hash=first_sweep_response_hash)
             result = self._global_coverage_status()
             self.global_review_progress = dict(format="v4-global-progress/1", verification_epoch=self._verification_epoch,
                                               **{**deepcopy(self.pending_global), **deepcopy(result)})
@@ -2106,7 +2229,10 @@ class PipelineRunnerV4:
                                    findings=deepcopy(findings), clarity_notes=deepcopy(clarity_notes), model=model_identity,
                                    resolved_external_findings=deepcopy(resolved_external),
                                    rejected_external_resolutions=deepcopy(rejected_external),
-                                   dependency_reviews=deepcopy(audit["dependency_reviews"]))
+                                   dependency_reviews=deepcopy(audit["dependency_reviews"]),
+                                   dependency_reviewers={row["claim_id"]: dependency_reviewers.get(
+                                       row["claim_id"], model_identity) for row in audit["dependency_reviews"]},
+                                   sweep_response_hash=first_sweep_response_hash)
         self.pending_global = None
         self.global_review_progress = None
         self.status = "revision" if findings else "verified"

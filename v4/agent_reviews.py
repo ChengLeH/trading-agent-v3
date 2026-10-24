@@ -9,11 +9,15 @@ replayed from matching raw response archives; the real runner alone decides
 revision/finalization gates. No model/provider or tool is started in this unit.
 """
 import json
+import time
 from copy import deepcopy
 from uuid import uuid4
 from types import SimpleNamespace
 
 from .agent_workflow import NativeWorkflow, json_read, _require_identity
+from .agent_queue import submit_items_in_state
+from .native_scheduling import NativeScheduling, leased_review_ids, retire_unowned_review_packets
+from .native_dependency_batches import NativeDependencyBatchMixin, dependency_identity, collect_dependency_packet
 from .journal import RunJournal
 from .schema import digest
 from .review_budget import review_budget_for, review_budget_row, review_wire_breakdown
@@ -62,7 +66,7 @@ def configure_review_budget(workflow, *, max_item_bytes=None, max_packet_bytes=N
         return dict(status='review_budget_updated', **event)
 
 
-class NativeReviewWorkflow(NativeWorkflow):
+class NativeReviewWorkflow(NativeDependencyBatchMixin, NativeScheduling, NativeWorkflow):
     def _options(self, state):
         options = state.get("options", {})
         size = options.get("review_group_size", DEFAULT_REVIEW_GROUP_SIZE)
@@ -167,10 +171,12 @@ class NativeReviewWorkflow(NativeWorkflow):
             pending = runner._pending_revision_block()
             if pending:
                 return self._next_patch_packet(state, runner) or pending
+            retire_unowned_review_packets(state)
             active = state["packets"].get(state.get("active_packet_id"))
             processed = state.setdefault("processed_items", {})
             if (active and active.get("kind") in REVIEW_KINDS and not active.get("retired")
-                    and any(processed.get(cid) != active["packet_id"] for cid in active["received"])):
+                    and any(cid not in active.get("processed_item_ids", {}) and processed.get(cid) != active["packet_id"]
+                            for cid in active["received"])):
                 outcome = self._ingest_reviews(state, runner, active)
                 self._save(state, runner)
                 if outcome.get("blocked") and not outcome.get("needs_retry"):
@@ -184,6 +190,7 @@ class NativeReviewWorkflow(NativeWorkflow):
             if layer is None:
                 return self._next_global(state, runner, active)
             size, cap = self._options(state)
+            held = leased_review_ids(state, layer)
             if active and active.get("kind") in REVIEW_KINDS and not active.get("retired"):
                 outstanding = {cid: deepcopy(item) for cid, item in active["items"].items()
                                if cid not in active["received"]}
@@ -192,11 +199,25 @@ class NativeReviewWorkflow(NativeWorkflow):
                                    and item["schema"] == schemas[cid]
                                    and item["review_context"] == runner.review_context_for(layer, [cid], tasks=tasks)
                                    for cid, item in outstanding.items()))
-                if outstanding and current:
+                available = {cid: item for cid, item in outstanding.items() if cid not in held}
+                if available and current:
                     return dict(status="reviews", packet_id=active["packet_id"], kind=layer,
-                                input_hash=state["input_hash"], items=outstanding)
-                active["retired"] = True
-                state["active_packet_id"] = None
+                                input_hash=state["input_hash"], items=available)
+                if not any(lease["expires_at"] > time.time()
+                           for lease in active.get("item_leases", {}).values()):
+                    active["retired"] = True
+                    state["active_packet_id"] = None
+            prompts = {cid: prompt for cid, prompt in prompts.items() if cid not in held}
+            if not prompts and layer == "atomic":
+                ready = [cid for cid in tasks if cid in runner.receipts
+                         and runner.receipts[cid]["result"]["verdict"] != "PASS"
+                         and cid not in runner.deep_receipts and cid not in leased_review_ids(state, "deep")]
+                if ready:
+                    prepared = runner._prepare_phase6_deep_review(tasks, ready, enforce_budget=False)
+                    layer, prompts, schemas = "deep", dict(prepared["deep_prompts"]), prepared["response_schemas"]
+            if not prompts:
+                return dict(status="reviews_in_flight", kind=layer, items={},
+                            reason="ready work is reserved; renew or await its owner, or reclaim after lease expiry")
             return self._issue_review_packet(state, runner, layer, prompts, schemas, size, cap, tasks)
 
     @staticmethod
@@ -215,7 +236,24 @@ class NativeReviewWorkflow(NativeWorkflow):
                     resolution_completion_hash=(digest(pending["resolution_completion"])
                                                 if pending.get("resolution_completion") else None))
 
+    @staticmethod
+    def _prepare_global_packet(runner, packet):
+        if packet.get("parallel_dependency"):
+            return runner.prepare_phase6_global_sweep(
+                dependency_claim_ids=packet["global_context"]["target_claim_ids"])
+        return runner.prepare_phase6_global_sweep()
+
+    @staticmethod
+    def _collect_global_packet(runner, packet, row):
+        if packet.get("parallel_dependency"):
+            return collect_dependency_packet(runner, packet, row)
+        return runner.collect_phase6_global_sweep(deepcopy(row["response"]), model_identity=row["executor"])
+
     def _matches_global(self, runner, packet, prepared):
+        if packet.get("parallel_dependency"):
+            return (isinstance(prepared, tuple) and prepared[0] == "global_dependency_completion"
+                    and packet["global_context"] == dependency_identity(
+                        runner, packet["global_context"]["target_claim_ids"]))
         role = next(iter(packet["items"]))
         return (isinstance(prepared, tuple) and len(prepared) == 2
                 and prepared[0] == role and packet["input_hash"] == runner._hash()
@@ -308,7 +346,17 @@ class NativeReviewWorkflow(NativeWorkflow):
                     runner.status = "verified"
                     restored_final_global = packet["packet_id"]
                     break
-        for packet in state.get("packets", {}).values():
+        acceptance_order = state.get("global_acceptance_order", [])
+        if (not isinstance(acceptance_order, list) or len(set(acceptance_order)) != len(acceptance_order)
+                or any(pid not in state["packets"] for pid in acceptance_order)):
+            raise ValueError("invalid global acceptance order")
+        acceptance_index = {pid: idx for idx, pid in enumerate(acceptance_order)}
+        # Pre-upgrade accepted packets precede the explicit new acceptance log.
+        # Within parallel chunks, submission order (not issue order) is replayed.
+        packets = list(state.get("packets", {}).values())
+        packets.sort(key=lambda p: ((1, acceptance_index[p["packet_id"]])
+                     if p["packet_id"] in acceptance_index else (0, 0)))
+        for packet in packets:
             if packet.get("kind") != "global" or not current_epoch(packet):
                 continue
             role = next(iter(packet["items"]))
@@ -343,11 +391,10 @@ class NativeReviewWorkflow(NativeWorkflow):
                 runner.global_review_progress = None
                 runner.status = 'revision'
                 continue
-            request = runner.prepare_phase6_global_sweep()
+            request = self._prepare_global_packet(runner, packet)
             if not self._matches_global(runner, packet, request):
                 raise ValueError("global packet replay request mismatch")
-            outcome = runner.collect_phase6_global_sweep(
-                deepcopy(row["response"]), model_identity=row["executor"])
+            outcome = self._collect_global_packet(runner, packet, row)
             if digest(outcome) != digest(stored):
                 raise ValueError("replayed global outcome differs from accepted candidate")
         runner.pending_patch = pending_patch
@@ -450,6 +497,17 @@ class NativeReviewWorkflow(NativeWorkflow):
                 self._save(state, runner)
                 return evidence_work
             return self._prepare_global_repair(state, runner, findings=semantic_findings)
+        # Recover a candidate persisted by an older two-transaction submit
+        # that crashed before collection. New global submits commit atomically.
+        for candidate in state["packets"].values():
+            if (candidate.get("parallel_dependency") and not candidate.get("retired")
+                    and candidate.get("input_hash") == state["input_hash"]
+                    and candidate.get("global_context", {}).get("verification_epoch") == runner._verification_epoch
+                    and "global_dependency_completion" in candidate.get("received", {})
+                    and candidate["packet_id"] not in state.get("global_outcomes", {})):
+                outcome = self._ingest_global(state, runner, candidate)
+                self._save(state, runner)
+                return outcome
         blocked = state.get("global_blocked")
         if blocked:
             return dict(status="blocked:global_contract", blocked=True,
@@ -494,6 +552,19 @@ class NativeReviewWorkflow(NativeWorkflow):
             result['sidecar']['execution_disclosure'] = deepcopy(disclosure)
             return result
 
+        if (state.get("parallel_dependency_mode") and runner.pending_global
+                and runner.pending_global.get("review") and not runner.pending_global.get("resolution_completion")):
+            coverage = runner._global_coverage_status()
+            missing = coverage["missing_dependency_claim_ids"]
+            if missing:
+                current_root = dependency_identity(runner, missing[:1])
+                current_root.pop("target_claim_ids")
+                if current_root == state["parallel_dependency_mode"]:
+                    self._save(state, runner)
+                    return ({**coverage, "status": "global_dependency_ready", "kind": "dependency", "blocked": False,
+                             "next_action": "claim-dependencies or dispatch-secondary"}
+                            if coverage.get("needs_retry") else coverage)
+                state.pop("parallel_dependency_mode", None)
         try:
             prepared = runner.prepare_phase6_global_sweep()
         except ValueError as exc:
@@ -783,16 +854,15 @@ class NativeReviewWorkflow(NativeWorkflow):
         if packet["packet_id"] in state.get("global_outcomes", {}):
             return deepcopy(state["global_outcomes"][packet["packet_id"]])
         try:
-            prepared = runner.prepare_phase6_global_sweep()
+            RunJournal(self.directory).archive_external_submission(
+                runner, model=row["executor"], task_id=role,
+                prompt=packet["items"][role]["prompt"], response=deepcopy(row["response"]))
+            prepared = self._prepare_global_packet(runner, packet)
             if not self._matches_global(runner, packet, prepared):
                 raise ValueError("global work packet no longer matches canonical request")
             if not isinstance(row["response"], dict):
                 raise ValueError("global response must be a JSON object")
-            RunJournal(self.directory).archive_external_submission(
-                runner, model=row["executor"], task_id=role,
-                prompt=packet["items"][role]["prompt"], response=deepcopy(row["response"]))
-            result = runner.collect_phase6_global_sweep(
-                deepcopy(row["response"]), model_identity=row["executor"])
+            result = self._collect_global_packet(runner, packet, row)
         except (ValueError, TypeError, KeyError) as exc:
             failure = dict(packet_id=packet["packet_id"], executor=row["executor"],
                            reason=f"{type(exc).__name__}: {exc}")
@@ -808,6 +878,7 @@ class NativeReviewWorkflow(NativeWorkflow):
                 state.setdefault("global_receipt_snapshots", {})[packet["packet_id"]] = \
                     deepcopy(runner.global_receipt)
         state.setdefault("global_outcomes", {})[packet["packet_id"]] = deepcopy(result)
+        state.setdefault("global_acceptance_order", []).append(packet["packet_id"])
         return result
 
     def retry_global(self, reason):
@@ -922,9 +993,28 @@ class NativeReviewWorkflow(NativeWorkflow):
                 return outcome
         if isinstance(packet, dict) and packet.get("kind") == "global":
             _require_identity(executor, "executor")
-            self.queue.submit(packet_id, responses, executor, input_hash)
             with self.queue.transaction() as state:
                 runner = self._load(state)
+                packet = state["packets"][packet_id]
+                accepted = state.get("global_outcomes", {}).get(packet_id)
+                if accepted is not None:
+                    context = packet["global_context"]
+                    if (state["input_hash"] != input_hash or packet["input_hash"] != input_hash
+                            or context.get("verification_epoch") != runner._verification_epoch
+                            or context.get("history_hash") != digest(runner.history)):
+                        raise ValueError("stale accepted global response")
+                    if (not isinstance(responses, dict) or set(responses) != set(packet["items"])
+                            or any(packet["received"].get(role, {}).get("executor") != executor
+                                   or packet["received"].get(role, {}).get("response") != response
+                                   for role, response in responses.items())):
+                        raise ValueError("conflicting duplicate global response")
+                    for role, response in responses.items():
+                        if RunJournal(self.directory).response_provenance(runner,
+                                SimpleNamespace(identity=executor), role,
+                                packet["items"][role]["prompt"], response) is None:
+                            raise ValueError("accepted global response has no verified raw archive")
+                    return {**deepcopy(accepted), "idempotent": True}
+                submit_items_in_state(state, packet_id, responses, executor, input_hash)
                 outcome = self._ingest_global(state, runner, state["packets"].get(packet_id))
                 self._save(state, runner)
                 return outcome
@@ -955,14 +1045,15 @@ class NativeReviewWorkflow(NativeWorkflow):
             prepared = runner._prepare_phase6_atomic(tasks, enforce_budget=False)
             prompts, _schemas = dict(prepared["atomic_prompts"]), prepared["response_schemas"]
         else:
-            wanted = [cid for cid in tasks if runner.receipts[cid]["result"]["verdict"] != "PASS"
+            wanted = [cid for cid in tasks if cid in runner.receipts and runner.receipts[cid]["result"]["verdict"] != "PASS"
                       and cid not in runner.deep_receipts]
             prepared = runner._prepare_phase6_deep_review(tasks, wanted, enforce_budget=False)
             prompts, _schemas = dict(prepared["deep_prompts"]), prepared["response_schemas"]
         journal = RunJournal(self.directory)
         for cid in list(packet["received"]):
-            if processed.get(cid) == packet_id:
+            if cid in packet.get("processed_item_ids", {}) or processed.get(cid) == packet_id:
                 continue
+            packet.setdefault("processed_item_ids", {})[cid] = True
             row = packet["received"][cid]
             item = packet["items"][cid]
             context = item["review_context"]
@@ -997,10 +1088,12 @@ class NativeReviewWorkflow(NativeWorkflow):
                 continue
             prompt = item["prompt"]
             try:
-                proof = journal.archive_external_submission(
-                    runner, model=row["executor"], task_id=f"{layer}.{cid}", prompt=prompt,
-                    response=deepcopy(row["response"]), response_schema=item["schema"],
-                    review_context=context)
+                proof = packet.get("batch_sources", {}).get(cid)
+                if proof is None:
+                    proof = journal.archive_external_submission(
+                        runner, model=row["executor"], task_id=f"{layer}.{cid}", prompt=prompt,
+                        response=deepcopy(row["response"]), response_schema=item["schema"],
+                        review_context=context)
                 runner._latest_review_sources[layer][cid] = {**proof, "claim_id": cid, "layer": layer}
                 summary = (runner.collect_phase6_atomic({cid: deepcopy(row["response"])},
                                                         model_identity=row["executor"], allow_partial=True)
@@ -1028,7 +1121,8 @@ class NativeReviewWorkflow(NativeWorkflow):
             else:
                 review_errors.pop(cid, None)
                 blocked.pop(cid, None)
-        if all(processed.get(cid) == packet_id for cid in packet["items"]):
+        if all(cid in packet.get("processed_item_ids", {}) or processed.get(cid) == packet_id
+               for cid in packet["items"]):
             packet["retired"] = True
             if state.get("active_packet_id") == packet_id:
                 state["active_packet_id"] = None
