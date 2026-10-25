@@ -159,6 +159,13 @@ class NativeReviewWorkflow(NativeDependencyBatchMixin, NativeScheduling, NativeW
         role_state = super().next()
         if role_state.get("status") not in PATCH_WAIT_STATUSES:
             if role_state.get("status") != "phase6_ready":
+                # A coarse role/evidence stage must not hide a durable repair
+                # already bound to the current canonical state.
+                with self.queue.transaction() as state:
+                    runner = self._load(state)
+                    pending = runner._pending_revision_block()
+                    if pending:
+                        return self._next_patch_packet(state, runner) or pending
                 return role_state
         elif not self._has_pending_patch():
             with self.queue.transaction() as state:

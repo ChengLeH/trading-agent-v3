@@ -102,6 +102,75 @@ class PrecisionContracts(unittest.TestCase):
 
 
 class EvidenceRecoveryContracts(unittest.TestCase):
+    def _pending_existing_evidence_repair(self, root, *, at_limit=False):
+        from pathlib import Path
+        from .checkpoint import save_checkpoint
+        from .agent_reviews import NativeReviewWorkflow
+        from .test_agent_reviews import NativeReviews
+        from .evidence_repair import prepare_evidence_patch
+        runner = seeded()
+        runner.run.fact_store.add(Fact('available.amount', 42, 'USD', 'FY2025',
+            entity='TEST', concept='Revenue', basis='gaap', scope='consolidated', source_id='fixture'))
+        source = Path(root) / 'source.json'
+        save_checkpoint(runner, source)
+        workflow = NativeReviewWorkflow.from_checkpoint(source, Path(root) / 'native')
+        NativeReviews()._reach_global(workflow)
+        with workflow.queue.transaction() as state:
+            runner = workflow._load(state)
+            findings = [dict(finding_id=f'gap.{i}', claim_ids=['a'],
+                issue='Source requires review', resolution_route='evidence_needed',
+                evidence_request=dict(proposition='Verify the disclosed amount.')) for i in range(23)]
+            runner.deferred_global_findings = deepcopy(findings)
+            requests = runner.prepare_evidence_work(findings)['evidence_requests']
+            if at_limit:
+                runner.revision_round = runner.max_revisions
+            workflow._save(state, runner)
+        outcome = prepare_evidence_patch(workflow, ['a'], request_id=requests[0]['request_id'],
+            source_refs=['available.amount'], reason='Review existing amount')
+        return workflow, outcome
+
+    def test_evidence_repair_at_revision_limit_returns_status_and_durable_patch(self):
+        import tempfile
+        from .agent_reviews import NativeReviewWorkflow
+        with tempfile.TemporaryDirectory() as root:
+            workflow, outcome = self._pending_existing_evidence_repair(root, at_limit=True)
+            self.assertEqual(outcome['status'], 'blocked:revision_limit')
+            self.assertTrue(outcome['manual_patch_only'])
+            self.assertIn('revision_prompts', outcome)
+            packet = NativeReviewWorkflow(workflow.directory).next()
+            self.assertEqual(packet['kind'], 'patch')
+            self.assertTrue(packet['manual_patch_only'])
+            with workflow.queue.transaction() as state:
+                runner = workflow._load(state)
+                self.assertEqual(len(runner.evidence_requests), 23)
+                self.assertEqual(runner.revision_round, runner.max_revisions)
+
+    def test_pending_patch_remains_deliverable_when_role_flow_reports_evidence_recovery(self):
+        import tempfile
+        from unittest.mock import patch
+        from .agent_reviews import NativeReviewWorkflow
+        from .agent_workflow import NativeWorkflow
+        with tempfile.TemporaryDirectory() as root:
+            workflow, outcome = self._pending_existing_evidence_repair(root)
+            self.assertIn('revision_prompts', outcome)
+            restored = NativeReviewWorkflow(workflow.directory)
+            with patch.object(NativeWorkflow, 'next', return_value=dict(
+                    status='evidence_recovery', evidence_requests=['outstanding'], blocked=False)):
+                packet = restored.next()
+                self.assertEqual(packet.get('kind'), 'patch', packet)
+                self.assertEqual(packet['allowed_claim_ids'], ['a'])
+                again = NativeReviewWorkflow(workflow.directory).next()
+                self.assertEqual(again['packet_id'], packet['packet_id'])
+            result = restored.submit_patch(packet['packet_id'],
+                [dict(claim_id='a', text='Revised amount requires supporting evidence.')],
+                'host/test', packet['input_hash'])
+            self.assertIn('a', result['revalidate_claim_ids'])
+            with restored.queue.transaction() as state:
+                runner = restored._load(state)
+                self.assertIsNone(runner.pending_patch)
+                self.assertEqual(len(runner.evidence_requests), 23)
+                self.assertNotIn('a', runner.receipts)
+
     def manifest(self, root, *, source_id='filing.new', subject=None):
         import json
         from pathlib import Path

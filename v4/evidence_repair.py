@@ -290,4 +290,4 @@ def prepare_evidence_patch(workflow, claim_ids, *, reason, request_id=None, sour
                 active.update(retired=True, retirement_reason='explicit_evidence_claim_repair')
             state['active_packet_id'] = None
         workflow._save(state, runner)
-        return dict(status=runner.status, **outcome)
+        return {"status": runner.status, **outcome}
