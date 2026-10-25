@@ -644,6 +644,130 @@ class NativeGlobalFindingsPatch(NativeReviews):
             packet = NativeReviewWorkflow(workflow.directory).next()
         self.fail('dependency audit did not close')
 
+    def test_receipt_invalidation_retires_old_global_round_across_restarts(self):
+        # An unchanged original-role answer invalidates receipts without changing
+        # the graph hash. Historical multi-packet Global must not block refill.
+        with tempfile.TemporaryDirectory() as root:
+            workflow = self.bootstrap(root)
+            self._dependency_gap_sweep(workflow, batch_size=4)
+            with workflow.queue.transaction() as state:
+                runner = workflow._load(state)
+                old_packets = set(state['global_outcomes'])
+                self.assertGreater(len(old_packets), 1)
+                original_hash = runner._hash()
+                round_before = runner.revision_round
+                runner.receipts.pop('a')
+                runner.deep_receipts.pop('a', None)
+                runner.global_receipt = None
+                runner.pending_global = None
+                runner.global_review_progress = None
+                runner.status = runner.run.stage = 'atomic'
+                workflow._save(state, runner)
+            reopened = NativeReviewWorkflow(workflow.directory)
+            packet = reopened.next()
+            self.assertEqual(packet['kind'], 'atomic', packet)
+            self.assertEqual(set(packet['items']), {'a'})
+            self.assertEqual(NativeReviewWorkflow(workflow.directory).next()['packet_id'], packet['packet_id'])
+            reopened.submit(packet['packet_id'],
+                {cid: response(cid, item) for cid, item in packet['items'].items()},
+                'host/fresh', packet['input_hash'])
+            fresh_global = NativeReviewWorkflow(workflow.directory).next()
+            self.assertEqual(fresh_global['kind'], 'global', fresh_global)
+            self.assertNotIn(fresh_global['packet_id'], old_packets)
+            with reopened.queue.transaction() as state:
+                runner = reopened._load(state)
+                self.assertEqual(runner._hash(), original_hash)
+                self.assertEqual(runner.revision_round, round_before)
+                self.assertIn('independent', runner.receipts)
+                self.assertIsNone(runner.global_receipt)
+                self.assertTrue(any('a' in runner._finding_claim_ids(f)
+                                    for f in runner.deferred_global_findings))
+
+    def test_receipt_invalidation_preserves_verified_links_and_checks_their_archive(self):
+        for remove_archive in (False, True):
+            with self.subTest(remove_archive=remove_archive), tempfile.TemporaryDirectory() as root:
+                workflow = self.bootstrap(root)
+                self._global_with_findings(workflow, dict(unresolved=True, issue='Unmapped premise.',
+                    evidence='Fixture', suggested_fix='Repair the target.'))
+                link = workflow.next()
+                workflow.submit(link['packet_id'], {'finding_linker': [dict(
+                    finding_index=0, claim_ids=['a'], unresolved=False, reason='Target is a.')]},
+                    'host/linker', link['input_hash'])
+                with workflow.queue.transaction() as state:
+                    runner = workflow._load(state)
+                    mapped = state['accepted_links']['findings'][0]
+                    runner.receipts.pop('a')
+                    runner.global_receipt = None
+                    runner.status = runner.run.stage = 'atomic'
+                    workflow._save(state, runner)
+                if remove_archive:
+                    for path in (workflow.directory / 'responses' / 'archive').glob('*.json'):
+                        if json.loads(path.read_text()).get('task_id') == 'finding_linker':
+                            path.unlink()
+                            break
+                    else:
+                        self.fail('missing linker archive fixture')
+                    with self.assertRaisesRegex(ValueError, 'verified raw response archive'):
+                        NativeReviewWorkflow(workflow.directory).next()
+                    continue
+                self.assertEqual(NativeReviewWorkflow(workflow.directory).next()['kind'], 'atomic')
+                with workflow.queue.transaction() as state:
+                    runner = workflow._load(state)
+                    self.assertNotIn('accepted_links', state)
+                    self.assertEqual(state['historical_links'][-1]['findings'][0], mapped)
+                    carried = next(f for f in runner.deferred_global_findings
+                                   if f['finding_id'] == mapped['finding_id'])
+                    self.assertEqual(carried['claim_ids'], ['a'])
+                    self.assertIsNone(runner.global_receipt)
+
+    def test_missing_deep_receipt_also_requires_a_fresh_global_round(self):
+        with tempfile.TemporaryDirectory() as root:
+            workflow = self.bootstrap(root)
+            for _ in range(32):
+                packet = workflow.next()
+                if packet.get('kind') == 'global':
+                    break
+                outputs = {cid: response(cid, item,
+                    'FAIL' if packet['kind'] == 'atomic' and cid == 'a' else 'PASS')
+                    for cid, item in packet['items'].items()}
+                workflow.submit(packet['packet_id'], outputs, 'host/reviewer', packet['input_hash'])
+            original_global = packet['packet_id']
+            result = workflow.submit(original_global,
+                {next(iter(packet['items'])): self._global_response(workflow)},
+                'host/global', packet['input_hash'])
+            self.assertEqual(result['status'], 'verified')
+            with workflow.queue.transaction() as state:
+                runner = workflow._load(state)
+                runner.deep_receipts.pop('a')
+                runner.global_receipt = None
+                runner.status = runner.run.stage = 'deep'
+                workflow._save(state, runner)
+            reopened = NativeReviewWorkflow(workflow.directory)
+            deep = reopened.next()
+            self.assertEqual(deep['kind'], 'deep', deep)
+            self.assertEqual(set(deep['items']), {'a'})
+            reopened.submit(deep['packet_id'], {cid: response(cid, item) for cid, item in deep['items'].items()},
+                            'host/fresh', deep['input_hash'])
+            fresh = NativeReviewWorkflow(workflow.directory).next()
+            self.assertEqual(fresh['kind'], 'global', fresh)
+            self.assertNotEqual(fresh['packet_id'], original_global)
+            with reopened.queue.transaction() as state:
+                previous = state['packets'][original_global]
+                original_role = next(iter(previous['items']))
+                received = previous['received'][original_role]
+            with self.assertRaisesRegex(ValueError, 'superseded'):
+                reopened.submit(original_global, {original_role: received['response']},
+                                received['executor'], previous['input_hash'])
+            # Superseded packets remain auditable, not exempt from raw proof.
+            for path in (workflow.directory / 'responses' / 'archive').glob('*.json'):
+                if json.loads(path.read_text()).get('task_id') == next(iter(packet['items'])):
+                    path.unlink()
+                    break
+            else:
+                self.fail('missing original global archive fixture')
+            with self.assertRaisesRegex(ValueError, 'verified raw response archive'):
+                NativeReviewWorkflow(workflow.directory).next()
+
     def test_completed_dependency_gap_never_reissues_last_batch_and_patch_survives_restart(self):
         with tempfile.TemporaryDirectory() as root:
             workflow = self.bootstrap(root)

@@ -304,7 +304,52 @@ class NativeReviewWorkflow(NativeRedeliberation, NativeDependencyBatchMixin, Nat
                 runner, SimpleNamespace(identity=row["executor"]), role,
                 packet["items"][role]["prompt"], row["response"])
 
+        # Receipt validity is independent of graph identity: a maintained
+        # original-role conclusion changes neither Claim nor history hash, but
+        # deliberately requires new semantic receipts. Retire that Global round
+        # durably so refilling receipts cannot resurrect its old verdict.
+        retired = state.setdefault("global_replay_retirements", {})
+        candidates = [p for p in state.get("packets", {}).values()
+                      if p.get("kind") == "global" and p.get("input_hash") == current_hash
+                      and current_epoch(p) and p["packet_id"] not in retired
+                      and (p["packet_id"] in state.get("global_outcomes", {}) or not p.get("retired"))]
+        invalidated_global = False
+        if candidates:
+            tasks = runner._tasks()
+            missing_atomic = sorted(set(tasks) - set(runner.receipts))
+            missing_deep = sorted(cid for cid, receipt in runner.receipts.items()
+                                  if receipt["result"]["verdict"] != "PASS"
+                                  and cid not in runner.deep_receipts)
+            if missing_atomic or missing_deep:
+                invalidated_global = True
+                deferred = {f["finding_id"]: deepcopy(f) for f in runner.deferred_global_findings}
+                snapshots = state.get("global_receipt_snapshots", {})
+                # Only the latest closed revision carries the outstanding work;
+                # older resolved rounds remain archive evidence, not new issues.
+                order = state.get("global_acceptance_order", [])
+                closed = sorted((p for p in candidates
+                                 if isinstance(snapshots.get(p["packet_id"]), dict)
+                                 and snapshots[p["packet_id"]].get("input_hash") == current_hash),
+                                key=lambda p: order.index(p["packet_id"]) if p["packet_id"] in order else -1)
+                if closed:
+                    last = closed[-1]
+                    for index, finding in enumerate(snapshots[last["packet_id"]].get("findings", [])):
+                        finding = deepcopy(finding)
+                        finding.setdefault("finding_id", "global.recheck." + digest(
+                            dict(packet_id=last["packet_id"], index=index, finding=finding)))
+                        deferred.setdefault(finding["finding_id"], finding)
+                runner.deferred_global_findings = list(deferred.values())
+                runner.global_receipt = runner.pending_global = runner.global_review_progress = None
+                for packet in candidates:
+                    retired[packet["packet_id"]] = dict(reason="semantic_receipts_invalidated",
+                        missing_atomic=missing_atomic, missing_deep=missing_deep)
+                    if not packet.get("retired"):
+                        packet.update(retired=True, retirement_reason="semantic_receipts_invalidated")
+                    if state.get("active_packet_id") == packet["packet_id"]:
+                        state["active_packet_id"] = None
+
         needs_global_replay = any(p.get('kind') == 'global' and p.get('input_hash') == current_hash
+            and p['packet_id'] not in retired
             and current_epoch(p)
             and (p['packet_id'] in state.get('global_outcomes', {}) or not p.get('retired'))
             for p in state.get('packets', {}).values())
@@ -323,7 +368,7 @@ class NativeReviewWorkflow(NativeRedeliberation, NativeDependencyBatchMixin, Nat
                     stored = state.get("global_outcomes", {}).get(packet.get("packet_id"))
                     snapshot = state.get("global_receipt_snapshots", {}).get(packet.get("packet_id"))
                     if (packet.get("kind") != "global" or packet.get("input_hash") != current_hash
-                            or not current_epoch(packet)
+                            or not current_epoch(packet) or packet["packet_id"] in retired
                             or not isinstance(stored, dict) or stored.get("status") != "verified"
                             or not isinstance(snapshot, dict) or snapshot.get("input_hash") != current_hash
                             or snapshot.get("findings") != []
@@ -382,6 +427,8 @@ class NativeReviewWorkflow(NativeRedeliberation, NativeDependencyBatchMixin, Nat
             proof = raw_global_proof(packet)
             if proof is None:
                 raise ValueError(f"global packet {packet['packet_id']} has no verified raw response archive")
+            if packet["packet_id"] in retired:
+                continue  # archive proof above remains mandatory; this round is no longer live
             if packet["input_hash"] != current_hash:
                 # A sweep accepted for a superseded graph version is history;
                 # the repair collector already re-derived or invalidated its
@@ -434,6 +481,17 @@ class NativeReviewWorkflow(NativeRedeliberation, NativeDependencyBatchMixin, Nat
                     if not self._matches_global(runner, active, request):
                         raise ValueError("pending global packet mismatches canonical request")
         linked = state.get("accepted_links")
+        if invalidated_global and linked is not None and linked.get("input_hash") == current_hash:
+            # Reuse the existing linker proof/mapping validation below before
+            # retiring it. Its source snapshot is historical, never a live gate.
+            sources = [snapshot for pid, snapshot in state.get("global_receipt_snapshots", {}).items()
+                       if pid in retired and isinstance(snapshot, dict)
+                       and snapshot.get("input_hash") == current_hash
+                       and current_epoch(state["packets"][pid])
+                       and digest(snapshot.get("findings")) == linked.get("source_hash")]
+            if not sources:
+                raise ValueError("accepted linker source findings altered")
+            runner.global_receipt = deepcopy(sources[-1])
         if linked is not None and linked.get("input_hash") == current_hash:
             linked_epoch = linked.get("verification_epoch")
             if linked_epoch is None:
@@ -483,6 +541,17 @@ class NativeReviewWorkflow(NativeRedeliberation, NativeDependencyBatchMixin, Nat
             expected = [deepcopy(by_id.get(f.get("finding_id"), f)) for f in original]
             if digest(expected) != digest(linked["findings"]):
                 raise ValueError("accepted linker finding mapping was altered")
+        if invalidated_global:
+            if linked is not None and linked.get("input_hash") == current_hash:
+                state.setdefault("historical_links", []).append(deepcopy(state.pop("accepted_links")))
+                by_id = {f["finding_id"]: deepcopy(f) for f in runner.deferred_global_findings}
+                for finding in linked["findings"]:
+                    by_id[finding["finding_id"]] = deepcopy(finding)
+                runner.deferred_global_findings = list(by_id.values())
+            runner.global_receipt = None
+            # The superclass next() can return phase6_ready without saving the
+            # runner. Persist migration and carried findings in that transaction.
+            self._save(state, runner)
         return runner
 
     def _next_global(self, state, runner, active):
@@ -1015,6 +1084,8 @@ class NativeReviewWorkflow(NativeRedeliberation, NativeDependencyBatchMixin, Nat
                 runner = self._load(state)
                 packet = state["packets"][packet_id]
                 accepted = state.get("global_outcomes", {}).get(packet_id)
+                if packet_id in state.get("global_replay_retirements", {}):
+                    raise ValueError("global response superseded by semantic revalidation")
                 if accepted is not None:
                     context = packet["global_context"]
                     if (state["input_hash"] != input_hash or packet["input_hash"] != input_hash
