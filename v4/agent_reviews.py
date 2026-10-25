@@ -19,6 +19,7 @@ from .agent_queue import submit_items_in_state
 from .native_scheduling import NativeScheduling, leased_review_ids, retire_unowned_review_packets
 from .native_dependency_batches import NativeDependencyBatchMixin, dependency_identity, collect_dependency_packet
 from .journal import RunJournal
+from .native_redeliberation import NativeRedeliberation, NativeResolutionJournal
 from .schema import digest
 from .review_budget import review_budget_for, review_budget_row, review_wire_breakdown
 
@@ -66,7 +67,7 @@ def configure_review_budget(workflow, *, max_item_bytes=None, max_packet_bytes=N
         return dict(status='review_budget_updated', **event)
 
 
-class NativeReviewWorkflow(NativeDependencyBatchMixin, NativeScheduling, NativeWorkflow):
+class NativeReviewWorkflow(NativeRedeliberation, NativeDependencyBatchMixin, NativeScheduling, NativeWorkflow):
     def _options(self, state):
         options = state.get("options", {})
         size = options.get("review_group_size", DEFAULT_REVIEW_GROUP_SIZE)
@@ -118,7 +119,9 @@ class NativeReviewWorkflow(NativeDependencyBatchMixin, NativeScheduling, NativeW
                                 "item budget cannot restore omitted diagnostics"
                                 if diagnostic_block else
                                 f"review_context_too_large: {len(oversized)} items exceed the declared context budget; "
-                                f"budget={cap}; no evidence or IDs were truncated"),
+                                f"item_budget={review_budget_for(runner, layer)}; packet_budget={cap}; "
+                                f"effective_item_budget={min(cap, review_budget_for(runner, layer))}; "
+                                "no evidence or IDs were truncated"),
                         oversized_items=oversized,
                         next_action=("reduce_structured_refs_or_adjust_related_diagnostics_cap"
                                      if diagnostic_block else
@@ -275,6 +278,7 @@ class NativeReviewWorkflow(NativeDependencyBatchMixin, NativeScheduling, NativeW
         through the real P6 collector.
         """
         runner = super()._load(state)
+        runner.journal = NativeResolutionJournal(self.directory)
         # Reconstruct historical requests on an isolated runner, before the
         # current repair was opened. Never weaken the live pending-patch guard
         # or remove the durable repair request from authoritative queue state.
@@ -625,6 +629,9 @@ class NativeReviewWorkflow(NativeDependencyBatchMixin, NativeScheduling, NativeW
         if runner.pending_patch is None:
             findings = (deepcopy(findings) if findings is not None else
                         [deepcopy(f) for f in runner.global_receipt["findings"]])
+            reconsideration = self._prepare_redeliberation(state, runner, findings)
+            if reconsideration is not None:
+                return reconsideration
             accepted = state.get("accepted_links")
             if accepted is not None:
                 if (accepted.get("input_hash") != state["input_hash"]
@@ -990,6 +997,10 @@ class NativeReviewWorkflow(NativeDependencyBatchMixin, NativeScheduling, NativeW
     def submit(self, packet_id, responses, executor, input_hash):
         state = json_read(self.queue.state_path)
         packet = state.get("packets", {}).get(packet_id)
+        if isinstance(packet, dict) and packet.get("kind") == "role_redeliberation":
+            if packet.get('manual_only'):
+                raise ValueError('revision limit: use explicit submit-redeliberation')
+            return self.submit_redeliberation(packet_id, responses, executor, input_hash)
         if isinstance(packet, dict) and packet.get("kind") == "link":
             _require_identity(executor, "executor")
             self.queue.submit(packet_id, responses, executor, input_hash)

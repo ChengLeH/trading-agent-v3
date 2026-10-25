@@ -421,8 +421,8 @@ python -m v4.agent_cli next --work-dir RUN
 ### Native 審查與來源修復入口
 
 審查預算分為單項 context 與整包（`review_packet_max_bytes`）。atomic 的
-`review_batch_max_bytes` 預設 65,536 bytes；deep 的 `review_deep_batch_max_bytes`
-獨立預設 131,072 bytes。checkpoint 保存兩者，舊 checkpoint 缺少 deep 設定時採新預設。
+`review_batch_max_bytes` 在新 run 預設 131,072 bytes；deep 的 `review_deep_batch_max_bytes`
+獨立預設 131,072 bytes。checkpoint 保存兩者；已有設定不會被覆寫。舊 checkpoint 缺少 atomic 設定時保留舊版 65,536 bytes，缺少 deep 設定時採 131,072 bytes。
 Native 與直接執行均先保存可審項目的收據，超限項保持未驗證並列出 ID／實際 UTF-8 bytes；不截斷內容、不預設 PASS。
 `init` 可帶 `--review-batch-max-bytes`／`--review-packet-max-bytes`；既有 run 用正式入口調整，不能手改 agent-state/checkpoint：
 

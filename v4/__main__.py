@@ -7,6 +7,7 @@ from .cloud import AntigravityCloudClient
 from .checkpoint import save_checkpoint, load_checkpoint, write_json
 from .journal import RunJournal
 from .agy_session import AntigravityError
+from .review_budget import DEFAULT_ATOMIC_REVIEW_MAX_BYTES, DEFAULT_DEEP_REVIEW_MAX_BYTES
 
 
 def _cloud_clients(args, out):
@@ -61,7 +62,7 @@ def main(argv=None):
     parser.add_argument("--review-batch-size", type=int, choices=range(1, 17),
                         help="Claims per Phase 6 request; default 1 (individual); larger batches are opt-in")
     parser.add_argument("--review-batch-max-bytes", type=int,
-                        help="Target UTF-8 input bytes per review batch; default 65536")
+                        help=f"UTF-8 limit per review item/request; default {DEFAULT_ATOMIC_REVIEW_MAX_BYTES}")
     parser.add_argument("--max-revisions", type=int,
                         help="Total revision ceiling; default 3, resume preserves checkpoint unless overridden")
     parser.add_argument("--max-contract-attempts", type=int,
@@ -150,8 +151,8 @@ def main(argv=None):
                                       global_dependency_batch_size=args.global_dependency_batch_size or 12,
                                       max_contract_attempts=args.max_contract_attempts if args.max_contract_attempts is not None else 3,
                                       review_batch_size=args.review_batch_size or 1,
-                                      review_batch_max_bytes=args.review_batch_max_bytes or 65536,
-                                      review_deep_batch_max_bytes=args.review_batch_max_bytes or 131072)
+                                      review_batch_max_bytes=args.review_batch_max_bytes or DEFAULT_ATOMIC_REVIEW_MAX_BYTES,
+                                      review_deep_batch_max_bytes=args.review_batch_max_bytes or DEFAULT_DEEP_REVIEW_MAX_BYTES)
             runner.journal = RunJournal(out, retry_roles=args.retry_role)
             clients = _cloud_clients(args, out)
             result = runner.execute(manifest["subject"]["ticker"], manifest, clients["author"], clients["verifier"], clients["deep"], clients["global"])

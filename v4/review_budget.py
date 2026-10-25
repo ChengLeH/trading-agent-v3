@@ -2,8 +2,9 @@
 import json
 
 from .cloud import structured_prompt
+from .review_wire import decode_review_payload
 
-DEFAULT_ATOMIC_REVIEW_MAX_BYTES = 64 * 1024
+DEFAULT_ATOMIC_REVIEW_MAX_BYTES = 128 * 1024
 DEFAULT_DEEP_REVIEW_MAX_BYTES = 128 * 1024
 
 
@@ -66,6 +67,10 @@ def _own_evidence(payload):
         if isinstance(first_review, dict):
             total += size(first_review)
 
+    dimension_catalog = payload.get("binding_dimension_catalog")
+    if isinstance(dimension_catalog, dict):
+        total += sum(size(value) for value in dimension_catalog.values())
+
     if isinstance(payload.get("tasks"), list):
         for field in ('evidence_catalog', 'dependency_catalog'):
             catalog = payload.get(field)
@@ -98,6 +103,7 @@ def requires_scoped_review(prompt):
     payload = _prompt_payload(prompt)
     if not isinstance(payload, dict):
         return False
+    payload = decode_review_payload(payload)
     contexts = []
     if isinstance(payload.get("context"), dict):
         contexts.append(payload["context"])
@@ -146,7 +152,7 @@ def review_budget_row(claim_id, prompt, schema, budget_bytes):
         next_action = "reduce_structured_refs_or_adjust_related_diagnostics_cap"
     elif exceeds_budget:
         reason = "wire_bytes_exceeds_budget"
-        next_action = "increase_review_byte_budget_or_reduce_structured_context"
+        next_action = "inspect_wire_breakdown_then_configure_reviews_or_reduce_structured_context"
     else:
         return None
     return dict(claim_id=claim_id, **breakdown, budget_bytes=budget_bytes,

@@ -280,6 +280,7 @@ class PipelineRunnerV4:
             received_attempts = self.journal.received_attempts(self.run_id)
         claims = claim_index(self.run.claims)
         output = []
+        current_task_hashes = None
         for finding in findings:
             if finding.get("resolution_route") != "role_redeliberation":
                 continue
@@ -310,9 +311,20 @@ class PipelineRunnerV4:
                         returned[claim["claim_id"]] = claim
                 except (ValueError, TypeError, KeyError):
                     continue
+                review = record.get("review", {})
+                reconsideration = review.get("redeliberation") if isinstance(review, dict) else None
+                accepted_hashes = None
+                if reconsideration is not None:
+                    if (not isinstance(reconsideration, dict)
+                            or finding.get("finding_id") not in reconsideration.get("finding_ids", [])):
+                        continue
+                    accepted_hashes = reconsideration.get("accepted_task_hashes", {})
+                    if current_task_hashes is None:
+                        current_task_hashes = {cid: digest(task.to_dict()) for cid, task in self._tasks().items()}
                 matched = [cid for cid, current in claims.items()
                            if current["author_role"] == role and cid in returned
-                           and (not targets or cid in targets) and returned[cid] == current]
+                           and (not targets or cid in targets) and returned[cid] == current
+                           and (accepted_hashes is None or accepted_hashes.get(cid) == current_task_hashes[cid])]
                 if matched:
                     output.append(dict(attempt_id=attempt_id, task_id=role,
                                        claim_ids=sorted(matched)))
@@ -974,6 +986,8 @@ class PipelineRunnerV4:
                        first_review_hash=digest(first),
                        response_contract=SEMANTIC_REVIEW_CONTRACT,
                        expected_reference_ids=review_ref_ids(task.claim), verification_epoch=self._verification_epoch)
+        from .review_wire import project_review_payload, review_wire_instructions
+        payload = project_review_payload(payload)
         text = json_prompt(
                 "你負責第二輪深度對抗覆核，可與第一層使用同一模型。重新讀取原始證據，"
                 "理解語義並查核第一層指控，不可直接沿用第一層判決；若誤報則判 PASS。"
@@ -984,7 +998,7 @@ class PipelineRunnerV4:
                 "其他 verdict 至少一項 finding，包含 issue/evidence/suggested_fix。\n"
                 + REFERENCE_INSTRUCTIONS + "\n" + FINANCIAL_REVIEW_CONTRACT + "\n"
                 + DIAGNOSTICS_INSTRUCTIONS + "\n"
-                + EVIDENCE_REQUEST_INSTRUCTIONS, payload)
+                + EVIDENCE_REQUEST_INSTRUCTIONS + review_wire_instructions(payload), payload, compact=True)
         return structured_prompt(text, json.dumps(semantic_review_schema(task.claim), ensure_ascii=False, separators=(",", ":")))
 
     def collect_phase6_deep_review(self, results_by_claim, *, model_identity=None, allow_partial=False):
@@ -1755,6 +1769,7 @@ class PipelineRunnerV4:
                     if finding.get("resolution_route", "claim_patch") != "claim_patch"
                     and isinstance(finding.get("finding_id"), str)}
         seen, normalized, rejected, progress_by_id = set(), [], [], {}
+        received_attempts_snapshot = None
         index = claim_index(self.run.claims)
         state = self._state()
         sources = {key for bucket in ("facts", "calcs", "evidence", "events")
@@ -1926,9 +1941,12 @@ class PipelineRunnerV4:
                                            resolution_refs=[], resolution_mode="claim_revised",
                                            target_reviews=target_reviews))
             elif route == "role_redeliberation":
+                if received_attempts_snapshot is None:
+                    received_attempts_snapshot = self._received_attempts()
                 prior_ids = set(self._finding_claim_ids(finding))
                 candidates = {row["attempt_id"]: set(row["claim_ids"])
-                              for row in self._role_redeliberation_candidates([finding])}
+                              for row in self._role_redeliberation_candidates(
+                                  [finding], received_attempts=received_attempts_snapshot)}
                 valid = (bool(resolution_refs) and bool(claim_ids)
                          and set(claim_ids) <= index.keys()
                          and set(resolution_refs) <= candidates.keys()

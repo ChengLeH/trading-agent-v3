@@ -184,6 +184,7 @@ print(json.dumps(dict(result=result, serialized_definitions=json.dumps(definitio
         from v3.evidence import EvidencePacket
         with tempfile.TemporaryDirectory() as root:
             r = seeded()
+            r.review_batch_max_bytes = 64 * 1024
             claim_a = next(c for c in r.run.claims if c['claim_id'] == 'independent')
             evidence_id = 'evidence.large-review-input'
             r.run.evidence_store.add(EvidencePacket(

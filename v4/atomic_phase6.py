@@ -25,6 +25,7 @@ from .financial_review import FINANCIAL_REVIEW_CONTRACT, FINANCIAL_REVIEW_VERSIO
 from .source_lineage import project_source_lineage
 from .review_diagnostics import (REVIEW_CONTEXT_FORMAT, DIAGNOSTICS_INSTRUCTIONS,
                                  project_diagnostics)
+from .review_wire import project_review_payload, review_wire_instructions
 
 CATALOG_DETAIL_MAX_BYTES = 4096
 
@@ -275,8 +276,10 @@ def build_atomic_prompt(task: AtomicTask, *, verification_epoch=None) -> str:
     payload = task.review_dict()
     payload.update(response_contract=SEMANTIC_REVIEW_CONTRACT,
                    expected_reference_ids=review_ref_ids(task.claim), verification_epoch=verification_epoch or uuid4().hex)
+    payload = project_review_payload(payload)
     text = (
         ATOMIC_INSTRUCTIONS
+        + review_wire_instructions(payload)
         + "\n\n## Claim 與局部證據上下文\n```json\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
         + "\n```\n\n只回 JSON object，不要 markdown。"
@@ -319,7 +322,9 @@ def build_reference_supplement_prompt(task: AtomicTask, prior_result, missing_re
         + "PASS 時 findings=[]；SUSPICIOUS/FAIL 必須有具體 findings。不要因多空立場或文字風格判錯。"
         + "不得捏造來源，不得修改 accepted_reference_checks。只回完整 JSON object。"
     )
-    text = (instructions + "\n\n## Claim、局部證據及已接受引用檢查\n```json\n"
+    payload = project_review_payload(payload)
+    text = (instructions + review_wire_instructions(payload)
+            + "\n\n## Claim、局部證據及已接受引用檢查\n```json\n"
             + json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
             + "\n```\n")
     schema = semantic_review_schema(task.claim, reference_ids=missing_ref_ids)
@@ -354,7 +359,9 @@ def build_reference_verdict_repair_prompt(task: AtomicTask, accepted_reference_c
         + "若 verdict=PASS，findings=[]；若 verdict=SUSPICIOUS/FAIL，提供具體 findings。"
         + "不要輸出 reference_checks。只回完整 JSON object。"
     )
-    text = (instructions + "\n\n## Claim、局部證據及已接受引用檢查\n```json\n"
+    payload = project_review_payload(payload)
+    text = (instructions + review_wire_instructions(payload)
+            + "\n\n## Claim、局部證據及已接受引用檢查\n```json\n"
             + json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
             + "\n```\n")
     schema = semantic_review_schema(task.claim, reference_ids=[])

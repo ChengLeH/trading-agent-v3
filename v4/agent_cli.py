@@ -110,6 +110,13 @@ def main(argv=None):
     patch.add_argument("--patches", required=True,
                        help="path to a JSON array of objects, each with claim_id and changed fields")
 
+    reconsider = sub.add_parser('submit-redeliberation', help='submit original-role reconsideration, including explicit work at the revision limit')
+    reconsider.add_argument('--work-dir', required=True)
+    reconsider.add_argument('--packet-id', required=True)
+    reconsider.add_argument('--input-hash', required=True)
+    reconsider.add_argument('--executor', required=True)
+    reconsider.add_argument('--responses', required=True, help='JSON mapping original role to claims and reason')
+
     secondary = sub.add_parser("dispatch-secondary", help="optional AGY atomic/deep dispatch; remaining work stays with main Agent")
     secondary.add_argument("--work-dir", required=True)
     secondary.add_argument("--agy-model", required=True, help="explicit AGY secondary model ID")
@@ -234,6 +241,9 @@ def main(argv=None):
             from .evidence_repair import record_evidence_search
             return _result_exit(record_evidence_search(NativeReviewWorkflow(args.work_dir), args.request_id,
                 args.outcome, query=args.query, details=args.details))
+        if args.command == 'submit-redeliberation':
+            return _result_exit(NativeReviewWorkflow(args.work_dir).submit_redeliberation(
+                args.packet_id, json_read(args.responses), args.executor, args.input_hash))
         if args.command == "repair-evidence":
             from .evidence_repair import prepare_evidence_patch
             return _result_exit(prepare_evidence_patch(NativeReviewWorkflow(args.work_dir), args.claim_id,

@@ -13,7 +13,7 @@ from .atomic_phase6 import build_atomic_tasks, build_atomic_prompt
 from .checkpoint import load_checkpoint
 from .financial_review import ingestion_diagnostics
 from .review_diagnostics import diagnostics_index
-from .review_budget import review_wire_breakdown
+from .review_budget import review_wire_breakdown, DEFAULT_ATOMIC_REVIEW_MAX_BYTES
 from .semantic_contracts import semantic_review_schema
 
 
@@ -36,7 +36,7 @@ def measure(run):
     return dict(mode='offline-measurement-only', semantic_verdicts_reverified=False,
         diagnostics=diagnostics_index(full), claim_count=len(items),
         wire_min=min(sizes, default=0), wire_median=median(sizes) if sizes else 0,
-        wire_max=max(sizes, default=0), over_atomic_default=sum(size > 65536 for size in sizes),
+        wire_max=max(sizes, default=0), over_atomic_default=sum(size > DEFAULT_ATOMIC_REVIEW_MAX_BYTES for size in sizes),
         incomplete_diagnostics=sum(row['requires_scoped_review'] for row in items), items=items)
 
 

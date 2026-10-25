@@ -9,7 +9,9 @@ from .cloud import structured_prompt
 from .schema import digest
 from .review_diagnostics import DIAGNOSTICS_INSTRUCTIONS
 from .financial_review import FINANCIAL_REVIEW_CONTRACT
-from .semantic_contracts import REFERENCE_INSTRUCTIONS, SEMANTIC_REVIEW_CONTRACT, review_ref_ids, semantic_review_schema
+from .semantic_contracts import (EVIDENCE_REQUEST_INSTRUCTIONS, REFERENCE_INSTRUCTIONS,
+                                 SEMANTIC_REVIEW_CONTRACT, review_ref_ids, semantic_review_schema)
+from .review_wire import project_review_payload, review_wire_instructions
 
 BATCH_INSTRUCTIONS = """你是 V4 語義驗證員。對 tasks 中每一條 Claim 分別完整審查，不得省略或以整批多數決。
 只根據輸入證據，理解每條 text 的語義，對照 assertion、binding、來源及相依論述。
@@ -26,7 +28,7 @@ resolved_ref_ids 指向 evidence_catalog；dependency_claim_ids 指向 dependenc
 "findings":[{"issue":"問題","evidence":"證據","suggested_fix":"必要修正"}],
 "clarity_notes":[{"issue":"輕微措辭提醒","reason":"不改變主張的原因"}]}]}。
 逐條回報，不能把不相關真實來源綁到錯誤命題而判 PASS。
-""" + REFERENCE_INSTRUCTIONS + '\n' + FINANCIAL_REVIEW_CONTRACT + '\n' + DIAGNOSTICS_INSTRUCTIONS
+""" + REFERENCE_INSTRUCTIONS + '\n' + FINANCIAL_REVIEW_CONTRACT + '\n' + DIAGNOSTICS_INSTRUCTIONS + '\n' + EVIDENCE_REQUEST_INSTRUCTIONS
 
 
 def batch_schema(tasks):
@@ -61,9 +63,11 @@ def _request(tasks, *, layer, verification_epoch, first_reviews):
     payload = dict(response_contract=SEMANTIC_REVIEW_CONTRACT, review_layer=layer,
                    verification_epoch=verification_epoch, tasks=rows,
                    evidence_catalog=evidence, dependency_catalog=dependencies)
+    payload = project_review_payload(payload)
     instruction = BATCH_INSTRUCTIONS
     if layer == "deep":
         instruction += "\n這是第二層深度對抗覆核。每條都重新閱讀原始證據，獨立挑戰第一層 findings，不可直接照抄。"
+    instruction += review_wire_instructions(payload)
     ids = [task.claim_id for task in tasks]
     return dict(request_id=f"{layer}.batch.{digest(ids)}", claim_ids=ids,
                 prompt=instruction + "\n\n```json\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n```",

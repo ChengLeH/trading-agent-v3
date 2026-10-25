@@ -71,6 +71,7 @@ class ReviewBatches(unittest.TestCase):
 
     def test_atomic_and_deep_use_independent_budgets_with_exact_evidence_accounting(self):
         r = self.runner_with_large_evidence()
+        r.review_batch_max_bytes = 64 * 1024  # Explicit per-run overrides remain independent.
         self.assertEqual(r.review_batch_max_bytes, 64 * 1024)
         self.assertEqual(r.review_deep_batch_max_bytes, 128 * 1024)
 
@@ -168,6 +169,7 @@ class ReviewBatches(unittest.TestCase):
     def test_prepared_batches_fall_back_to_layer_capped_per_claim_requests(self):
         from unittest.mock import patch
         r = seeded()
+        r.review_batch_max_bytes = 64 * 1024
         r.review_batch_size = 4
         oversized_batch_schema = {"type": "object", "description": "x" * (70 * 1024)}
         with patch("v4.review_batches.batch_schema", return_value=oversized_batch_schema):
