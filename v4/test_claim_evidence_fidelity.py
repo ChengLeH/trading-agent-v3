@@ -5,7 +5,7 @@ validator for generated financial prose. Semantic correctness remains reviewed.
 """
 import unittest
 
-from .test_integration import seeded, review_all
+from .test_integration import seeded, review_all, verdict, reference_ids
 
 
 class EvidenceFidelityContract(unittest.TestCase):
@@ -21,6 +21,25 @@ class EvidenceFidelityContract(unittest.TestCase):
             self.assertIn("統計截止日", prompt)
             self.assertIn("極值發生日", prompt)
             self.assertIn("bindings", prompt)
+
+    def test_generic_definition_causality_and_execution_obligations_reach_all_review_layers(self):
+        from .financial_review import FINANCIAL_REVIEW_CONTRACT
+
+        runner = seeded()
+        role_prompts = dict(runner._role_prompts(("research_manager", "trader")))
+        atomic = dict(runner.prepare_phase6_atomic()["atomic_prompts"])
+        rows = {c["claim_id"]: c for c in runner.run.claims}
+        runner.collect_phase6_atomic({cid: verdict(cid, "FAIL" if cid == "a" else "PASS",
+            ref_ids=reference_ids(rows[cid])) for cid in atomic}, model_identity="test/first")
+        deep = runner.prepare_phase6_deep_review()
+        runner.collect_phase6_deep_review({"a": verdict("a")}, model_identity="test/deep")
+        global_task = runner.prepare_phase6_global_sweep()
+        prompts = [*role_prompts.values(), *atomic.values(),
+                   *dict(deep["deep_prompts"]).values(), global_task[1]]
+        for prompt in prompts:
+            self.assertIn(FINANCIAL_REVIEW_CONTRACT, prompt)
+            for obligation in ("共同原因", "重新評估條件", "metric_definitions", "price_basis_by_field"):
+                self.assertIn(obligation, prompt)
 
     def test_p6_revision_prompt_requests_full_evidence_correction_not_ref_removal(self):
         runner = seeded()

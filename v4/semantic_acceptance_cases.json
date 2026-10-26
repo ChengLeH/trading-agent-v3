@@ -171,6 +171,144 @@
       },
       "claim": "Log return was -10.0%, computed as (90-100)/100.",
       "expected_verdict": "FAIL"
+    },
+    {
+      "case_id": "cash_flow_definition.pass",
+      "context": {
+        "generic_fcf": 20,
+        "reported_fcf": 13,
+        "components": {
+          "ocf": 100,
+          "signed_capex": -80,
+          "signed_lease_principal": -7
+        },
+        "issuer_definition": "OCF + signed Capex + signed lease principal"
+      },
+      "claim": "The generic measure is 20; the issuer-defined measure is 13 after the separately disclosed lease principal. Both definitions are stated.",
+      "expected_verdict": "PASS"
+    },
+    {
+      "case_id": "cash_flow_definition.fail",
+      "context": {
+        "generic_fcf": 20,
+        "reported_fcf": 13,
+        "components": {
+          "ocf": 100,
+          "signed_capex": -80,
+          "signed_lease_principal": -7
+        },
+        "issuer_definition": "OCF + signed Capex + signed lease principal"
+      },
+      "claim": "The 7 difference proves the issuer FCF is wrong because every issuer must use OCF plus Capex only.",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "case_id": "cash_flow_overlap.pass",
+      "context": {
+        "ocf": 100,
+        "capex_including_lease": -87,
+        "lease_principal": -7,
+        "issuer_definition": "OCF plus Capex including lease principal"
+      },
+      "claim": "FCF is 13 under the disclosed definition; deducting lease principal again would double count it.",
+      "expected_verdict": "PASS"
+    },
+    {
+      "case_id": "cash_flow_overlap.fail",
+      "context": {
+        "ocf": 100,
+        "capex_including_lease": -87,
+        "lease_principal": -7,
+        "issuer_definition": "OCF plus Capex including lease principal"
+      },
+      "claim": "FCF is 6 because finance lease principal must always be deducted again.",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "case_id": "shared_cause.pass",
+      "context": {
+        "legal_expense": 10,
+        "margin_impact": "includes the expense",
+        "guidance_raise": "includes the same expense",
+        "other_cost_pressure": "separately supported"
+      },
+      "claim": "The margin and guidance effects share the legal charge and are not independent votes; separately supported other cost pressure remains relevant.",
+      "expected_verdict": "PASS"
+    },
+    {
+      "case_id": "shared_cause.fail",
+      "context": {
+        "legal_expense": 10,
+        "margin_impact": "includes the expense",
+        "guidance_raise": "includes the same expense",
+        "other_cost_pressure": "separately supported"
+      },
+      "claim": "Margin decline and guidance increase prove two independent deteriorations because they appear as separate Claims.",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "case_id": "reevaluation_entry.pass",
+      "context": {
+        "watch_trigger": "earnings release",
+        "entry_conditions": "not yet evaluated",
+        "directional_triggers": "different evidence for long and short"
+      },
+      "claim": "The release triggers a fresh assessment; it is not an automatic entry. Different directional triggers need not be numerically symmetric.",
+      "expected_verdict": "PASS"
+    },
+    {
+      "case_id": "reevaluation_entry.fail",
+      "context": {
+        "watch_trigger": "earnings release",
+        "entry_conditions": "not yet evaluated",
+        "directional_triggers": "different evidence for long and short"
+      },
+      "claim": "The release trigger alone authorizes immediate entry without assessing execution or updated evidence.",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "case_id": "corporate_action_timing.pass",
+      "context": {
+        "as_of": "2032-06-01",
+        "effective_date": "2033-01-01",
+        "price_basis": "raw",
+        "action_factor": 0.5
+      },
+      "claim": "The future action is background; raw historical prices remain raw as of the analysis date.",
+      "expected_verdict": "PASS"
+    },
+    {
+      "case_id": "corporate_action_timing.fail",
+      "context": {
+        "as_of": "2032-06-01",
+        "effective_date": "2033-01-01",
+        "price_basis": "raw",
+        "action_factor": 0.5
+      },
+      "claim": "All historical prices as of June must be halved now because a future action has been announced.",
+      "expected_verdict": "FAIL"
+    },
+    {
+      "case_id": "distance_denominator.pass",
+      "context": {
+        "current": 100,
+        "low": 80,
+        "distance_from_current": 0.2,
+        "rise_from_low": 0.25
+      },
+      "claim": "A fall from current to the low is 20%; the rise from the low to current is 25%, using different denominators.",
+      "expected_verdict": "PASS"
+    },
+    {
+      "case_id": "distance_denominator.fail",
+      "context": {
+        "current": 100,
+        "low": 80,
+        "distance_from_current": 0.2,
+        "rise_from_low": 0.25
+      },
+      "claim": "The stock has risen 20% from its low, using current price as the denominator.",
+      "expected_verdict": "FAIL"
     }
   ]
 }

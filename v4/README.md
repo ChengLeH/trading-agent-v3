@@ -503,7 +503,7 @@ permission 判斷不再搜尋整個 step JSON，結構化 error_code 優先。�
 
 ### 財報覆蓋、交易期限與執行假設
 
-`financial-evidence/9` 沿用原有角色／atomic／deep／global 審查，不增加模型輪次。
+`financial-evidence/10` 沿用原有角色／atomic／deep／global 審查，不增加模型輪次。
 升級後舊版收據會失效，必須依新契約重驗；不要在無法接受重驗成本時中途更新進行中的 run。
 
 來源可在 manifest 的 source row 宣告 `financial_report_coverage` 陣列，欄位為
@@ -558,3 +558,50 @@ Fact entity 缺失時，僅可根據相符且唯一的 SourceRecord.subject_tick
 
 角色輸入既有路徑直接使用 canonical Fact／Calc／Evidence，不重新讀原始 OHLCV 來算相同摘要。
 原始來源繼續保存供稽核；外部社群搜尋的候選擷取不在這個 repo 的執行路徑內，未擅自刪除候選或改抓取器。
+
+
+### 來源定義、共同原因與行情口徑（financial-evidence/10）
+
+沿用角色生成及 atomic／deep／global 的既有 LLM 審查，不增加分類器或審查輪次。
+新增責任：分清程式通用值與公司公布指標、共同原因與獨立佐證、重新評估觸發與實際進場條件，
+並核對價格欄位口徑及企業行為生效日。多空觸發不必形式對稱，同一事件的不同實際後果仍可分別分析。
+契約升版會讓舊版審查收據失效；進行中 run 更新後需要依正常路徑重新驗證，請勿當成可無成本熱換的提示調整。
+
+現金流來源仍可提供原有 OCF、帶正負號的 Capex 與回購；另可提供
+`finance_lease_principal_payments`（或 `principal_payments_on_finance_leases`）、
+`reported_free_cash_flow`（或 `free_cash_flow`）。公布值獨立儲存為 `ReportedFreeCashFlow`，
+不覆蓋既有 `FreeCashFlow`，不自動扣除租賃本金。缺少公司指標口徑時 basis 保留 unknown。
+任意來源明示指標可用以下資料契約，不需要新增 ticker 判斷：
+
+```json
+{
+  "cash_flow_metric_definitions": {
+    "IssuerResidualCash": {
+      "reported_field": "issuer_residual_cash",
+      "definition": "來源對指標及各元件的原始定義，不是可執行公式",
+      "component_fields": ["operating_cash_flow", "capex", "other_cash_payment"],
+      "basis": "issuer_defined",
+      "unit": "USD"
+    }
+  }
+}
+```
+
+同一 mapping 可放在個別 cash_flow row 的 `metric_definitions`，覆寫來源層同名項。
+`reported_field` 與非空 `definition` 必填；`component_fields` 可省略，未知元件不填零。
+自訂指標須使用與程式通用 `FreeCashFlow` 不同的 concept。basis／unit 可明示；
+未明示的公司指標 basis 為 unknown，unit 沿用 row／來源資料規則。
+程式只抽取宣告欄位及保存元件原始儲存格、是否存在、來源指紋與位置；
+不解析定義文字執行計算，也不因數值湊得上就宣稱調節完成。
+這些資料透過既有 ingestion diagnostics 進入審查 context、checkpoint 與報告 sidecar。
+若資料包未提供定義或調節元件，程式不會自動補抓，既有 evidence_needed 流程仍適用。
+
+行情來源可在 manifest source、record.meta 或 payload 提供 `price_basis_by_field`
+（open／high／low／close 的明示標籤）及 `corporate_actions` 陣列，優先序依此排列。
+企業行為可保留任意 kind、source_ref、factor 等註記；明示 `effective_date` 才作日期先後分類。
+這些是來源宣告，不是獨立認證；缺欄位、不同口徑或日期未知以 WARN 交既有語義審查。
+不換用 adj_close、不執行價格調整、不把未來事件當成已生效，也不把空事件清單當成完整性證明。
+未提供這些可選欄位時，既有計算與預設診斷維持原狀。
+
+`semantic_acceptance_cases.json` 新增成對通用案例，供真實模型驗收；
+單元測試只證明資料傳遞、契約與路由，不能證明模型已能穩定識別每種語義錯誤。

@@ -1,7 +1,7 @@
 """Shared semantic obligations for existing LLM stages, not a new classifier."""
-FINANCIAL_REVIEW_VERSION = 'financial-evidence/9'
+FINANCIAL_REVIEW_VERSION = 'financial-evidence/10'
 FINANCIAL_REVIEW_CONTRACT = '''
-金融證據契約 financial-evidence/9：這些是語義核對責任，不是以字詞命中判錯。
+金融證據契約 financial-evidence/10：這些是語義核對責任，不是以字詞命中判錯。
 來源原始值、計算值與展示值須區分；assertion.value 保留 canonical 值。
 可另附 assertion.presentation={value,unit,decimal_places,rounding:half_up|half_even} 明示換單位與捨入。
 合理四捨五入或不同抓取時點造成的小差異，若來源、時間與精度足以解釋，不列重大錯誤；
@@ -19,6 +19,10 @@ GAAP P/E 算對不代表已證明便宜；淨利減營業利益不等於可直�
 情境壓力測試可以故意極端，須標清假設、時點及固定分母；不得將其當作基準預測或既成事實。
 資金用途、收款主體、交割時點、可動用現金與已承諾融資須按來源區分；
 出售款不一定歸買方可用，不可自動扣抵價金，不得憑空指定現金／舉債比例。
+現金流須分開程式通用 FreeCashFlow 與來源自行定義的 ReportedFreeCashFlow 或其他指標；核對 cash_flow metric_definitions 的 definition、reported_field、component_fields 及各 literal source cell 的時點、單位、正負號與是否已包含於另一元件。來源公布值不自動等於程式計算值；有差額時先核對來源定義與可追溯調節項，避免將已包含支出再扣一次。未提供的元件不得填零，也不得把殘差猜成某個支出；調節不足才保留 evidence_needed。不同定義的數值可以同時成立，不因不同就判算術錯，也不得因數值湊得上就認證口徑相同。
+共同原因與獨立證據須區分：多項指標或新聞若共享同一事件、會計費用或上游前提，不能僅因列成多條 Claim 就當成多份獨立佐證或重複增加裁決權重。不同實際後果仍可分別分析；核對原始原因、影響範圍、殘餘結構壓力與反向證據，不強制把相關現象刪成一條，也不憑共時性認定因果相同。只有裁決實際重複計權或推論超出證據時才列 finding。
+重新評估條件、背景情境與實際進場條件須分開：事件觸發只表示需要更新分析，不能自動代表可成交、已有正期望值或可執行交易。多空條件不必形式對稱；須按各自證據、期限、使用者政策與執行假設檢查，不能自行發明對稱門檻或替 WAIT 捏造交易。
+行情須核對 price_basis_by_field、明示 price_basis、corporate_actions 及其 effective_date。這些是來源註記，不是自動認證事件完整或價格已調整；未知欄位口徑、缺日期或缺事件清單須保留未知。不得把某一欄位的調整基礎推給所有 OHLC 欄位，也不得只從名稱或價格跳變推算拆股。公告日不等於生效日，未生效企業行為不能回頭調整分析日以前的價量；不同基礎的價格、ATR、停損與歷史比較不得冒充同一基礎。距離與報酬須依 calculation_definitions 的 ordered inputs 與實際分母描述；以現價為分母的下跌距離不是自低點上漲幅度，合理不同定義須明示而非強制統一。
 目前提供的證據沒有資料，只能說本次證據未提供；不能推成公司沒有披露或事件沒有發生。
 缺資料時縮小主張或標 evidence_needed，讓主 Agent 補入可追溯來源；不得編數或刪真正因果依賴。
 判定 evidence_needed 時，須附 typed evidence_request 說明待確認命題及已知資料維度；未知維度留空，不從 finding 文字猜來源 ID。

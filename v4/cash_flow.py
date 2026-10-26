@@ -9,14 +9,51 @@ from .financial_data import (statement_metadata, period_dimensions, financial_fa
 
 FIELDS = {'OperatingCashFlow': ('net_cash_from_operating_activities', 'operating_cash_flow'),
           'Capex': ('purchase_of_plant_property_and_equipment', 'capex'),
-          'ShareRepurchases': ('share_repurchases',)}
+          'ShareRepurchases': ('share_repurchases',),
+          'FinanceLeasePrincipalPayments': ('finance_lease_principal_payments', 'principal_payments_on_finance_leases'),
+          'ReportedFreeCashFlow': ('reported_free_cash_flow', 'free_cash_flow')}
+
+
+def _metric_definitions(record, row):
+    """Source-declared field registry, never a ticker/formula inference engine."""
+    shared = record.payload.get('cash_flow_metric_definitions', {})
+    local = row.get('metric_definitions', {})
+    if not isinstance(shared, dict) or not isinstance(local, dict):
+        raise ValueError(f'{record.id}: cash-flow metric_definitions must be mappings')
+    definitions = {**shared, **local}
+    for concept, definition in definitions.items():
+        if (not isinstance(concept, str) or not concept.strip() or concept == 'FreeCashFlow'
+                or not isinstance(definition, dict)):
+            raise ValueError(f'{record.id}: declared metric needs a distinct nonempty concept')
+        for key in ('reported_field', 'definition'):
+            if not isinstance(definition.get(key), str) or not definition[key].strip():
+                raise ValueError(f'{record.id}: metric {concept} needs {key}')
+        fields = definition.get('component_fields', [])
+        if (not isinstance(fields, list) or any(not isinstance(f, str) or not f for f in fields)
+                or len(set(fields)) != len(fields)):
+            raise ValueError(f'{record.id}: metric {concept} component_fields must be unique field names')
+        for key in ('basis', 'unit'):
+            if key in definition and (not isinstance(definition[key], str) or not definition[key].strip()):
+                raise ValueError(f'{record.id}: metric {concept} {key} must be explicit text')
+    return definitions
+
+
+def _metric_context(record, row, index, period, definitions):
+    # Component amounts are literal source cells, not canonical-ID guesses or
+    # automatically additive adjustments. The existing LLM verifies the meaning.
+    return [dict(source_id=record.id, source_hash=record.source_hash, row=index,
+                 period=period, concept=concept, declaration=deepcopy(definition),
+                 components=[dict(field=field, source_pointer=f'cash_flow[{index}].{field}',
+                     present=row.get(field) is not None, value=deepcopy(row.get(field)))
+                     for field in definition.get('component_fields', [])])
+            for concept, definition in sorted(definitions.items())]
 
 
 def extract_cash_flow(record):
     rows = record.payload.get('cash_flow', [])
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise ValueError(f'{record.id}: cash_flow must be a list of row objects')
-    facts, calcs, limitations, coverage = [], [], [], []
+    facts, calcs, limitations, coverage, metric_contexts = [], [], [], [], []
     seen_fact_ids = set()
     metadata = statement_metadata(record)
     convention = record.payload.get('cash_flow_capex_convention')
@@ -29,7 +66,12 @@ def extract_cash_flow(record):
             raise ValueError(f'{record.id}: cash_flow[{i}] {exc}') from None
         year, period = dims['fiscal_year'], dims['period']
         values, transforms = {}, []
-        for concept, aliases in FIELDS.items():
+        definitions = _metric_definitions(record, row)
+        fields = dict(FIELDS)
+        for concept, definition in sorted(definitions.items()):
+            fields[concept] = tuple(dict.fromkeys((*fields.get(concept, ()), definition['reported_field'])))
+        metric_contexts.extend(_metric_context(record, row, i, period, definitions))
+        for concept, aliases in fields.items():
             present = [key for key in aliases if row.get(key) is not None]
             if not present:
                 continue
@@ -48,7 +90,16 @@ def extract_cash_flow(record):
             if value != row[field]:
                 transforms.append(dict(field=field, input_value=row[field], canonical_value=value,
                                        method='positive_outflow_to_signed_cash_flow'))
-            fact = financial_fact(record, row, metadata, 'cash_flow', i, field, concept,
+            fact_row = dict(row)
+            definition = definitions.get(concept, {})
+            if concept == 'ReportedFreeCashFlow' or concept not in FIELDS:
+                # A row-wide GAAP basis does not establish the basis of a
+                # company-defined measure. Missing per-metric basis stays unknown.
+                fact_row['basis'] = definition.get('basis', 'unknown')
+            for key in ('basis', 'unit'):
+                if key in definition:
+                    fact_row[key] = definition[key]
+            fact = financial_fact(record, fact_row, metadata, 'cash_flow', i, field, concept,
                          'USD', value, period_info=dims)
             if fact.fact_id in seen_fact_ids:
                 discriminator = "|".join((record.id, fact.source_pointer,
@@ -73,7 +124,8 @@ def extract_cash_flow(record):
                     capex.unit, capex.basis, capex.scope, capex.entity, capex.period):
                 limitations.append(f'{record.id}: cash_flow[{i}] FCF unavailable: OCF and Capex dimensions differ')
                 continue
-            fcf = financial_fact(record, row, metadata, 'cash_flow', i, 'derived:OCF+Capex',
+            fcf_row = dict(row, unit=ocf.unit, basis=ocf.basis)
+            fcf = financial_fact(record, fcf_row, metadata, 'cash_flow', i, 'derived:OCF+Capex',
                 'FreeCashFlow', ocf.unit, value, period_info=dims,
                 source_pointer=f'derived:cash_flow[{i}].ocf+capex')
             facts.append(fcf)
@@ -87,7 +139,8 @@ def extract_cash_flow(record):
     digest([fact.to_dict() for fact in facts])  # rejects NaN/infinity before mutation
     return facts, calcs, dict(section='cash_flow', source_id=record.id,
         source_hash=record.source_hash, input_rows=len(rows), produced_facts=len(facts),
-        coverage=coverage, limitations=limitations)
+        coverage=coverage, limitations=limitations,
+        **({'metric_definitions': metric_contexts} if metric_contexts else {}))
 
 
 def build_with_cash_flow(orchestrator, run_id, build_legacy, source_records=None):
@@ -116,10 +169,10 @@ def build_with_cash_flow(orchestrator, run_id, build_legacy, source_records=None
     # Remove only cash-flow resources owned by these same source records.
     # Updating/removing an input row must not leave stale cash-flow facts.
     source_ids = {item[0].id for item in additions}
-    cash_concepts = set(FIELDS) | {'FreeCashFlow'}
     existing = run.fact_store.to_dict()
     removed = {fid for fid, row in existing.items() if row['source_id'] in source_ids
-               and row['concept'] in cash_concepts}
+               and (row['source_pointer'].startswith('cash_flow[')
+                    or row['source_pointer'].startswith('derived:cash_flow['))}
     facts = FactStore()
     for fid, row in existing.items():
         if fid not in removed: facts.add(Fact(**row))
