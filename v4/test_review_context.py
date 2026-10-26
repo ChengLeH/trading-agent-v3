@@ -80,6 +80,94 @@ class ReviewContext(unittest.TestCase):
         self.assertFalse(over['truncation']['truncated'])
         self.assertTrue(over['overflow'])
 
+    def test_default_projection_keeps_all_related_diagnostics_above_legacy_cap(self):
+        from .review_diagnostics import project_diagnostics, canonical_bytes, RELATED_DIAGNOSTICS_MAX_BYTES
+        rows = [dict(check_id='future.warning', status='WARN', ref_id='filing',
+                     field=str(i), reason='原始警告不可截斷' * 100) for i in range(12)]
+        section = dict(section='financial_data', source_id='filing', findings=rows,
+                       limitations=['Original source context ' * 180])
+        complete = project_diagnostics([section], [dict(refs=['filing'])], {})
+        self.assertGreater(complete['total_bytes'], RELATED_DIAGNOSTICS_MAX_BYTES)
+        self.assertFalse(complete['requires_scoped_review'])
+        self.assertEqual(complete['truncation']['omitted_count'], 0)
+        self.assertEqual(sorted([r['finding'] for r in complete['findings']
+                                 if r['collection'] == 'findings'], key=canonical_bytes),
+                         sorted(rows, key=canonical_bytes))
+        context = next(r['finding'] for r in complete['findings'] if r['collection'] == 'source_context')
+        self.assertEqual(context['limitations'], section['limitations'])
+        self.assertGreaterEqual(complete['budget_bytes'], complete['findings_bytes'])
+        limited = project_diagnostics([section], [dict(refs=['filing'])], {},
+                                      max_bytes=RELATED_DIAGNOSTICS_MAX_BYTES)
+        self.assertTrue(limited['requires_scoped_review'])
+        small = [dict(section='coverage', findings=rows[:1])]
+        self.assertEqual(project_diagnostics(small, [dict(refs=['filing'])], {}),
+                         project_diagnostics(small, [dict(refs=['filing'])], {},
+                                             max_bytes=RELATED_DIAGNOSTICS_MAX_BYTES))
+
+    def test_complete_projection_serialization_work_stays_linear_in_diagnostic_bytes(self):
+        from . import review_diagnostics as module
+        rows = [dict(check_id='warning', status='WARN', ref_id='filing',
+                     field=str(i), reason='Original warning ' * 20) for i in range(128)]
+        encoded_sizes = []
+        original = module.canonical_bytes
+        def measured(value):
+            encoded = original(value)
+            encoded_sizes.append(len(encoded))
+            return encoded
+        with patch('v4.review_diagnostics.canonical_bytes', side_effect=measured):
+            view = module.project_diagnostics([dict(section='coverage', findings=rows)],
+                                              [dict(refs=['filing'])], {})
+        self.assertEqual(len(view['findings']), len(rows))
+        self.assertLess(sum(encoded_sizes), 10 * view['total_bytes'])
+
+    def test_legacy_diagnostics_block_resumes_through_next_and_leased_reviews_without_repeating_siblings(self):
+        from . import test_agent_reviews as native_fixture
+        from .agent_reviews import NativeReviewWorkflow
+        from .review_diagnostics import project_diagnostics, RELATED_DIAGNOSTICS_MAX_BYTES
+        from .test_native_scheduling import batch_answer
+        rows = [dict(check_id='new.warning', status='WARN', claim_id='a',
+                     field=str(i), reason='complete warning ' * 100) for i in range(16)]
+        diagnostics = [dict(section='financial_data', findings=rows)]
+        def old_projection(*args, **kwargs):
+            return project_diagnostics(*args, **kwargs, max_bytes=RELATED_DIAGNOSTICS_MAX_BYTES)
+        with tempfile.TemporaryDirectory() as root, patch(
+                'v4.atomic_phase6.ingestion_diagnostics', return_value=diagnostics):
+            workflow = native_fixture.NativeReviews().bootstrap(root)
+            with patch('v4.atomic_phase6.project_diagnostics', side_effect=old_projection):
+                for _ in range(20):
+                    packet = workflow.next()
+                    if packet.get('blocked'):
+                        break
+                    workflow.submit(packet['packet_id'], {cid: native_fixture.response(cid, item)
+                        for cid, item in packet['items'].items()}, 'host/earlier', packet['input_hash'])
+                self.assertEqual(packet['status'], 'blocked:review_context_budget', packet)
+                with workflow.queue.transaction() as state:
+                    runner = workflow._load(state)
+                    accepted = {cid: dict(receipt) for cid, receipt in runner.receipts.items()}
+                self.assertTrue(accepted)
+            # Normal load is the recovery path; no checkpoint edits or budget bump.
+            resumed = NativeReviewWorkflow(workflow.directory)
+            packet = resumed.next()
+            self.assertEqual(packet['kind'], 'atomic', packet)
+            self.assertTrue({'a', 'b', 'c'} & set(packet['items']))
+            self.assertFalse(set(accepted) & set(packet['items']))
+            for _ in range(8):
+                lease = resumed.claim_reviews('host/main', max_items=4, batch_size=4)
+                self.assertEqual(lease['status'], 'reviews_claimed', lease)
+                self.assertFalse(set(accepted) & set(lease['lease']['item_ids']))
+                for request in lease['requests']:
+                    result = resumed.submit_review_request(lease['packet_id'], request['request_id'],
+                        batch_answer(request), 'host/main', lease['input_hash'])
+                    self.assertFalse(result.get('blocked'), result)
+                with resumed.queue.transaction() as state:
+                    runner = resumed._load(state)
+                    for cid, receipt in accepted.items():
+                        self.assertEqual(runner.receipts[cid], receipt)
+                    if len(runner.receipts) == len(runner.run.claims):
+                        break
+            self.assertEqual(len(runner.receipts), len(runner.run.claims))
+            self.assertEqual(NativeReviewWorkflow(workflow.directory).next()['kind'], 'global')
+
     def test_report_sidecar_links_the_full_snapshot_diagnostics(self):
         from .reporting import render_report
         from .schema import digest

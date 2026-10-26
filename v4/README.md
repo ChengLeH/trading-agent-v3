@@ -446,12 +446,16 @@ coverage requirements 的 FAIL 與來源層 limitations 也保留。局部 hash�
 完整診斷仍留在 snapshot、global review 與 sidecar；sidecar 的 `diagnostics_index`、
 `diagnostics_sha256` 可核對該完整副本，`diagnostics_mode` 為 `summary+relevant`。
 
-相關診斷預算常數 `RELATED_DIAGNOSTICS_MAX_BYTES` 預設 16,384 bytes。
-整筆保留、FAIL 優先，不切斷診斷原文；若任何項目無法附全，會明示
-`truncation.omitted_check_ids/omitted_count`，FAIL 本身超限則保留 FAIL 並標明 overflow。
-該 item 以 `related_diagnostics_incomplete` 保持未驗證，其他可審 item 可繼續，
-不能僅提高一般封包上限就假裝補齊診斷。須縮小結構化範圍或明示調整相關診斷預算。
-升級 context 格式會使舊審查收據失效，需重驗；不修改原始 Claim、來源或既有交付檔案。
+相關診斷預設完整附上，保留原文與來源限制，FAIL 優先；不因超過 16,384 bytes 就省略 WARN。
+`RELATED_DIAGNOSTICS_MAX_BYTES` 僅保留為小型投影的相容基準，完整相關診斷較大時自動擴展。
+真正的派發上限由 atomic/deep 的整題 wire 與 packet 預算控制，包含完整診斷後再量測；
+真的超限會回 `wire_bytes_exceeds_budget`，可用既有 `configure-reviews` 明示調整，不能自動刪引用或放行。
+低於原基準的 item 內容及收據 hash 維持不變；原先因省略而未送審的 item 在正常續跑時重新組裝完整內容。
+僅程式明示呼叫 `project_diagnostics(..., max_bytes=...)` 時採窄投影：若附不全，仍明示
+`truncation.omitted_check_ids/omitted_count`；FAIL 本身超限則保留 FAIL 並標明 overflow。
+任何這類不完整投影都以 `related_diagnostics_incomplete` 保持未驗證，不能當作完整證據接受 PASS。
+本修復不升級 context 格式，不使完整且未改變的既有收據失效，也不修改原始 Claim、來源或既有交付檔案。
+未來若升級 context 格式，仍須依契約重驗舊收據。
 
 離線量測入口（唯讀 checkpoint、不呼叫模型、不重發舊裁決收據）：
 

@@ -12,6 +12,8 @@ from .schema import digest
 
 REVIEW_CONTEXT_FORMAT = 'v4-review-context/2'
 DIAGNOSTICS_FORMAT = 'v4-review-diagnostics/1'
+# Compatibility baseline for small projections, not a default dispatch ceiling.
+# Explicit max_bytes remains a strict diagnostic-preview cap.
 RELATED_DIAGNOSTICS_MAX_BYTES = 16384
 DIAGNOSTICS_INSTRUCTIONS = '''
 ingestion_diagnostics 是 summary+relevant 的局部診斷，不是整份 ingestion inventory。
@@ -71,10 +73,11 @@ def _identities(value):
 
 
 def project_diagnostics(diagnostics, claims, resolved, *, max_bytes=None):
-    """Select by declared entity/ID, preserve text, and explicitly bound WARNs.
+    """Select by declared entity/ID and deliver complete diagnostics by default.
 
-    FAILs are never dropped. If FAILs or even the omission marker cannot fit,
-    requires_scoped_review prevents dispatch rather than implying complete proof.
+    The caller's actual wire budget bounds dispatch, not a hidden projection cap.
+    Explicit max_bytes is a bounded preview: FAILs are never dropped and any
+    omission/overflow still requires scoped review, never implies complete proof.
     """
     cap = RELATED_DIAGNOSTICS_MAX_BYTES if max_bytes is None else max_bytes
     if type(cap) is not int or cap < 256:
@@ -124,14 +127,22 @@ def project_diagnostics(diagnostics, claims, resolved, *, max_bytes=None):
     def marker(omitted):
         return dict(truncated=bool(omitted), omitted_count=len(omitted),
                     omitted_check_ids=sorted({row['check_id'] for row in omitted}))
-    # The marker is part of the bounded delivery. Keep a deterministic prefix.
-    remaining = list(warnings)
-    for offset, row in enumerate(warnings):
-        candidate = kept + [row]
-        tail = warnings[offset + 1:]
-        if len(canonical_bytes(dict(findings=candidate, truncation=marker(tail)))) > cap:
-            break
-        kept, remaining = candidate, tail
+    if max_bytes is None:
+        # A local WARN may be nonblocking at ingestion but is still evidence for
+        # semantic review. Do not omit it before the real request budget check.
+        # Keep small projections byte-identical so accepted siblings stay valid.
+        cap = max(cap, len(canonical_bytes(dict(findings=selected, truncation=marker([])))))
+        kept, remaining = selected, []
+    else:
+        # Only bounded previews need prefix packing; full delivery must not
+        # repeatedly serialize growing prefixes of an already complete set.
+        remaining = list(warnings)
+        for offset, row in enumerate(warnings):
+            candidate = kept + [row]
+            tail = warnings[offset + 1:]
+            if len(canonical_bytes(dict(findings=candidate, truncation=marker(tail)))) > cap:
+                break
+            kept, remaining = candidate, tail
     truncation = marker(remaining)
     delivered_bytes = len(canonical_bytes(dict(findings=kept, truncation=truncation)))
     overflow = delivered_bytes > cap

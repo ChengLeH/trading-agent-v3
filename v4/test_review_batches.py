@@ -221,6 +221,40 @@ class ReviewBatches(unittest.TestCase):
         self.assertEqual(native["oversized_items"][0]["reason"], "related_diagnostics_incomplete")
         self.assertEqual(native["next_action"], "reduce_structured_refs_or_adjust_related_diagnostics_cap")
 
+    def test_dense_complete_diagnostics_dispatch_sync_atomic_and_deep_with_actual_wire_limit(self):
+        from unittest.mock import patch
+        from .review_budget import review_budget_row, review_wire_breakdown
+        diagnostics = [dict(section='coverage', findings=[dict(claim_id='a',
+            status='WARN', check_id='future.check', field=str(i), reason='preserved warning ' * 100)
+            for i in range(16)])]
+        with patch('v4.atomic_phase6.ingestion_diagnostics', return_value=diagnostics):
+            runner = seeded()
+            prepared = runner.prepare_phase6_atomic(enforce_budget=False)
+            cid, prompt = next((cid, p) for cid, p in prepared['atomic_prompts'] if cid == 'a')
+            schema = prepared['response_schemas'][cid]
+            wire_bytes = review_wire_breakdown(prompt, schema)['wire_bytes']
+            self.assertLess(wire_bytes, runner.review_batch_max_bytes)
+            self.assertIsNone(review_budget_row(cid, prompt, schema, wire_bytes))
+            self.assertEqual(review_budget_row(cid, prompt, schema, wire_bytes - 1)['reason'],
+                             'wire_bytes_exceeds_budget')
+            def first_answer(sent):
+                payload = json.loads(sent.split('```json\n')[1].split('\n```', 1)[0])
+                claim = payload['claim']
+                return verdict(claim['claim_id'], 'SUSPICIOUS' if claim['claim_id'] == 'a' else 'PASS',
+                               ref_ids=reference_ids(claim))
+            first = CloudDouble(responder=first_answer)
+            result = runner._execute_review_batch(first, [('a', prompt)],
+                runner.collect_phase6_atomic, layer='atomic')
+            self.assertFalse(result.get('blocked'), result)
+            self.assertEqual(len(first.calls), len(runner.run.claims))
+            deep = runner.prepare_phase6_deep_review(['a'], enforce_budget=False)
+            second = CloudDouble(identity='test/deep', responder=lambda _: verdict('a'))
+            result = runner._execute_review_batch(second, deep['deep_prompts'],
+                runner.collect_phase6_deep_review, layer='deep')
+            self.assertFalse(result.get('blocked'), result)
+            self.assertEqual(len(second.calls), 1)
+            self.assertIn('a', runner.deep_receipts)
+
     def test_partial_collector_keeps_all_unreceived_siblings_until_they_finish(self):
         for layer in ('atomic', 'deep'):
             with self.subTest(layer=layer):
