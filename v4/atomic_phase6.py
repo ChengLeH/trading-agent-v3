@@ -221,7 +221,7 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
             context={"financial_review_contract": FINANCIAL_REVIEW_VERSION,
                      "review_context_format": REVIEW_CONTEXT_FORMAT,
                      "as_of": getattr(run, "manifest", {}).get("as_of"),
-                     **({'analysis_mandate': deepcopy(run.manifest['analysis_mandate'])} if 'analysis_mandate' in run.manifest else {}),
+                     **({'analysis_mandate': deepcopy(run.manifest['analysis_mandate'])} if 'analysis_mandate' in getattr(run, 'manifest', {}) else {}),
                      **({'source_declarations': declarations} if declarations else {}),
                      **({"calculation_definitions": definitions} if definitions else {}),
                      **({'indicator_definitions': indicators} if indicators else {}),

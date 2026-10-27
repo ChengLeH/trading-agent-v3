@@ -74,6 +74,7 @@ assertion 是結構化斷言，至少有 kind；若 kind=value，填 ref_id/valu
 "refs":[],"fact_refs":[],"dependencies":[],"author_role":"指定角色",
 "assertion":{"kind":"interpretation"},"bindings":[],"confidence":0.5,
 "subsection":"章節名稱","purpose":"論述用途"}]}。
+trader 的 trade.decision_comparison 必須包含 research_view={direction:BULLISH|BEARISH|NEUTRAL|UNKNOWN,reason, horizon_end:ISO日期或null,refs:[]} 與 alternatives（恰好 BUY、SHORT 各一項；每項含 direction,status:VIABLE|REJECTED|UNASSESSABLE|NOT_ALLOWED,reason,support_refs:[],opposition_refs:[],missing_information:[]）。WAIT 另填 wait={best_alternative:BUY|SHORT|UNKNOWN,reason,reassessment_trigger,refs:[]}；沒有資料或未獲授權時如實表示，不准虛構數字或使用者風險偏好。比較中的所有引用須列入 trade_plan Claim 的 refs 或 dependencies。研究判斷方向和可執行交易不同，不能只因多空都有反證就預設 WAIT。
 trader 另在 object 的 trade 欄位給結構化交易計畫：direction=WAIT 或 BUY/SHORT，
 交易時填 entry/stop/target/position_pct，價格必須是 JSON 數字。其他角色不可修改 trade。
 trader 恰一條 Claim 的 assertion 必須為 {"kind":"trade_plan","trade":與輸出的 trade 相同物件}；

@@ -18,6 +18,13 @@ from .schema import Claim
 from .test_contracts import claim
 
 
+def comparable_wait():
+    return {"direction": "WAIT", "decision_comparison": {
+        "research_view": {"direction": "UNKNOWN", "reason": "evidence incomplete", "horizon_end": None, "refs": []},
+        "alternatives": [{"direction": side, "status": "UNASSESSABLE", "reason": "insufficient evidence", "support_refs": [], "opposition_refs": [], "missing_information": ["evidence"]} for side in ("BUY", "SHORT")],
+        "wait": {"best_alternative": "UNKNOWN", "reason": "neither alternative is assessable", "reassessment_trigger": "new evidence", "refs": []}}}
+
+
 class CloudDouble:
     execution = "cloud"
 
@@ -269,7 +276,7 @@ class Integration(unittest.TestCase):
             c["author_role"] = packet["role"]
             output = {"claims": [c]}
             if packet["role"] == "trader":
-                output["trade"] = {"direction": "WAIT"}
+                output["trade"] = comparable_wait()
                 c["assertion"] = dict(kind="trade_plan", trade=output["trade"])
             return output
         clients = {"author": CloudDouble("test/author", author_response), "atomic": CloudDouble(),
@@ -305,7 +312,7 @@ class Integration(unittest.TestCase):
             c["author_role"] = role
             output = {"claims": [c]}
             if role == "trader":
-                output["trade"] = {"direction": "WAIT"}
+                output["trade"] = comparable_wait()
                 c["assertion"] = dict(kind="trade_plan", trade=output["trade"])
             return output
         with tempfile.TemporaryDirectory() as temp:

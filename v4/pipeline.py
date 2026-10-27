@@ -469,6 +469,7 @@ class OrchestratorV4(Orchestrator):
         rid = super().start_run(subject, manifest)
         if mandate is not None:
             self.runs[rid].manifest["analysis_mandate"] = mandate
+        self.runs[rid].manifest["decision_comparison_contract"] = "decision-comparison/1"
         self.runs[rid].events = {}
         self.runs[rid].source_lineage = {}
         if lineage:
@@ -504,7 +505,8 @@ class OrchestratorV4(Orchestrator):
                 raise ValueError("trade.position_pct outside (0,100]")
         candidates = [Claim.from_dict(c).to_dict() for c in candidate_claims]
         candidate_index = claim_index(run.claims + candidates)
-        validate_trade_evidence(trade, set(source_catalog(shadow)) | set(candidate_index))
+        validate_trade_evidence(trade, set(source_catalog(shadow)) | set(candidate_index),
+                                require_comparison=run.manifest.get("decision_comparison_contract") == "decision-comparison/1")
         digest(trade)
         before_facts, before_calcs = set(shadow.fact_store.to_dict()), set(shadow.calc_store.to_dict())
         self.runs[run_id] = shadow

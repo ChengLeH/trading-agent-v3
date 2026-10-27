@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .agent_reviews import NativeReviewWorkflow
 from .test_agent_reviews import response
-from .test_integration import claim
+from .test_integration import claim, comparable_wait
 
 
 class NativeManifestLifecycle(unittest.TestCase):
@@ -42,7 +42,7 @@ class NativeManifestLifecycle(unittest.TestCase):
                         candidate["author_role"] = role
                         entry = dict(claims=[candidate])
                         if role == "trader":
-                            entry["trade"] = dict(direction="WAIT")
+                            entry["trade"] = comparable_wait()
                             candidate["assertion"] = dict(kind="trade_plan", trade=entry["trade"])
                         output[role] = entry
                 elif kind in {"atomic", "deep"}:

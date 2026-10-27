@@ -5,6 +5,7 @@ per-Claim and global semantic reviews must still assess those premises.
 """
 from datetime import date
 
+from .decision_comparison import comparison_refs, validate_comparison
 from .precision import number, validate_calculation_value
 from .schema import id_list
 
@@ -45,11 +46,13 @@ def trade_evidence_refs(trade):
         if isinstance(row, dict):
             for key in keys:
                 result.update(id_list(row.get(key, []), f'trade.{field}.{key}'))
+    result.update(comparison_refs(trade.get("decision_comparison")))
     return result
 
 
-def validate_trade_evidence(trade, known_refs):
+def validate_trade_evidence(trade, known_refs, *, require_comparison=False):
     """Validate supplied typed premises. Legacy plans remain explicitly unknown."""
+    validate_comparison(trade, known_refs, required=require_comparison)
     if trade.get('direction') == 'WAIT':
         return
     contract = trade.get('evidence_contract')

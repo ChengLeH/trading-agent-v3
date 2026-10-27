@@ -275,11 +275,11 @@ print(json.dumps(dict(result=result, serialized_definitions=json.dumps(definitio
             with resumed.queue.transaction() as state:
                 upgrade = state['contract_upgrades'][-1]
                 self.assertEqual(upgrade['previous_contract'], previous_contract)
-                self.assertEqual(upgrade['current_contract'], 'financial-evidence/11')
+                self.assertEqual(upgrade['current_contract'], 'financial-evidence/12')
                 self.assertTrue(state['packets'][old_packet['packet_id']]['retired'])
                 self.assertEqual(state['packets'][old_packet['packet_id']]['retirement_reason'],
                                  'financial_review_contract_upgraded')
-                self.assertEqual(state['financial_review_contract'], 'financial-evidence/11')
+                self.assertEqual(state['financial_review_contract'], 'financial-evidence/12')
 
     def test_nonpass_reviews_issue_patch_then_revalidate_descendants(self):
         with tempfile.TemporaryDirectory() as root:
