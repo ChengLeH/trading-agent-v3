@@ -363,7 +363,8 @@ class OrchestratorV4(Orchestrator):
         """
         run = self.runs[run_id]
         from .cash_flow import build_with_cash_flow
-        from .market_data import normalize_market_record, annotate_market_facts
+        from .market_data import (normalize_market_record, annotate_market_facts,
+                                  remove_incomplete_52_week_values)
         from .financial_data import augment_financial_facts, prepare_legacy_builder_view
         original_records = run.records
         builder_records = deepcopy(original_records)
@@ -393,6 +394,7 @@ class OrchestratorV4(Orchestrator):
         finally:
             run.records = original_records
         report["limitations"].extend(legacy_limitations)
+        remove_incomplete_52_week_values(run, market_diagnostics, builder_records)
         original_by_id = {getattr(rec, "id", None): rec for rec in original_records}
         for diagnostic in market_diagnostics:
             source_record = original_by_id.get(diagnostic["source_id"])

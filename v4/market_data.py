@@ -260,6 +260,34 @@ def normalize_market_record(record, manifest):
     return payload, diagnostic
 
 
+def remove_incomplete_52_week_values(run, diagnostics, records):
+    """Never label a shorter supplied window as the builder's 252-bar range."""
+    by_source = {rec.id: rec for rec in records if getattr(rec, 'type', None) == 'openbb_ohlcv'}
+    removed = set()
+    for diagnostic in diagnostics:
+        rec = by_source.get(diagnostic['source_id'])
+        high = run.fact_store.get('fact.High52w.latest')
+        if rec is None or high is None or high.source_id != rec.id:
+            continue
+        # The shared builder can exclude an unfinished last bar. Count only
+        # observations through the date actually used for its latest fact.
+        bars = rec.payload.get('bars', [])
+        used = sum(1 for bar in bars if bar['date'] <= high.effective_date)
+        if used >= 252:
+            continue
+        reason = f'{rec.id}: 52-week high/low unavailable: only {used} of 252 required observations'
+        diagnostic['limitations'].append(reason)
+        diagnostic['findings'].append(dict(status='WARN', check_id='market_52_week_history_incomplete',
+            source_id=rec.id, actual_observations=used, required_observations=252, reason=reason))
+        for fid in ('fact.High52w.latest', 'fact.Low52w.latest'):
+            if run.fact_store.get(fid) is not None:
+                removed.add(fid)
+                run.fact_store._facts.pop(fid)
+    for cid, calc in list(run.calc_store._calcs.items()):
+        if removed.intersection(calc.get('input_refs', [])):
+            run.calc_store._calcs.pop(cid)
+
+
 def annotate_market_facts(run, diagnostics):
     by_source = {row["source_id"]: row for row in diagnostics}
     for fact in run.fact_store._facts.values():

@@ -398,6 +398,28 @@ class CalculationInputContracts(unittest.TestCase):
 
 
 class MarketAndFreshnessContracts(unittest.TestCase):
+    def test_short_history_does_not_claim_a_52_week_extreme(self):
+        from datetime import date, timedelta
+        for size in (20, 252):
+            orch, rid = OrchestratorV4(), 'history-window'
+            orch.runs[rid] = RunState(run_id=rid, ticker='TEST',
+                manifest={'subject': {'ticker': 'TEST'}, 'as_of': '2026-10-16'})
+            orch.runs[rid].events = {}
+            bars = [dict(date=(date(2025, 1, 1) + timedelta(days=i)).isoformat(),
+                         open=100, high=101, low=99, close=100, volume=10)
+                    for i in range(size)]
+            orch.runs[rid].records = [SourceRecord('market', 'openbb_ohlcv', 'TEST', None,
+                                                   {'bars': bars}, 'market-hash', meta={})]
+            report = orch.build_facts(rid)
+            facts = orch.runs[rid].fact_store.to_dict()
+            calcs = orch.runs[rid].calc_store.to_dict()
+            self.assertEqual('fact.High52w.latest' in facts, size >= 252)
+            self.assertEqual('fact.Low52w.latest' in facts, size >= 252)
+            self.assertEqual('calc.dist.52whi' in calcs, size >= 252)
+            self.assertEqual('calc.dist.52wlo' in calcs, size >= 252)
+            if size < 252:
+                self.assertTrue(any('52-week' in s for s in report['limitations']))
+
     def test_market_facts_are_order_independent_and_report_raw_price_basis(self):
         bars = [
             {"date": "2026-10-15", "open": 100, "high": 101, "low": 99,

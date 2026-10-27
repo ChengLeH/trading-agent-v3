@@ -98,10 +98,10 @@ class MarketBasisAnnotations(unittest.TestCase):
 
     def test_atr_uses_high_low_close_basis_when_open_is_unknown(self):
         bars = []
-        for offset in range(16):
+        for offset in range(252):
             close = 100 + offset
             bars.append({
-                "date": (date(2026, 10, 1) + timedelta(days=offset)).isoformat(),
+                "date": (date(2026, 10, 16) - timedelta(days=251 - offset)).isoformat(),
                 "open": close - 1,
                 "high": close + 2,
                 "low": close - 2,
@@ -124,7 +124,7 @@ class MarketBasisAnnotations(unittest.TestCase):
                          "price:range_basis")
         self.assertEqual(run.fact_store.get("fact.Low52w.latest").basis,
                          "price:range_basis")
-        self.assertEqual(run.fact_store.get("fact.High52w.latest").value, 117)
+        self.assertEqual(run.fact_store.get("fact.High52w.latest").value, 353)
         self.assertEqual(run.fact_store.get("fact.Low52w.latest").value, 98)
 
     def test_return_calc_drops_stale_basis_for_missing_or_mixed_source_close(self):
@@ -251,13 +251,14 @@ class MarketBasisAnnotations(unittest.TestCase):
 
     def test_absent_optional_metadata_preserves_existing_diagnostic_and_global_basis(self):
         _, _, record = self.build()
-        self.assertEqual(record.meta["market_data_extraction"], {
+        diagnostic = record.meta["market_data_extraction"]
+        self.assertTrue(any(f['check_id'] == 'market_52_week_history_incomplete'
+                            for f in diagnostic['findings']))
+        self.assertEqual({k: v for k, v in diagnostic.items() if k not in {'findings', 'limitations'}}, {
             "section": "market_data",
             "source_id": "market",
             "input_rows": 2,
             "normalized_rows": 2,
-            "findings": [],
-            "limitations": [],
             "selected_price_field": "close",
             "price_basis": "raw_close",
             "price_basis_source": "default_assumption",
