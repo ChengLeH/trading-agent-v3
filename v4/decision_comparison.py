@@ -35,6 +35,8 @@ def validate_comparison(trade, known_refs, *, required=False):
     if not isinstance(view, dict) or view.get('direction') not in {'BULLISH', 'BEARISH', 'NEUTRAL', 'UNKNOWN'}:
         raise ValueError('decision_comparison.research_view requires a direction')
     _text(view, 'reason')
+    if not {'horizon_end', 'refs'} <= set(view):
+        raise ValueError('decision_comparison.research_view requires horizon_end and refs; unknown values may be null or empty')
     horizon = view.get('horizon_end')
     if horizon is not None:
         try:
@@ -53,6 +55,8 @@ def validate_comparison(trade, known_refs, *, required=False):
         if row.get('status') not in {'VIABLE', 'REJECTED', 'UNASSESSABLE', 'NOT_ALLOWED'}:
             raise ValueError('decision_comparison alternative status invalid')
         _text(row, 'reason')
+        if not {'support_refs', 'opposition_refs', 'missing_information'} <= set(row):
+            raise ValueError('decision_comparison alternative requires support_refs, opposition_refs and missing_information')
         for field in ('support_refs', 'opposition_refs'):
             id_list(row.get(field, []), f'decision_comparison.{field}')
         missing = row.get('missing_information', [])
@@ -64,6 +68,8 @@ def validate_comparison(trade, known_refs, *, required=False):
             raise ValueError('WAIT requires best_alternative BUY, SHORT or UNKNOWN')
         _text(wait, 'reason')
         _text(wait, 'reassessment_trigger')
+        if 'refs' not in wait:
+            raise ValueError('decision_comparison.wait requires refs; an empty list is allowed')
     unknown = comparison_refs(comparison) - set(known_refs)
     if unknown:
         raise ValueError('decision_comparison has unknown refs: ' + ', '.join(sorted(unknown)))

@@ -27,6 +27,17 @@ class DecisionComparisonTests(unittest.TestCase):
     def test_legacy_wait_is_accepted_without_pretending_it_has_comparison(self):
         validate_trade_evidence({'direction': 'WAIT'}, set())
 
+    def test_missing_fields_are_not_silently_converted_to_unknown(self):
+        for section, field in [('research_view', 'horizon_end'), ('research_view', 'refs'),
+                               ('alternative', 'support_refs'), ('alternative', 'opposition_refs'),
+                               ('alternative', 'missing_information'), ('wait', 'refs')]:
+            trade = comparable_wait()
+            comparison = trade['decision_comparison']
+            row = comparison['alternatives'][0] if section == 'alternative' else comparison[section]
+            row.pop(field)
+            with self.subTest(section=section, field=field), self.assertRaises(ValueError):
+                validate_trade_evidence(trade, set(), require_comparison=True)
+
     def test_prose_is_not_a_deterministic_veto(self):
         trade = comparable_wait()
         trade['decision_comparison']['wait']['reason'] = 'anything; no keyword changes a semantic verdict'
