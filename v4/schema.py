@@ -61,6 +61,8 @@ class Claim:
         if not raw["assertion"]["kind"]:
             raise ValueError("assertion.kind must be nonempty")
         assertion = raw["assertion"]
+        if 'catalog_scope' in assertion and assertion['catalog_scope'] not in ('referenced_sources', 'full_catalog'):
+            raise ValueError('assertion.catalog_scope must be referenced_sources or full_catalog')
         if assertion["kind"] == "value" and (assertion.get("ref_id") not in raw["refs"] or "value" not in assertion):
             raise ValueError("value assertion requires a declared ref_id and value")
         if assertion["kind"] == "event" and (assertion.get("event_ref") not in raw["refs"] or type(assertion.get("is_aggregate")) is not bool):

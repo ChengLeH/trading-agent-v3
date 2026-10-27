@@ -9,7 +9,7 @@ import json
 from uuid import uuid4
 from .atomic_phase6 import (build_atomic_tasks, build_atomic_prompt, build_reference_supplement_prompt,
                             build_reference_verdict_repair_prompt,
-                            summarize_atomic_results)
+                            summarize_atomic_results, _catalog_scope_instructions)
 from .review_batches import pack_review_requests, unpack_review_result, unpack_prepared_review_result
 from .review_budget import (DEFAULT_ATOMIC_REVIEW_MAX_BYTES, DEFAULT_DEEP_REVIEW_MAX_BYTES,
                             review_budget_for, review_budget_row,
@@ -65,6 +65,7 @@ refs 的來源 ID 與 Claim ID 是不同類型：來源以 facts/calcs/evidence/
 所有提供的 binding 欄位 ref_id/entity/concept/period/scope/unit/basis 均必填；
 來源不具備的維度明寫 unknown，不得猜。保留原始 Fact 的 share_basis/effective_date 與 provenance。
 assertion 是結構化斷言，至少有 kind；若 kind=value，填 ref_id/value；
+可選 assertion.catalog_scope=referenced_sources 僅限命題完全依所列引用與前提判斷，不宣稱整體目錄完整、某資料不存在或本次沒有其他證據；這類目錄相關命題用 full_catalog，未確定可省略（沿用保守完整目錄）。範圍宣告仍須語義驗證，不能刪來源或改標籤來規避重驗。
 若 kind=event，event_ref 只能選 events 目錄已註冊的 event_id，is_aggregate 必須與該事件相同；並在 refs 與 binding 中列出事件。
 一般新聞敘述不需要量化事件結構時可用 kind=text；evidence ID 不是 event_id，不得把所有新聞預設為 aggregate。
 需要新事件時由主 Agent 先 register-events 註冊結構化事件，不能自行假造目錄 ID。
@@ -1001,7 +1002,8 @@ class PipelineRunnerV4:
                 "其他 verdict 至少一項 finding，包含 issue/evidence/suggested_fix。\n"
                 + REFERENCE_INSTRUCTIONS + "\n" + FINANCIAL_REVIEW_CONTRACT + "\n"
                 + DIAGNOSTICS_INSTRUCTIONS + "\n"
-                + EVIDENCE_REQUEST_INSTRUCTIONS + review_wire_instructions(payload), payload, compact=True)
+                + EVIDENCE_REQUEST_INSTRUCTIONS + _catalog_scope_instructions(task)
+                + review_wire_instructions(payload), payload, compact=True)
         return structured_prompt(text, json.dumps(semantic_review_schema(task.claim), ensure_ascii=False, separators=(",", ":")))
 
     def collect_phase6_deep_review(self, results_by_claim, *, model_identity=None, allow_partial=False):

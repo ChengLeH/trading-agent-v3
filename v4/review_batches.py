@@ -65,6 +65,8 @@ def _request(tasks, *, layer, verification_epoch, first_reviews):
                    evidence_catalog=evidence, dependency_catalog=dependencies)
     payload = project_review_payload(payload)
     instruction = BATCH_INSTRUCTIONS
+    if any('catalog_scope' in (task.context or {}).get('evidence_scope', {}) for task in tasks):
+        instruction += "\n逐條依 task.context.evidence_scope 的 catalog_scope/effective_catalog_scope 理解作者明示範圍；未宣告者維持原完整目錄規格。referenced_sources 只憑該條已引用來源與前提判斷，不代表資料完整或缺席已被證明；若命題實際依賴全目錄或來源不存在而引用不足，回 SUSPICIOUS。full_catalog 的計數與雜湊也不是來源全文，不能單獨作為不存在的證據。範圍宣告不能免除語義審查。"
     if layer == "deep":
         instruction += "\n這是第二層深度對抗覆核。每條都重新閱讀原始證據，獨立挑戰第一層 findings，不可直接照抄。"
     instruction += review_wire_instructions(payload)

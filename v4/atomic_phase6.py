@@ -28,6 +28,7 @@ from .review_diagnostics import (REVIEW_CONTEXT_FORMAT, DIAGNOSTICS_INSTRUCTIONS
 from .review_wire import project_review_payload, review_wire_instructions
 
 CATALOG_DETAIL_MAX_BYTES = 4096
+CATALOG_SCOPES = frozenset({"referenced_sources", "full_catalog"})
 
 
 @dataclass
@@ -107,6 +108,83 @@ def _evidence_scope(run, facts, calcs, evidence, events):
                 source_records_hash=digest(sorted(records, key=lambda r: r["id"])))
 
 
+def _full_catalog_content_hash(run, facts, calcs, evidence, events):
+    """Hash complete catalog content only when a new claim explicitly needs it."""
+    trade_facts, trade_calcs = getattr(run, "trade_generated", ([], []))
+    records = [record.to_dict() if callable(getattr(record, "to_dict", None)) else
+               dict(id=getattr(record, "id", None), type=getattr(record, "type", None),
+                    source_hash=getattr(record, "source_hash", None))
+               for record in getattr(run, "records", []) if hasattr(record, "source_hash")]
+    records.sort(key=lambda row: row.get("id") or "")
+    return digest(dict(
+        facts={fid: facts[fid] for fid in sorted(facts) if fid not in trade_facts},
+        calcs={cid: calcs[cid] for cid in sorted(calcs) if cid not in trade_calcs},
+        evidence=evidence,
+        events=events,
+        source_records=records,
+    ))
+
+
+def _declared_catalog_scope(claim):
+    """Read an explicit typed scope; legacy claims stay catalog-sensitive."""
+    assertion = claim.get("assertion")
+    if not isinstance(assertion, dict) or "catalog_scope" not in assertion:
+        return "full_catalog"
+    scope = assertion["catalog_scope"]
+    if type(scope) is not str or scope not in CATALOG_SCOPES:
+        raise ValueError("assertion.catalog_scope must be 'referenced_sources' or 'full_catalog'")
+    return scope
+
+
+def _referenced_evidence_scope(run, source_ids):
+    """Fingerprint only the source records reached through explicit refs."""
+    source_ids = sorted(source_ids)
+    records = [dict(id=record.id, type=record.type, source_hash=record.source_hash)
+               for record in getattr(run, "records", [])
+               if getattr(record, "id", None) in source_ids and hasattr(record, "source_hash")]
+    records.sort(key=lambda row: row["id"])
+    source_ids_bytes = json.dumps(source_ids, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    records_bytes = json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return dict(scope="referenced_sources", includes_source_contents=False,
+                referenced_source_count=len(source_ids),
+                referenced_source_ids=source_ids if len(source_ids_bytes) <= CATALOG_DETAIL_MAX_BYTES else None,
+                referenced_source_ids_hash=digest(source_ids),
+                source_record_count=len(records),
+                source_records=records if len(records_bytes) <= CATALOG_DETAIL_MAX_BYTES else None,
+                source_records_included=len(records_bytes) <= CATALOG_DETAIL_MAX_BYTES,
+                source_records_hash=digest(records))
+
+
+def _catalog_scope_instructions(task):
+    """Explain the typed scope to the reviewer without changing legacy prompts."""
+    scope = (task.context or {}).get("evidence_scope", {})
+    declared = scope.get("catalog_scope")
+    if declared not in CATALOG_SCOPES:
+        return ""
+
+    common = (
+        "此欄位只宣告作者希望使用的目錄範圍，不是證據，也不能免除你核對 Claim 與實際證據是否相符。"
+        "仍須按 text 與 assertion 的實際語義檢查此宣告是否適當；不得從 prose 自動推定或改寫範圍。"
+    )
+    if declared == "referenced_sources" and scope.get("effective_catalog_scope") == "referenced_sources":
+        return ("\n\n## Typed catalog scope\n"
+                "此 Claim 宣告 catalog_scope=referenced_sources。只根據 Claim 明確引用、且在 resolved_refs "
+                "或 dependency_claims 中提供的來源判斷；不使用全目錄計數或未引用項目。"
+                "若命題實際依賴完整目錄、來源不存在或未提供，而引用來源未能證明，請回 SUSPICIOUS；"
+                "不得因作者宣告 referenced_sources 就略過這項缺失判斷。" + common)
+    if declared == "referenced_sources":
+        inherited = scope.get("inherited_full_catalog_claim_ids", [])
+        return ("\n\n## Typed catalog scope\n"
+                "此 Claim 宣告 catalog_scope=referenced_sources，但因依賴以下 full_catalog 前提，"
+                f"本次任務繼承 full_catalog 敏感性：{', '.join(inherited)}。"
+                "檢查已附全目錄 metadata 與依賴；metadata 的計數、指紋及概念摘要不是來源全文，"
+                "不能單獨證明任何資料缺席。" + common)
+    return ("\n\n## Typed catalog scope\n"
+            "此 Claim 宣告 catalog_scope=full_catalog，必須保留對整體目錄完整性與缺席判斷的敏感性。"
+            "evidence_scope 是全目錄 metadata 摘要，不含來源全文；計數、指紋及概念摘要不能單獨證明資料缺席。"
+            "若命題依賴完整性或缺席，而目前 context 沒有足以判斷的來源，請回 SUSPICIOUS。" + common)
+
+
 def _local_calculation_definitions(claims, resolved):
     """Describe only calculations reachable from the reviewed Claim and its direct parents."""
     calculations, visited = {}, set()
@@ -146,6 +224,8 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
     from .financial_statements import source_declarations
     declarations = source_declarations(run)
     claims = claim_index(run.claims)
+    catalog_scopes = {cid: _declared_catalog_scope(claim) for cid, claim in claims.items()}
+    catalog_content_hash = None
     tasks: List[AtomicTask] = []
 
     for claim in run.claims:
@@ -200,18 +280,48 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
         for dep in claim.get("dependencies", []):
             dependency(dep)
 
+        declared_scope = catalog_scopes[cid]
+        inherited_full_catalog_claim_ids = sorted(
+            dep["claim_id"] for dep in deps if catalog_scopes[dep["claim_id"]] == "full_catalog")
+        effective_scope = ("full_catalog" if declared_scope == "full_catalog"
+                           or inherited_full_catalog_claim_ids else "referenced_sources")
+        assertion = claim.get("assertion")
+        explicit_scope = isinstance(assertion, dict) and "catalog_scope" in assertion
+        explicit_full_catalog = explicit_scope and declared_scope == "full_catalog"
+        explicit_full_ancestors = [
+            dep for dep in deps
+            if (isinstance(dep.get("assertion"), dict)
+                and dep["assertion"].get("catalog_scope") == "full_catalog")]
+        needs_full_content_hash = explicit_full_catalog or bool(explicit_full_ancestors)
+
         direct = set(claim.get("dependencies", []))
         local_claims = [claim] + [parent for parent in deps if parent["claim_id"] in direct]
         definitions = _local_calculation_definitions(local_claims, resolved)
         indicators = indicator_definitions({ref: item['value'] for ref, item in resolved.items()
                                              if item['kind'] == 'fact'})
         lineage_refs = set(resolved)
-        lineage_refs.update(item["value"].get("source_id") for item in resolved.values()
-                            if item.get("kind") in {"fact", "evidence"}
-                            and isinstance(item.get("value"), dict)
-                            and item["value"].get("source_id"))
+        source_ids = {item["value"].get("source_id") for item in resolved.values()
+                      if item.get("kind") in {"fact", "evidence"}
+                      and isinstance(item.get("value"), dict)
+                      and isinstance(item["value"].get("source_id"), str)
+                      and item["value"].get("source_id")}
+        lineage_refs.update(source_ids)
         source_lineage = project_source_lineage(
             getattr(run, "source_lineage", {}), lineage_refs)
+        task_evidence_scope = (deepcopy(evidence_scope) if effective_scope == "full_catalog"
+                               else _referenced_evidence_scope(run, source_ids))
+        task_declarations = (declarations if effective_scope == "full_catalog"
+                             else {source_id: declarations[source_id] for source_id in sorted(source_ids)
+                                   if source_id in declarations})
+        if explicit_scope:
+            task_evidence_scope["catalog_scope"] = declared_scope
+            task_evidence_scope["effective_catalog_scope"] = effective_scope
+            if declared_scope == "referenced_sources" and inherited_full_catalog_claim_ids:
+                task_evidence_scope["inherited_full_catalog_claim_ids"] = inherited_full_catalog_claim_ids
+        if needs_full_content_hash:
+            if catalog_content_hash is None:
+                catalog_content_hash = _full_catalog_content_hash(run, facts, calcs, evidence, events)
+            task_evidence_scope["catalog_contents_hash"] = catalog_content_hash
         tasks.append(AtomicTask(
             claim_id=cid,
             claim=deepcopy(claim),
@@ -222,11 +332,11 @@ def build_atomic_tasks(run) -> List[AtomicTask]:
                      "review_context_format": REVIEW_CONTEXT_FORMAT,
                      "as_of": getattr(run, "manifest", {}).get("as_of"),
                      **({'analysis_mandate': deepcopy(run.manifest['analysis_mandate'])} if 'analysis_mandate' in getattr(run, 'manifest', {}) else {}),
-                     **({'source_declarations': declarations} if declarations else {}),
+                     **({'source_declarations': task_declarations} if task_declarations else {}),
                      **({"calculation_definitions": definitions} if definitions else {}),
                      **({'indicator_definitions': indicators} if indicators else {}),
                      **({'source_lineage': source_lineage} if source_lineage else {}),
-                     "evidence_scope": {**deepcopy(evidence_scope),
+                     "evidence_scope": {**task_evidence_scope,
                          "ingestion_diagnostics": project_diagnostics(diagnostics, [claim] + deps, resolved)},
                      "trade": deepcopy(getattr(run, "trade", {}))
                      if claim.get("author_role") in {"trader", "risk_manager"} else {}},
@@ -280,6 +390,7 @@ def build_atomic_prompt(task: AtomicTask, *, verification_epoch=None) -> str:
     payload = project_review_payload(payload)
     text = (
         ATOMIC_INSTRUCTIONS
+        + _catalog_scope_instructions(task)
         + review_wire_instructions(payload)
         + "\n\n## Claim 與局部證據上下文\n```json\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
@@ -313,6 +424,7 @@ def build_reference_supplement_prompt(task: AtomicTask, prior_result, missing_re
     )
     instructions = (
         role_instructions
+        + _catalog_scope_instructions(task)
         + EVIDENCE_INSTRUCTIONS
         + FINANCIAL_REVIEW_CONTRACT
         + EVIDENCE_REQUEST_INSTRUCTIONS
@@ -351,6 +463,7 @@ def build_reference_verdict_repair_prompt(task: AtomicTask, accepted_reference_c
             "你是 V4 的原子化語義驗證員。重新判斷 Claim 的整體語義與 verdict。")
     instructions = (
         role
+        + _catalog_scope_instructions(task)
         + EVIDENCE_INSTRUCTIONS
         + FINANCIAL_REVIEW_CONTRACT
         + EVIDENCE_REQUEST_INSTRUCTIONS
