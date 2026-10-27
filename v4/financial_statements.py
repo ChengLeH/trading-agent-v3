@@ -20,9 +20,17 @@ ALIASES = {
     "NonRedeemableNCI": ("nonredeemable_nci", "non_redeemable_nci"),
     "RedeemableNCI": ("redeemable_nci", "redeemable_noncontrolling_interest"),
     "ConsolidatedEquity": ("consolidated_equity",),
+    # Preserve unclassified NCI as its own fact: it is not evidence that the
+    # amount is redeemable or non-redeemable and cannot complete an identity.
+    "NoncontrollingInterests": ("noncontrolling_interests",),
+    "EquityIncludingNoncontrollingInterests": ("total_equity_and_noncontrolling_interests",),
+    "LiabilitiesAndEquity": ("total_liabilities_and_equity",),
+    "ShortTermInvestments": ("short_term_investments",),
+    "LongTermInvestments": ("long_term_investments",),
+    "WarrantLiabilities": ("warrant_liabilities",),
 }
 KNOWN_INPUT_FIELDS = {key for aliases in ALIASES.values() for key in aliases} | {
-    "fiscal_year", "fiscal_period", "unit", "currency", "basis", "precision",
+    "fiscal_year", "fiscal_period", "unit", "currency", "reported_currency", "basis", "precision",
     "equity_attribution", "statement_scope", "scope", "entity", "share_basis",
     "redeemable_nci_inclusion", "period", "period_type", "period_coverage",
     "start", "end", "start_date", "end_date", "period_start", "period_end",
@@ -114,7 +122,7 @@ def extract_financial_statements(record):
                              if row.get(key) is not None]
                 if misplaced:
                     findings.append(_diagnostic(record, section, index, "WARN", "financial_field_section",
-                        "equity attribution fields appear in the income statement section", fields=misplaced))
+                        "balance sheet fields appear in the income statement section", fields=misplaced))
             declared_precision = row.get("precision", metadata.get("precision"))
             declared_basis = row.get('basis', metadata.get('basis', 'unknown'))
             if isinstance(declared_basis, str) and declared_basis.strip().casefold() in {'parent', 'consolidated', 'single_company', 'segment'}:
@@ -143,15 +151,32 @@ def extract_financial_statements(record):
                 value = row[present[0]]
                 unit = source_unit(row, metadata, None)
                 basis = row.get("basis", metadata.get("basis", "unknown"))
+                reported_currency = row.get('reported_currency')
+                if (not unit and isinstance(reported_currency, str) and len(reported_currency) == 3
+                        and reported_currency.isascii() and reported_currency.isalpha()
+                        and reported_currency.isupper()):
+                    unit = source_unit(dict(row, currency=reported_currency), metadata, None)
                 if not unit:
                     findings.append(_diagnostic(record, section, index, "WARN", "financial_unit_unknown",
                                                 f"{concept} has no explicit unit or currency"))
+                    continue
+                unit_currency = unit.split()[0].split('_')[0]
+                if (isinstance(reported_currency, str) and len(reported_currency) == 3
+                        and reported_currency.isascii() and reported_currency.isalpha()
+                        and reported_currency.isupper() and len(unit_currency) == 3
+                        and unit_currency.isascii() and unit_currency.isalpha()
+                        and unit_currency.isupper() and reported_currency != unit_currency):
+                    findings.append(_diagnostic(record, section, index, 'WARN', 'financial_currency_conflict',
+                        f'{concept} has conflicting unit and reported currency',
+                        fields=present, unit=unit, reported_currency=reported_currency))
                     continue
                 fact_id = _fact_id(concept, period, record.id)
                 fact = Fact(fact_id, value, unit, period,
                     start=period_dims['start'], end=period_dims['end'],
                     fiscal_year=year, fiscal_period=fiscal_period, concept=concept, basis=basis,
-                    scope="parent" if concept == "ParentEquity" else "consolidated",
+                    scope=("parent" if concept == "ParentEquity" else
+                           "consolidated" if concept in {"ConsolidatedEquity", "NonRedeemableNCI", "RedeemableNCI"}
+                           else row.get("scope", metadata.get("scope", "unknown"))),
                     source_id=record.id, source_pointer=f"{section}[{index}].{present[0]}",
                     source_hash=record.source_hash,
                     accession_or_version=period_dims['accession_or_version'],
@@ -267,7 +292,8 @@ def financial_statement_findings(run):
     facts = run.fact_store.to_dict()
     by_key = {}
     for fid, f in facts.items():
-        if f.get("concept") in {"Assets", "Liabilities", *ALIASES.keys()}:
+        if f.get("concept") in {"Assets", "Liabilities", "ParentEquity", "ConsolidatedEquity",
+                                "NonRedeemableNCI", "RedeemableNCI"}:
             entity = f.get('entity') or _source_entity(run, f)
             basis = f.get('basis')
             if isinstance(basis, str):
@@ -325,7 +351,8 @@ def financial_statement_findings(run):
             equation = 'Assets = Liabilities + ParentEquity + NonRedeemableNCI' + (' + RedeemableNCI' if inclusion != 'liabilities' else '')
         else:
             peer_equity = any(other_key[0] == key[0] and other_key[1] == key[1]
-                and any(concept in other_group for concept in ALIASES)
+                and any(concept in other_group for concept in
+                        ('ParentEquity', 'ConsolidatedEquity', 'NonRedeemableNCI', 'RedeemableNCI'))
                 for other_key, other_group in by_key.items() if other_key != key)
             out.append(dict(status="WARN", check_id="balance_sheet_identity_coverage",
                 entity=key[0], period=key[1], reason=(

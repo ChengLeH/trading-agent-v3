@@ -31,6 +31,63 @@ def run_for(rows, company="ZZZ"):
 
 
 class FinancialStatementTests(unittest.TestCase):
+    def test_balance_components_are_preserved_without_guessing_nci_classification(self):
+        rec = record({'income': [], 'balance': [dict(fiscal_year=2026, fiscal_period='Q2',
+            noncontrolling_interests=12.371, short_term_investments=883.24,
+            long_term_investments=840.365, warrant_liabilities=3052.398,
+            total_equity_and_noncontrolling_interests=3339.579,
+            total_liabilities_and_equity=6778.591)],
+            'financial_statement_metadata': {'unit': 'USD_M', 'basis': 'gaap'}})
+        facts, diagnostic = extract_financial_statements(rec)
+        by_concept = {f.concept: f for f in facts}
+        for concept, value in [('NoncontrollingInterests', 12.371),
+                               ('ShortTermInvestments', 883.24),
+                               ('LongTermInvestments', 840.365),
+                               ('WarrantLiabilities', 3052.398),
+                               ('EquityIncludingNoncontrollingInterests', 3339.579),
+                               ('LiabilitiesAndEquity', 6778.591)]:
+            self.assertEqual(by_concept[concept].value, value)
+            self.assertEqual(by_concept[concept].source_id, rec.id)
+        self.assertNotIn('NonRedeemableNCI', by_concept)
+        self.assertNotIn('RedeemableNCI', by_concept)
+        self.assertEqual(by_concept['NoncontrollingInterests'].scope, 'unknown')
+        self.assertTrue(by_concept['NoncontrollingInterests'].source_pointer.endswith('.noncontrolling_interests'))
+        self.assertFalse(any(f['check_id'] == 'financial_fields_unmapped'
+                             for f in diagnostic['findings']))
+
+    def test_unclassified_nci_does_not_complete_balance_identity(self):
+        run = run_for([dict(fiscal_year=2030, parent_equity=70,
+                            noncontrolling_interests=10, redeemable_nci=0)])
+        augment_financial_statements(run, dict(facts=0, limitations=[]))
+        results = financial_statement_findings(run)
+        self.assertFalse(any(r['check_id'] == 'balance_sheet_identity' for r in results))
+        self.assertTrue(any(r['check_id'] == 'balance_sheet_identity_coverage' for r in results))
+
+    def test_reported_currency_is_used_when_no_unit_was_declared(self):
+        rec = record({'income': [], 'balance': [dict(fiscal_year=2026, fiscal_period='Q2',
+            reported_currency='USD', noncontrolling_interests=12371000)],
+            'financial_statement_metadata': {'basis': 'gaap'}})
+        facts, diagnostic = extract_financial_statements(rec)
+        self.assertEqual([(f.concept, f.value, f.unit) for f in facts],
+                         [('NoncontrollingInterests', 12371000, 'USD')])
+        self.assertFalse(any(f['check_id'] == 'financial_unit_unknown' for f in diagnostic['findings']))
+
+    def test_reported_currency_conflict_does_not_mislabel_new_fact(self):
+        rec = record({'income': [], 'balance': [dict(fiscal_year=2026,
+            reported_currency='EUR', noncontrolling_interests=123)],
+            'financial_statement_metadata': {'unit': 'USD', 'basis': 'gaap'}})
+        facts, diagnostic = extract_financial_statements(rec)
+        self.assertFalse(facts)
+        self.assertTrue(any(f['check_id'] == 'financial_currency_conflict'
+                            for f in diagnostic['findings']))
+
+    def test_reported_currency_preserves_explicit_source_scale(self):
+        rec = record({'income': [], 'balance': [dict(fiscal_year=2026,
+            reported_currency='USD', noncontrolling_interests=12.371)],
+            'financial_statement_metadata': {'scale': 'millions', 'basis': 'gaap'}})
+        facts, _ = extract_financial_statements(rec)
+        self.assertEqual([(f.value, f.unit) for f in facts], [(12.371, 'USD millions')])
+
     def test_source_declared_company_identity_joins_legacy_without_mutating_facts(self):
         run=run_for([dict(fiscal_year=2030,parent_equity=70,consolidated_equity=80,
             non_redeemable_nci=10,redeemable_nci=0)],company='Example Issuer Inc.')

@@ -503,8 +503,15 @@ permission 判斷不再搜尋整個 step JSON，結構化 error_code 優先。�
 
 ### 財報覆蓋、交易期限與執行假設
 
-`financial-evidence/10` 沿用原有角色／atomic／deep／global 審查，不增加模型輪次。
+`financial-evidence/11` 沿用原有角色／atomic／deep／global 審查，不增加模型輪次。
 升級後舊版收據會失效，必須依新契約重驗；不要在無法接受重驗成本時中途更新進行中的 run。
+
+組包者應在分析日前核對重大事件的公司官方公告、SEC 等一手來源，記錄發布與事件時間、時區和預估／確認狀態；將取得的來源放入 evidence，與第三方來源發生衝突時保留兩者。未取得官方來源應留明確缺口，不能宣稱已核查。本管線不自動搜尋網站，審查契約也不代表已查到官方公告。
+
+已知 `noncontrolling_interests`、`total_equity_and_noncontrolling_interests`、`total_liabilities_and_equity`、`short_term_investments`、`long_term_investments`、`warrant_liabilities` 可抽為帶來源的事實。一般非控制權益不自動分成可贖回或不可贖回，也不能以未分類值自動認證資產負債表恆等式；不同口徑或缺失的組件仍須保留未知。
+抽取上述擴充欄位時，來源的 `reported_currency` 可在沒有明示 unit／currency 時提供幣別，但不自動宣告數值縮放；幣別衝突的擴充事實不產生並列 WARN。既有 checkpoint 的 facts 不會因載入新版就自動補建；要使用新抽取的欄位，須以原始來源重新初始化或依既有證據更新流程建立新的事實並重驗，不能手改 checkpoint。
+
+裁決時應分開研究方向和當下交易狀態，依同一時點的證據比較多空候選支持與反證、期限及未知；WAIT 可成立，也不強迫捏造交易。這是既有語義審查的責任，不是程式判定模型已公平比較；跨情境的真模型偏差評估需另行執行。
 
 來源可在 manifest 的 source row 宣告 `financial_report_coverage` 陣列，欄位為
 `entity/period/period_coverage/published_or_filing_time`。這是操作者提供的來源 metadata，

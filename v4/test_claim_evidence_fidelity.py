@@ -38,7 +38,8 @@ class EvidenceFidelityContract(unittest.TestCase):
                    *dict(deep["deep_prompts"]).values(), global_task[1]]
         for prompt in prompts:
             self.assertIn(FINANCIAL_REVIEW_CONTRACT, prompt)
-            for obligation in ("共同原因", "重新評估條件", "metric_definitions", "price_basis_by_field"):
+            for obligation in ("共同原因", "重新評估條件", "metric_definitions", "price_basis_by_field",
+                               "官方公告", "多空候選", "研究方向"):
                 self.assertIn(obligation, prompt)
 
     def test_p6_revision_prompt_requests_full_evidence_correction_not_ref_removal(self):

@@ -1,7 +1,7 @@
 """Shared semantic obligations for existing LLM stages, not a new classifier."""
-FINANCIAL_REVIEW_VERSION = 'financial-evidence/10'
+FINANCIAL_REVIEW_VERSION = 'financial-evidence/11'
 FINANCIAL_REVIEW_CONTRACT = '''
-金融證據契約 financial-evidence/10：這些是語義核對責任，不是以字詞命中判錯。
+金融證據契約 financial-evidence/11：這些是語義核對責任，不是以字詞命中判錯。
 來源原始值、計算值與展示值須區分；assertion.value 保留 canonical 值。
 可另附 assertion.presentation={value,unit,decimal_places,rounding:half_up|half_even} 明示換單位與捨入。
 合理四捨五入或不同抓取時點造成的小差異，若來源、時間與精度足以解釋，不列重大錯誤；
@@ -12,6 +12,8 @@ FINANCIAL_REVIEW_CONTRACT = '''
 彙整日在事件之後，不足以證明每位分析師都已更新；也不得無證據宣稱共識形成於事件之前或尚未反映事件。
 比較需對齊 entity/metric/period/unit/basis/scope；可明示做跨期或跨口徑比較，但不得冒充同一量。
 季度 EPS 共識、年度 EPS、未來十二月股價目標是不同指標，不能互相代替作為指引落差證據。
+重大事件日期與條款應核對已提供的官方公告及其發布時間、事件時間、時區、來源版本與預估／確認狀態；官方與第三方說法不同須揭露及引用，不能把預估當確認。未提供官方資料時標明待查或 evidence_needed，不得宣稱已完成查核；資料收集由主 Agent 提供來源，不假裝此審查能上網。
+涉及整體裁決時，分開研究方向與當下可執行動作：按相同時點與證據比較多空候選的支持、反證、期限、風險和未知，不憑距離高低點或分析師意見就斷定某方向沒有機會。WAIT 可合理成立，也可保留方向性觀點；缺少估值、稀釋、借券成本或政策資料時說明未知，不捏造候選交易或強迫對稱。
 區分歸屬母公司權益、合併權益、非控制權益及可贖回非控制權益；缺少元件不能從殘差捏造。
 估值結論須繼承上游盈餘品質、一次性項目與可比性限制。
 GAAP P/E 算對不代表已證明便宜；淨利減營業利益不等於可直接剔除的稅後一次性收益，
