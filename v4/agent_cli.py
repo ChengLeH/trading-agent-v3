@@ -27,6 +27,19 @@ def _result_exit(payload):
     return 1 if blocked else 0
 
 
+def _deliver(payload, directory, enabled):
+    if not enabled or not (payload.get('items') or payload.get('requests')):
+        return payload
+    from .task_delivery import create_delivery, task_brief
+    keys = ('status', 'kind', 'blocked', 'packet_id', 'input_hash', 'lease',
+            'needs_retry', 'delivery_ready', 'verification_status', 'warnings')
+    result = {key: payload[key] for key in keys if key in payload}
+    result['delivery'] = create_delivery(directory, payload)
+    result['tasks'] = task_brief(result['delivery'])
+    result['next_action'] = 'read-task brief, then query required sources before answering'
+    return result
+
+
 def main(argv=None):
     from .agent_reviews import NativeReviewWorkflow
     from .agent_workflow import json_read
@@ -40,6 +53,16 @@ def main(argv=None):
     plan.add_argument('--lookback-months', type=int)
     plan.add_argument('--horizon-months', type=int)
     plan.add_argument('--objective')
+
+    read = sub.add_parser('read-task', help='read exact shared task content; never starts a model')
+    read.add_argument('--manifest', required=True)
+    read.add_argument('--sha256', required=True)
+    read.add_argument('--item')
+    read.add_argument('--action', choices=('materialize', 'brief', 'index', 'query', 'claim', 'role-query'), default='brief')
+    read.add_argument('--path', default='[]', help='JSON list of exact payload keys or indices')
+    read.add_argument('--ref')
+    read.add_argument('--catalog')
+    read.add_argument('--global-state', action='store_true')
 
     init = sub.add_parser("init", help="import a checkpoint into a new work directory")
     origin = init.add_mutually_exclusive_group(required=True)
@@ -63,6 +86,8 @@ def main(argv=None):
     nxt.add_argument('--prompt-files', action='store_true',
                      help='for role packets, return durable prompt paths/hashes instead of inline prompts')
 
+    nxt.add_argument('--delivery-files', action='store_true', help='return hash-addressed shared task files for any stage')
+
     submit = sub.add_parser("submit", help="submit structured responses for a packet")
     submit.add_argument("--work-dir", required=True)
     submit.add_argument("--packet-id", required=True)
@@ -72,6 +97,9 @@ def main(argv=None):
     submit.add_argument("--responses", required=True,
                         help="path to a JSON object mapping exact item IDs to JSON objects/arrays")
 
+    submit.add_argument('--next', dest='include_next', action='store_true', help='persist submission then return next work')
+    submit.add_argument('--delivery-files', action='store_true')
+
     claim = sub.add_parser("claim-reviews", help="reserve disjoint bounded review batches for this executor")
     claim.add_argument('--work-dir', required=True)
     claim.add_argument('--executor', required=True)
@@ -79,6 +107,8 @@ def main(argv=None):
     claim.add_argument('--batch-size', type=int, default=4, choices=range(1,17))
     claim.add_argument('--lease-seconds', type=float, default=3600)
     claim.add_argument('--takeover-incomplete', action='store_true', help='fresh full review after explicit reviewer handoff; accepted receipts are retained')
+
+    claim.add_argument('--delivery-files', action='store_true')
 
     dependency_claim = sub.add_parser('claim-dependencies', help='reserve an independent dependency completion chunk')
     dependency_claim.add_argument('--work-dir', required=True)
@@ -184,6 +214,39 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
     try:
+        if args.command == 'read-task':
+            from .task_delivery import (VERSION, materialize_delivery, review_brief,
+                review_directory, review_query, review_claim, query_delivery, delivery_index)
+            pointer = dict(version=VERSION, manifest_file=args.manifest, manifest_sha256=args.sha256)
+            if args.action == 'materialize':
+                result = materialize_delivery(pointer)
+            else:
+                if not args.item:
+                    raise ValueError('--item required for scoped reads')
+                path = json.loads(args.path)
+                if not isinstance(path, list) or any(type(k) not in (str, int) for k in path):
+                    raise ValueError('--path must be a JSON list of exact keys or indices')
+                if args.action == 'brief':
+                    result = review_brief(pointer, args.item)
+                elif args.action == 'index':
+                    try:
+                        result = review_directory(pointer, args.item, path)
+                    except ValueError:
+                        if path:
+                            raise
+                        result = delivery_index(pointer, args.item)
+                elif args.action == 'query':
+                    result = review_query(pointer, args.item, path)
+                elif args.action == 'claim':
+                    if not args.ref:
+                        raise ValueError('--ref required')
+                    result = review_claim(pointer, args.item, args.ref, global_state=args.global_state)
+                else:
+                    if not args.ref or not args.catalog:
+                        raise ValueError('--catalog and --ref required')
+                    result = query_delivery(pointer, args.item, args.catalog, args.ref)
+            _emit(result)
+            return 0
         if args.command == 'plan-data':
             from .analysis_mandate import plan_data
             _emit(plan_data(args.as_of, lookback_months=args.lookback_months,
@@ -263,9 +326,10 @@ def main(argv=None):
             return _result_exit(NativeReviewWorkflow(args.work_dir).claim_dependency_reviews(args.executor,
                 max_items=args.max_items, lease_seconds=args.lease_seconds))
         if args.command == 'claim-reviews':
-            return _result_exit(NativeReviewWorkflow(args.work_dir).claim_reviews(args.executor,
+            payload = NativeReviewWorkflow(args.work_dir).claim_reviews(args.executor,
                 max_items=args.max_items, batch_size=args.batch_size, lease_seconds=args.lease_seconds,
-                takeover_incomplete=args.takeover_incomplete))
+                takeover_incomplete=args.takeover_incomplete)
+            return _result_exit(_deliver(payload, args.work_dir, args.delivery_files))
         if args.command == 'submit-review-request':
             response = json_read(args.response)
             return _result_exit(NativeReviewWorkflow(args.work_dir).submit_review_request(
@@ -282,7 +346,7 @@ def main(argv=None):
                 for item in payload['items'].values():
                     item.pop('prompt', None)
                 payload['prompt_delivery'] = 'files; read each delivery.prompt_file before answering'
-            return _result_exit(payload)
+            return _result_exit(_deliver(payload, args.work_dir, args.delivery_files))
         if args.command == "submit":
             path = Path(args.responses)
             try:
@@ -299,6 +363,12 @@ def main(argv=None):
                 if not isinstance(response, (dict, list)):
                     raise ValueError(f"response for {item_id} must be a JSON object or array")
             workflow = NativeReviewWorkflow(args.work_dir)
+            if args.include_next:
+                from .workflow_exchange import submit_and_next
+                result = submit_and_next(workflow, args.packet_id, responses, args.executor, args.input_hash)
+                if 'next' in result:
+                    result['next'] = _deliver(result['next'], args.work_dir, args.delivery_files)
+                return _result_exit(result)
             return _result_exit(workflow.submit(args.packet_id, responses, args.executor, args.input_hash))
         if args.command == "patch":
             path = Path(args.patches)
@@ -350,7 +420,7 @@ def main(argv=None):
         if args.command == "retry-patch":
             return _result_exit(NativeReviewWorkflow(args.work_dir).retry_patch(args.reason))
         return _result_exit(NativeReviewWorkflow(args.work_dir).retry_role(args.role))
-    except (ValueError, OSError, KeyError, TypeError) as exc:
+    except (KeyError, IndexError, ValueError, OSError, KeyError, TypeError) as exc:
         return _fail(exc)
     except Exception as exc:  # surface unexpected failures as strict JSON too
         return _fail(exc)
