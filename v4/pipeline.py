@@ -464,7 +464,11 @@ class OrchestratorV4(Orchestrator):
 
     def start_run(self, subject, manifest):
         lineage = normalize_source_lineage(manifest.get("source_lineage", {}))
+        from .analysis_mandate import normalize_mandate
+        mandate = normalize_mandate(manifest["analysis_mandate"], manifest["as_of"]) if "analysis_mandate" in manifest else None
         rid = super().start_run(subject, manifest)
+        if mandate is not None:
+            self.runs[rid].manifest["analysis_mandate"] = mandate
         self.runs[rid].events = {}
         self.runs[rid].source_lineage = {}
         if lineage:
@@ -601,6 +605,8 @@ class OrchestratorV4(Orchestrator):
                       indicator_definitions=indicator_definitions(run.fact_store.to_dict()),
                       evidence=run.evidence_store.to_dict(), events=deepcopy(run.events),
                       claims=deepcopy(run.claims), trade=deepcopy(run.trade))
+        if 'analysis_mandate' in run.manifest:
+            packet['analysis_mandate'] = deepcopy(run.manifest['analysis_mandate'])
         packet['issuer_identity'] = self.require_issuer_identity(run_id)
         run.packets[role] = deepcopy(packet)
         return packet

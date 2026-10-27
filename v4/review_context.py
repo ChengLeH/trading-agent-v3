@@ -193,7 +193,7 @@ def scoped_review_state(state, target_ids):
                 refs.add(parent)
                 pending.append(parent)
     result = {key: deepcopy(state[key]) for key in
-              ('as_of', 'trade', 'financial_review_contract', 'source_declarations') if key in state}
+              ('as_of', 'trade', 'financial_review_contract', 'source_declarations', 'analysis_mandate') if key in state}
     result['claims'] = scoped_claims
     for key in ('facts', 'calcs', 'evidence', 'events', 'source_lineage'):
         result[key] = {ref: deepcopy(value) for ref, value in state.get(key, {}).items() if ref in refs}

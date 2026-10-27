@@ -356,7 +356,11 @@ def load_checkpoint(path, *, continue_verification=True):
     if type(package_gate) is not bool:
         raise ValueError("invalid package acceptance checkpoint marker")
     r.package_acceptance_blocked = package_gate
-    run = RunState(run_id=r.run_id, ticker=state["ticker"], manifest=state["manifest"])
+    manifest = dict(state["manifest"])
+    if "analysis_mandate" in manifest:
+        from .analysis_mandate import normalize_mandate
+        manifest["analysis_mandate"] = normalize_mandate(manifest["analysis_mandate"], manifest["as_of"])
+    run = RunState(run_id=r.run_id, ticker=state["ticker"], manifest=manifest)
     run.events = {}
     r.orch.runs[r.run_id] = run
     for value in state["facts"].values():

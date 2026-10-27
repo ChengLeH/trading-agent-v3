@@ -35,6 +35,12 @@ def main(argv=None):
                                      description="Experimental native checkpoint exchange; no model is started.")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    plan = sub.add_parser('plan-data', help='plan explicitly requested analysis and historical windows; does not fetch data')
+    plan.add_argument('--as-of', required=True)
+    plan.add_argument('--lookback-months', type=int)
+    plan.add_argument('--horizon-months', type=int)
+    plan.add_argument('--objective')
+
     init = sub.add_parser("init", help="import a checkpoint into a new work directory")
     origin = init.add_mutually_exclusive_group(required=True)
     origin.add_argument("--checkpoint", help="import an existing V4 checkpoint")
@@ -178,6 +184,11 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
     try:
+        if args.command == 'plan-data':
+            from .analysis_mandate import plan_data
+            _emit(plan_data(args.as_of, lookback_months=args.lookback_months,
+                            horizon_months=args.horizon_months, objective=args.objective))
+            return 0
         if args.command == "init":
             if any(v is not None and v < 1024 for v in
                    (args.review_batch_max_bytes, args.review_packet_max_bytes)):

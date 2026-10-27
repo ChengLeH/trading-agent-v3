@@ -164,6 +164,10 @@ def render_report(snapshot):
     claims = snapshot["claims"]
     citations, claim_citations = _citation_index(snapshot)
     lines = [f"# {snapshot['ticker']} 投資分析（{snapshot.get('as_of', '')}）", ""]
+    mandate = snapshot.get('manifest', {}).get('analysis_mandate')
+    if mandate is not None:
+        lines.extend(['## 分析期限與歷史資料範圍', '', '```json',
+                      json.dumps(mandate, ensure_ascii=False, indent=2), '```', ''])
     sections = {}
     by_role = {}
     for c in claims:
@@ -246,6 +250,8 @@ def render_report(snapshot):
                    indicator_definitions=methods, issuer_identity=snapshot.get('issuer_identity', []), ingestion_diagnostics=snapshot.get('ingestion_diagnostics', []),
                    verification=dict(status='unverified', delivery_ready=False, global_review_complete=False),
                    report_hash=digest(report), total_claims=len(claims))
+    if mandate is not None:
+        sidecar['analysis_mandate'] = deepcopy(mandate)
     index = diagnostics_index(snapshot.get('ingestion_diagnostics', []))
     sidecar.update(diagnostics_sha256=index['sha256'], diagnostics_mode='summary+relevant',
                    diagnostics_index=index, review_context_format=REVIEW_CONTEXT_FORMAT)

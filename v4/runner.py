@@ -50,6 +50,7 @@ semantic_fact 描述可驗證命題、interpretation 描述推論、forecast 描
 引用區間高低點、事件及日期時，區分統計截止日與極值發生日；只知道高低價格、觀察期間或
 source_pointer 的窗口計算，不代表知道極值實際日期。來源未明載就省略特定發生日，
 不得猜日期或把推定日期塞進 bindings.period；binding 的 period 應對應所引來源真正標示的期間。
+analysis_mandate 的 analysis_end 是未來分析期限，history_start 是歷史資料起點，兩者不可混為一談；未指定不得假定使用者給了期限。
 資料限制只能說目前提供內容中可確認的缺口，不能推成公司未揭露或數值為零。
 不得憑自己覺得內容不全就宣稱資料遭截斷或傳輸失敗；沒有實際紀錄時只能說無法確認。
 每一項論述都必須回傳 Claim object。refs 列來源及論述 ID；fact_refs 是 refs 中的 FACT ID；
@@ -213,6 +214,7 @@ class PipelineRunnerV4:
         declarations = source_declarations(self.run)
         lineage = getattr(self.run, "source_lineage", {})
         return {**{k: s.get(k) for k in ("claims", "facts", "calcs", "evidence", "events", "trade", "as_of")},
+                **({'analysis_mandate': deepcopy(s['manifest']['analysis_mandate'])} if 'analysis_mandate' in s.get('manifest', {}) else {}),
                 **({'source_declarations': declarations} if declarations else {}),
                 **({'source_lineage': deepcopy(lineage)} if lineage else {}),
                 "financial_review_contract": FINANCIAL_REVIEW_VERSION,
