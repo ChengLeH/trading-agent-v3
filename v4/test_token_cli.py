@@ -54,6 +54,36 @@ class TokenCliTests(unittest.TestCase):
                 result = workflow.submit_review_request(reserved['packet_id'], request['request_id'], {'results': answers}, 'host/batch', reserved['input_hash'])
                 self.assertFalse(result.get('review_errors'), result)
 
+    def test_shared_delivery_takes_precedence_over_old_role_file_flag(self):
+        from .task_delivery import review_brief
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            (root / 'news.json').write_text(json.dumps({'items': [{'title': 'Fixture', 'url': 'https://example.test', 'published': '2026-10-15'}]}))
+            manifest = root / 'manifest.json'
+            manifest.write_text(json.dumps({'subject': {'ticker': 'TEST'}, 'as_of': '2026-10-16', 'sources': [{'id': 'news', 'type': 'news_json', 'path': 'news.json'}]}))
+            workflow = NativeReviewWorkflow.from_manifest(manifest, root / 'native')
+            rc, delivered = invoke(['next', '--work-dir', str(workflow.directory), '--delivery-files', '--prompt-files'])
+            self.assertEqual(rc, 0, delivered)
+            brief = review_brief(delivered['delivery'], 'market_analyst')
+            self.assertIn('instructions', brief)
+            self.assertIn('facts', brief['payload_keys'])
+
+    def test_cost_audit_is_readonly_and_canonical_summary_uses_receipts(self):
+        with tempfile.TemporaryDirectory() as root:
+            workflow = self.setup_work(root)
+            packet = workflow.next()
+            workflow.submit(packet['packet_id'], {cid: response(cid, item) for cid, item in packet['items'].items()}, 'host/test', packet['input_hash'])
+            before = workflow.queue.state_path.read_bytes()
+            rc, metrics = invoke(['audit-cost', '--work-dir', str(workflow.directory)])
+            self.assertEqual(rc, 0, metrics)
+            self.assertEqual(before, workflow.queue.state_path.read_bytes())
+            self.assertIsNone(metrics['usage_tokens']['input_tokens'])
+            rc, summary = invoke(['completion-summary', '--work-dir', str(workflow.directory)])
+            self.assertEqual(rc, 0, summary)
+            self.assertEqual(summary['completed_count'], len(packet['items']))
+            self.assertEqual(summary['receipt_status'], 'accepted')
+            self.assertNotIn('findings', summary)
+
     def test_submit_then_next_returns_saved_receipt(self):
         with tempfile.TemporaryDirectory() as root:
             workflow = self.setup_work(root)

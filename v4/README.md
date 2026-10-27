@@ -612,3 +612,8 @@ Fact entity 缺失時，僅可根據相符且唯一的 SourceRecord.subject_tick
 
 `semantic_acceptance_cases.json` 新增成對通用案例，供真實模型驗收；
 單元測試只證明資料傳遞、契約與路由，不能證明模型已能穩定識別每種語義錯誤。
+
+
+### Token 與交付成本優化
+
+本機主 Agent 可採用 `next --delivery-files`、`claim-reviews --delivery-files` 與精確來源查詢，讓共享規則及目錄只保存一份；既有 AGY 自足輸入維持完整。`completion-summary` 提供短報、`audit-cost` 分列 prepared prompt bytes、wire request bytes 與實體儲存；未記錄的模型 token 用量維持 unknown。操作、恢復與 catalog_scope 的限制見 [TOKEN_OPTIMIZATION.md](TOKEN_OPTIMIZATION.md)。

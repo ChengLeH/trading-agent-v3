@@ -14,6 +14,19 @@ def submit_and_next(workflow, packet_id, responses, executor, input_hash):
             outcome = deepcopy(saved['outcome'])
         else:
             outcome = None
+            packet = state.get('packets', {}).get(packet_id, {})
+            received = packet.get('received', {})
+            if packet.get('input_hash') == input_hash and isinstance(responses, dict) and responses:
+                exact = all(item in packet.get('items', {}) and
+                            received.get(item, {}).get('executor') == executor and
+                            received.get(item, {}).get('response') == answer
+                            for item, answer in responses.items())
+                if exact:
+                    # A crash may occur after raw receipt publication, before
+                    # our convenience outcome. Recover receipt, never a verdict;
+                    # next still runs ordinary archive/epoch/semantic checks.
+                    outcome = dict(status='submission_recovered', recovered_from_received=True,
+                                   verification_status='requires_current_workflow_validation')
     if outcome is None:
         # Commit before attempting delivery. A lost reply must not lose proof.
         outcome = workflow.submit(packet_id, responses, executor, input_hash)
@@ -27,6 +40,7 @@ def submit_and_next(workflow, packet_id, responses, executor, input_hash):
         return result
     try:
         result['next'] = workflow.next()
+        result['blocked'] = bool(result['next'].get('blocked'))
     except (ValueError, OSError, RuntimeError) as exc:
         result.update(blocked=True, next_error=dict(type=type(exc).__name__, reason=str(exc)),
                       next_action='retry_next_without_resubmitting')

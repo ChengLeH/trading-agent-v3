@@ -25,6 +25,37 @@ class WorkflowExchangeTests(unittest.TestCase):
             with workflow.queue.transaction() as state:
                 self.assertTrue(set(answers) <= set(workflow._load(state).receipts))
 
+    def test_recover_when_process_stopped_after_submission_before_exchange_receipt(self):
+        from .workflow_exchange import submit_and_next
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / 'source.json'
+            save_checkpoint(seeded(), source)
+            workflow = NativeReviewWorkflow.from_checkpoint(source, Path(root) / 'native')
+            packet = workflow.next()
+            answers = {cid: response(cid, item) for cid, item in packet['items'].items()}
+            workflow.submit(packet['packet_id'], answers, 'host/test', packet['input_hash'])
+            recovered = submit_and_next(workflow, packet['packet_id'], answers, 'host/test', packet['input_hash'])
+            self.assertTrue(recovered['submission_saved'])
+            self.assertTrue(recovered['submission']['recovered_from_received'])
+            self.assertNotEqual(recovered['next']['packet_id'], packet['packet_id'])
+
+    def test_raw_received_invalid_verdict_is_revalidated_after_interruption(self):
+        from .workflow_exchange import submit_and_next
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / 'source.json'
+            save_checkpoint(seeded(), source)
+            workflow = NativeReviewWorkflow.from_checkpoint(source, Path(root) / 'native')
+            packet = workflow.next()
+            cid = next(iter(packet['items']))
+            answers = {cid: dict(claim_id=cid, verdict='INVALID', findings=[])}
+            workflow.queue.submit(packet['packet_id'], answers, 'host/test', packet['input_hash'])
+            result = submit_and_next(workflow, packet['packet_id'], answers, 'host/test', packet['input_hash'])
+            self.assertTrue(result['submission_saved'])
+            self.assertTrue(result['submission']['recovered_from_received'])
+            self.assertNotEqual(result['next'].get('status'), 'complete')
+            with workflow.queue.transaction() as state:
+                self.assertNotIn(cid, workflow._load(state).receipts)
+
     def test_next_failure_does_not_undo_saved_submission(self):
         from .workflow_exchange import submit_and_next
         with tempfile.TemporaryDirectory() as root:

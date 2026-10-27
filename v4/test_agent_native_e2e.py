@@ -11,6 +11,12 @@ from .test_integration import claim, comparable_wait
 
 class NativeManifestLifecycle(unittest.TestCase):
     def test_fresh_manifest_role_reviews_global_and_report_survive_restarts(self):
+        self._run_fresh_lifecycle()
+
+    def test_shared_delivery_full_lifecycle_survives_restarts(self):
+        self._run_fresh_lifecycle(shared_delivery=True)
+
+    def _run_fresh_lifecycle(self, shared_delivery=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "news.json").write_text(json.dumps(dict(items=[
@@ -25,7 +31,13 @@ class NativeManifestLifecycle(unittest.TestCase):
             workflow.record_secondary_event({}, code='secondary_unavailable', requested_identity='antigravity/test')
             kinds = []
             for _ in range(32):
-                packet = workflow.next()
+                if shared_delivery:
+                    from .test_token_cli import invoke
+                    from .task_delivery import materialize_delivery
+                    _rc, delivered = invoke(['next', '--work-dir', str(workflow.directory), '--delivery-files'])
+                    packet = materialize_delivery(delivered['delivery']) if 'delivery' in delivered else delivered
+                else:
+                    packet = workflow.next()
                 kind = packet.get("kind")
                 if packet.get("status") == "complete":
                     self.assertTrue(packet["report_markdown"])

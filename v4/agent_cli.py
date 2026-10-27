@@ -54,6 +54,13 @@ def main(argv=None):
     plan.add_argument('--horizon-months', type=int)
     plan.add_argument('--objective')
 
+    costs = sub.add_parser('audit-cost', help='read-only accounting; never estimates tokens from bytes')
+    costs.add_argument('--work-dir', required=True)
+    summary = sub.add_parser('completion-summary', help='short result receipt without findings or prompts')
+    summary_source = summary.add_mutually_exclusive_group(required=True)
+    summary_source.add_argument('--result', help='JSON result artifact; counts are unverified')
+    summary_source.add_argument('--work-dir', help='rebuild canonical receipts from verified archives')
+
     read = sub.add_parser('read-task', help='read exact shared task content; never starts a model')
     read.add_argument('--manifest', required=True)
     read.add_argument('--sha256', required=True)
@@ -214,6 +221,26 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
     try:
+        if args.command == 'audit-cost':
+            from .token_metrics import audit_native_work
+            _emit(audit_native_work(args.work_dir))
+            return 0
+        if args.command == 'completion-summary':
+            from .completion_summary import summarize_completion
+            if args.result:
+                result = summarize_completion(args.result)
+            else:
+                workflow = NativeReviewWorkflow(args.work_dir)
+                with workflow.queue.transaction() as state:
+                    runner = workflow._load(state)
+                    runner._tasks()  # retire stale per-Claim receipts
+                    result = summarize_completion(
+                        dict(run_id=runner.run_id, status=runner.status),
+                        accepted_receipts=dict(atomic=runner.receipts, deep=runner.deep_receipts,
+                                               global_review=runner.global_receipt))
+                    result['receipt_scope'] = 'current_run; counts reviews, not unique Claims'
+            _emit(result)
+            return 0
         if args.command == 'read-task':
             from .task_delivery import (VERSION, materialize_delivery, review_brief,
                 review_directory, review_query, review_claim, query_delivery, delivery_index)
@@ -342,7 +369,7 @@ def main(argv=None):
             return _result_exit(dict(status=args.command, **result))
         if args.command == "next":
             payload = NativeReviewWorkflow(args.work_dir).next()
-            if args.prompt_files and payload.get('kind') == 'roles':
+            if args.prompt_files and not args.delivery_files and payload.get('kind') == 'roles':
                 for item in payload['items'].values():
                     item.pop('prompt', None)
                 payload['prompt_delivery'] = 'files; read each delivery.prompt_file before answering'
@@ -420,7 +447,7 @@ def main(argv=None):
         if args.command == "retry-patch":
             return _result_exit(NativeReviewWorkflow(args.work_dir).retry_patch(args.reason))
         return _result_exit(NativeReviewWorkflow(args.work_dir).retry_role(args.role))
-    except (KeyError, IndexError, ValueError, OSError, KeyError, TypeError) as exc:
+    except (KeyError, IndexError, ValueError, OSError, TypeError) as exc:
         return _fail(exc)
     except Exception as exc:  # surface unexpected failures as strict JSON too
         return _fail(exc)
