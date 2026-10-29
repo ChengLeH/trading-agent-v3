@@ -32,6 +32,12 @@ def _source(source_id, source_hash, declarations=None):
 
 
 class CatalogInvalidation(unittest.TestCase):
+    def test_role_contract_requests_scope_without_forcing_legacy_migration(self):
+        from .runner import ROLE_CONTRACT
+        self.assertIn('每條 Claim 請依實際論述在 assertion.catalog_scope 宣告來源範圍', ROLE_CONTRACT)
+        self.assertIn('範圍宣告仍須語義驗證', ROLE_CONTRACT)
+        self.assertIn('省略仍按保守完整目錄處理', ROLE_CONTRACT)
+
     def test_referenced_scope_ignores_unreferenced_fact_and_source_declaration(self):
         run = make_run([_claim(scope="referenced_sources", refs=["fact.dram_supply.2029"])])
         run.records = [_source("fixture", "used-v1", {"origin": "used"})]

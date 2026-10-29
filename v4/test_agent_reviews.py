@@ -541,6 +541,15 @@ print(json.dumps(dict(result=result, serialized_definitions=json.dumps(definitio
             workflow = NativeReviewWorkflow(workflow.directory)
             packet = workflow.next()
             self.assertEqual(next(iter(packet['items'])), 'global_dependency_completion')
+            contract = packet['completion_contract']
+            self.assertFalse(contract['parallel'])
+            self.assertTrue(contract['target_claim_ids'])
+            self.assertTrue(set(contract['target_claim_ids']) <= set(contract['missing_claim_ids']))
+            self.assertIn('dependency_reviews', contract['response_format']['required'])
+            self.assertEqual(NativeReviewWorkflow(workflow.directory).next()['completion_contract'], contract)
+            from .agent_cli import _deliver
+            compact = _deliver(packet, workflow.directory, True)
+            self.assertEqual(compact['completion_contract'], contract)
             wrong = workflow.submit(packet['packet_id'],
                                     {next(iter(packet['items'])): self._global_response(workflow)},
                                     'host/other', packet['input_hash'])

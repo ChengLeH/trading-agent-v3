@@ -28,7 +28,7 @@ class EmptyRevision(unittest.TestCase):
         clients = dict(author=CloudDouble("test/author", lambda _: self.fail("supplied patches must not invoke author")),
                        verifier=verifier or CloudDouble("test/verifier"), deep=CloudDouble("test/deep"),
                        global_reviewer=CloudDouble("test/global", lambda _: global_verdict(restored[-1], global_findings)))
-        args = ["--resume", str(checkpoint), "--apply-patches", str(patch_file), "--out", str(out),
+        args = ["--resume", str(checkpoint), "--apply-patches", str(patch_file), "--allow-ephemeral-out", "--out", str(out),
                 "--author-model", "author", "--verifier-model", "verifier", "--deep-model", "deep",
                 "--global-model", "global_reviewer"]
         if patch_dependents:
@@ -354,7 +354,7 @@ class EmptyRevision(unittest.TestCase):
 
     def test_cli_apply_patches_requires_resume(self):
         from .__main__ import main
-        args = ["--manifest", "unused.json", "--apply-patches", "unused-patches.json", "--out", "unused",
+        args = ["--manifest", "unused.json", "--apply-patches", "unused-patches.json", "--allow-ephemeral-out", "--out", "unused",
                 "--author-model", "author", "--verifier-model", "verifier", "--deep-model", "deep",
                 "--global-model", "global"]
         with patch("v4.__main__.AntigravityCloudClient") as clients, \

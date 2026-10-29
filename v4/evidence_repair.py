@@ -52,7 +52,7 @@ def record_evidence_search(workflow, request_id, outcome, *, query='', details='
                     resolution_status='unresolved', input_hash=runner._hash())
 
 
-def append_sources(workflow, manifest_path, *, reason, request_id=None):
+def append_sources(workflow, manifest_path, *, reason, request_id=None, request_bindings=None):
     """Validate new sources separately, then append in one canonical transaction.
 
     Existing IDs/values are never overwritten. The operator supplies a manifest
@@ -63,6 +63,10 @@ def append_sources(workflow, manifest_path, *, reason, request_id=None):
     from .pipeline import OrchestratorV4, source_catalog
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError('operator reason required')
+    if request_id is not None and request_bindings is not None:
+        raise ValueError('choose one request_id or explicit request_bindings')
+    if request_bindings is not None and (not isinstance(request_bindings, dict) or not request_bindings):
+        raise ValueError('request_bindings must be a nonempty object')
     path = Path(manifest_path).resolve()
     manifest = json.loads(path.read_text(encoding='utf-8'))
     if not isinstance(manifest, dict) or not isinstance(manifest.get('sources'), list) or not manifest['sources']:
@@ -82,6 +86,15 @@ def append_sources(workflow, manifest_path, *, reason, request_id=None):
         new_ids = [source.get('id') for source in manifest['sources']]
         if len(new_ids) != len(set(new_ids)) or old_ids.intersection(new_ids):
             raise ValueError('new evidence requires distinct new source IDs')
+        if request_bindings is not None:
+            from .schema import id_list
+            normalized_bindings = {}
+            for bound_request, source_ids in request_bindings.items():
+                target = _evidence_request(runner, bound_request)
+                ids = id_list(source_ids, 'source IDs')
+                if target.get('resolution_status') != 'unresolved' or not ids or set(ids) - set(new_ids):
+                    raise ValueError('request bindings require unresolved requests and source IDs in this manifest')
+                normalized_bindings[bound_request] = ids
         manifest.setdefault('issuer_registry_path', run.manifest.get('issuer_registry_path'))
         if manifest.get('issuer_registry_path') is None:
             manifest.pop('issuer_registry_path', None)
@@ -96,6 +109,12 @@ def append_sources(workflow, manifest_path, *, reason, request_id=None):
         additions = source_catalog(added_run)
         if not additions:
             raise ValueError('new evidence yielded no canonical sources')
+        if request_bindings is not None:
+            request_refs = {request: sorted(ref for ref, row in additions.items()
+                            if isinstance(row, dict) and row.get('source_id') in source_ids)
+                            for request, source_ids in normalized_bindings.items()}
+            if any(not refs for refs in request_refs.values()):
+                raise ValueError('each bound request requires a directly attributable canonical source')
         collisions = set(source_catalog(run)).intersection(additions)
         if collisions:
             raise ValueError(f'canonical source IDs already exist; do not overwrite: {sorted(collisions)}')
@@ -119,13 +138,24 @@ def append_sources(workflow, manifest_path, *, reason, request_id=None):
         if request is not None:
             for source_id in new_ids:
                 runner.record_evidence_source(request['request_id'], source_id)
+        if request_bindings is not None:
+            for bound_request, source_ids in normalized_bindings.items():
+                for source_id in source_ids:
+                    runner.record_evidence_source(bound_request, source_id)
         event = dict(source_ids=new_ids, canonical_refs=sorted(additions), reason=reason.strip(),
                      before_hash=before_hash, after_hash=runner._hash())
         if request is not None:
             event['request_id'] = request['request_id']
         state.setdefault('evidence_additions', []).append(event)
+        if request_bindings is not None:
+            for bound_request, source_ids in normalized_bindings.items():
+                state['evidence_additions'].append(dict(
+                    source_ids=source_ids, canonical_refs=request_refs[bound_request],
+                    reason=reason.strip(), before_hash=before_hash, after_hash=runner._hash(),
+                    request_id=bound_request))
         workflow._save(state, runner)
         return dict(status='evidence_added', **event,
+                    **({'request_bindings': deepcopy(request_bindings)} if request_bindings is not None else {}),
                     next_action='complete_outstanding_reviews_then_repair_evidence_claims',
                     findings_resolved=False)
 
@@ -149,7 +179,7 @@ def _reopen_evidence_reviews(workflow, state, runner, retirement_reason, *, pres
         if not packet.get('retired'):
             packet.update(retired=True, retirement_reason=retirement_reason)
     state['active_packet_id'] = None
-    keys = ('patch_prompt', 'accepted_links', 'link_blocked', 'patch_blocked', 'review_blocked', 'global_blocked')
+    keys = ('patch_prompt', 'catalog_scope_migration', 'accepted_links', 'link_blocked', 'patch_blocked', 'review_blocked', 'global_blocked')
     if not preserve_role_state:
         keys += ('role_candidates', 'role_errors', 'group_error')
     for key in keys:
@@ -291,3 +321,68 @@ def prepare_evidence_patch(workflow, claim_ids, *, reason, request_id=None, sour
             state['active_packet_id'] = None
         workflow._save(state, runner)
         return {"status": runner.status, **outcome}
+
+
+def prepare_evidence_patch_batch(workflow, repairs, *, reason):
+    """Prepare explicit evidence requests as one state-bound patch transaction.
+
+    Every entry selects an existing evidence request and exact canonical
+    sources. Selection is not a semantic finding or a resolution; the patcher
+    and ordinary Claim and descendant reviews still decide those questions.
+    """
+    from .pipeline import source_catalog
+    from .schema import id_list
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError('operator reason required')
+    if not isinstance(repairs, list) or not repairs:
+        raise ValueError('repairs must be a nonempty array')
+    with workflow.queue.transaction() as state:
+        runner = workflow._load(state)
+        if runner.pending_patch is not None:
+            raise ValueError('finish the current pending patch first')
+        catalog = source_catalog(runner.run)
+        findings, seen = [], set()
+        for item in repairs:
+            if not isinstance(item, dict) or set(item) != {'request_id', 'source_refs'}:
+                raise ValueError('each repair requires exactly request_id and source_refs')
+            request_id = item['request_id']
+            if not isinstance(request_id, str) or not request_id or request_id in seen:
+                raise ValueError('request IDs must be nonempty and unique')
+            seen.add(request_id)
+            request = _evidence_request(runner, request_id)
+            if request.get('resolution_status') != 'unresolved':
+                raise ValueError('evidence request is already resolved')
+            refs = id_list(item['source_refs'], 'existing source refs')
+            if not refs or set(refs) - catalog.keys():
+                raise ValueError('each repair requires existing canonical source refs')
+            for cid in request['claim_ids']:
+                findings.append(dict(claim_id=cid, category='evidence_recovery',
+                    resolution_route='claim_patch',
+                    issue='主 Agent 要求核對所選證據對此主張的影響；來源存在不代表支持主張',
+                    evidence=dict(request_id=request_id, source_refs=list(refs),
+                                  sources={ref: deepcopy(catalog[ref]) for ref in refs},
+                                  repair_mode='existing_evidence'), suggested_fix=reason.strip()))
+        tasks = runner._tasks()
+        missing_atomic = [cid for cid, task in tasks.items() if cid not in runner.receipts
+                          or runner.receipts[cid]['input_hash'] != digest(task.to_dict())]
+        if missing_atomic:
+            workflow._save(state, runner)
+            return dict(status='reviews_pending', blocked=False, layer='atomic',
+                        pending_claim_ids=missing_atomic, next_action='next')
+        missing_deep = [cid for cid, task in tasks.items()
+                        if runner.receipts[cid]['result']['verdict'] != 'PASS'
+                        and (cid not in runner.deep_receipts
+                             or runner.deep_receipts[cid]['input_hash'] != digest(task.to_dict()))]
+        if missing_deep:
+            workflow._save(state, runner)
+            return dict(status='reviews_pending', blocked=False, layer='deep',
+                        pending_claim_ids=missing_deep, next_action='next')
+        outcome = runner.prepare_phase6_revision_v4(findings)
+        if 'revision_prompts' in outcome:
+            runner.pending_global = runner.global_review_progress = None
+            active = state.get('packets', {}).get(state.get('active_packet_id'))
+            if active and not active.get('retired'):
+                active.update(retired=True, retirement_reason='explicit_evidence_claim_repair')
+            state['active_packet_id'] = None
+        workflow._save(state, runner)
+        return {'status': runner.status, **outcome}

@@ -9,6 +9,7 @@ native queue for one current host agent at a time.
 import argparse
 import json
 from pathlib import Path
+from .storage import is_ephemeral_directory
 
 
 def _emit(payload):
@@ -32,7 +33,8 @@ def _deliver(payload, directory, enabled):
         return payload
     from .task_delivery import create_delivery, task_brief
     keys = ('status', 'kind', 'blocked', 'packet_id', 'input_hash', 'lease',
-            'needs_retry', 'delivery_ready', 'verification_status', 'warnings')
+            'needs_retry', 'delivery_ready', 'verification_status', 'warnings',
+            'completion_contract', 'target_claim_ids')
     result = {key: payload[key] for key in keys if key in payload}
     result['delivery'] = create_delivery(directory, payload)
     result['tasks'] = task_brief(result['delivery'])
@@ -56,6 +58,10 @@ def main(argv=None):
 
     costs = sub.add_parser('audit-cost', help='read-only accounting; never estimates tokens from bytes')
     costs.add_argument('--work-dir', required=True)
+    dispatch_status = sub.add_parser('dispatch-status', help='inspect local secondary call observations')
+    dispatch_status.add_argument('--work-dir', required=True)
+    dispatch_status.add_argument('--attention-after-seconds', type=float,
+        help='flag long-running calls for inspection; never assumes they are dead')
     summary = sub.add_parser('completion-summary', help='short result receipt without findings or prompts')
     summary_source = summary.add_mutually_exclusive_group(required=True)
     summary_source.add_argument('--result', help='JSON result artifact; counts are unverified')
@@ -77,6 +83,8 @@ def main(argv=None):
     origin.add_argument("--manifest", help="ingest a fresh V4 manifest without AGY")
     init.add_argument("--ticker", help="optional expected ticker; must match manifest")
     init.add_argument("--work-dir", required=True)
+    init.add_argument('--allow-ephemeral-work-dir', action='store_true',
+                      help='explicitly allow disposable test runs in OS temporary storage')
     init.add_argument('--role-prompt-budget-bytes', type=int, default=None,
                       help='advisory UTF-8 budget per role; never truncates source evidence')
     init.add_argument('--review-batch-max-bytes', type=int, default=None)
@@ -168,6 +176,26 @@ def main(argv=None):
     secondary.add_argument('--batch-size', type=int, default=4, choices=range(1,17))
     secondary.add_argument('--single-packet', action='store_true', help='stop at the initial packet boundary')
     secondary.add_argument('--lease-seconds', type=float, default=3600)
+    secondary.add_argument('--startup-lease-seconds', type=float, default=60,
+        help='reservation before worker start, not the model timeout')
+    secondary.add_argument('--progress-interval-seconds', type=float, default=60,
+        help='write local dispatcher heartbeat at this interval')
+    secondary.add_argument('--attention-after-seconds', type=float, default=300,
+        help='warn on a stale dispatcher heartbeat, without stopping the worker')
+    secondary.add_argument('--allow-ephemeral-work-dir', action='store_true')
+    secondary.add_argument('--direct', action='store_true', help=argparse.SUPPRESS)
+
+    supervise = sub.add_parser('supervise-secondary', help='launch and monitor one secondary dispatch process')
+    supervise.add_argument('--work-dir', required=True)
+    supervise.add_argument('--agy-model', required=True)
+    supervise.add_argument('--max-workers', type=int, default=4, choices=range(1, 9))
+    supervise.add_argument('--max-items', type=int, default=16)
+    supervise.add_argument('--batch-size', type=int, default=4, choices=range(1, 17))
+    supervise.add_argument('--lease-seconds', type=float, default=3600)
+    supervise.add_argument('--startup-lease-seconds', type=float, default=60)
+    supervise.add_argument('--poll-seconds', type=float, default=30)
+    supervise.add_argument('--attention-after-seconds', type=float, default=300)
+    supervise.add_argument('--allow-ephemeral-work-dir', action='store_true')
 
     retry_link = sub.add_parser("retry-link", help="retry a rejected finding linker mapping")
     retry_link.add_argument("--work-dir", required=True)
@@ -189,7 +217,9 @@ def main(argv=None):
     evidence = sub.add_parser("add-evidence", help="append new canonical sources without overwriting existing IDs")
     evidence.add_argument("--work-dir", required=True)
     evidence.add_argument("--manifest", required=True)
-    evidence.add_argument("--request-id", help="link the imported sources to one exact evidence request")
+    evidence_links = evidence.add_mutually_exclusive_group()
+    evidence_links.add_argument("--request-id", help="link the imported sources to one exact evidence request")
+    evidence_links.add_argument('--request-bindings', help='JSON object mapping request IDs to new source IDs')
     evidence.add_argument("--reason", required=True)
 
     search_result = sub.add_parser("record-evidence-search", help="record a search attempt without resolving its finding")
@@ -219,8 +249,29 @@ def main(argv=None):
         help="exact existing canonical source ID; repeat as needed; requires --request-id")
     evidence_patch.add_argument("--reason", required=True)
 
+    evidence_batch = sub.add_parser('repair-evidence-batch', help='prepare explicit evidence requests as one patch')
+    evidence_batch.add_argument('--work-dir', required=True)
+    evidence_batch.add_argument('--repairs', required=True, help='JSON array of request_id and canonical source_refs')
+    evidence_batch.add_argument('--reason', required=True)
+
+    migrate_scope = sub.add_parser('prepare-catalog-scopes', help='review legacy Claim source scopes in one patch')
+    migrate_scope.add_argument('--work-dir', required=True)
+    migrate_scope.add_argument('--claim-id', action='append', required=True)
+    migrate_scope.add_argument('--reason', required=True)
+
     args = parser.parse_args(argv)
     try:
+        if args.command == 'dispatch-status':
+            from .agent_dispatch import dispatch_status
+            return _result_exit(dispatch_status(Path(args.work_dir),
+                                                attention_after_seconds=args.attention_after_seconds))
+        if args.command == 'supervise-secondary':
+            from .dispatch_supervisor import supervise_secondary
+            return _result_exit(supervise_secondary(args.work_dir, args.agy_model,
+                max_workers=args.max_workers, max_items=args.max_items, batch_size=args.batch_size,
+                lease_seconds=args.lease_seconds, startup_lease_seconds=args.startup_lease_seconds,
+                poll_seconds=args.poll_seconds, attention_after_seconds=args.attention_after_seconds,
+                allow_ephemeral=args.allow_ephemeral_work_dir))
         if args.command == 'audit-cost':
             from .token_metrics import audit_native_work
             _emit(audit_native_work(args.work_dir))
@@ -280,6 +331,9 @@ def main(argv=None):
                             horizon_months=args.horizon_months, objective=args.objective))
             return 0
         if args.command == "init":
+            if is_ephemeral_directory(args.work_dir) and not args.allow_ephemeral_work_dir:
+                raise ValueError('work directory is in temporary storage; choose a persistent work directory '
+                                 'or explicitly allow an ephemeral test run')
             if any(v is not None and v < 1024 for v in
                    (args.review_batch_max_bytes, args.review_packet_max_bytes)):
                 raise ValueError('review byte budgets must be >=1024')
@@ -337,7 +391,8 @@ def main(argv=None):
         if args.command == "add-evidence":
             from .evidence_repair import append_sources
             return _result_exit(append_sources(NativeReviewWorkflow(args.work_dir), args.manifest,
-                reason=args.reason, request_id=args.request_id))
+                reason=args.reason, request_id=args.request_id,
+                request_bindings=json_read(args.request_bindings) if args.request_bindings else None))
         if args.command == "record-evidence-search":
             from .evidence_repair import record_evidence_search
             return _result_exit(record_evidence_search(NativeReviewWorkflow(args.work_dir), args.request_id,
@@ -349,6 +404,14 @@ def main(argv=None):
             from .evidence_repair import prepare_evidence_patch
             return _result_exit(prepare_evidence_patch(NativeReviewWorkflow(args.work_dir), args.claim_id,
                 reason=args.reason, request_id=args.request_id, source_refs=args.source_ref))
+        if args.command == 'repair-evidence-batch':
+            from .evidence_repair import prepare_evidence_patch_batch
+            return _result_exit(prepare_evidence_patch_batch(NativeReviewWorkflow(args.work_dir),
+                json_read(args.repairs), reason=args.reason))
+        if args.command == 'prepare-catalog-scopes':
+            from .catalog_scope_migration import prepare_catalog_scope_migration
+            return _result_exit(prepare_catalog_scope_migration(NativeReviewWorkflow(args.work_dir),
+                args.claim_id, reason=args.reason))
         if args.command == 'claim-dependencies':
             return _result_exit(NativeReviewWorkflow(args.work_dir).claim_dependency_reviews(args.executor,
                 max_items=args.max_items, lease_seconds=args.lease_seconds))
@@ -412,6 +475,13 @@ def main(argv=None):
         if args.command == "retry-link":
             return _result_exit(NativeReviewWorkflow(args.work_dir).retry_link(args.reason))
         if args.command == "dispatch-secondary":
+            if not args.direct:
+                from .dispatch_supervisor import supervise_secondary
+                return _result_exit(supervise_secondary(args.work_dir, args.agy_model,
+                    max_workers=args.max_workers, max_items=args.max_items, batch_size=args.batch_size,
+                    lease_seconds=args.lease_seconds, startup_lease_seconds=args.startup_lease_seconds,
+                    poll_seconds=args.progress_interval_seconds, attention_after_seconds=args.attention_after_seconds,
+                    allow_ephemeral=args.allow_ephemeral_work_dir, single_packet=args.single_packet))
             # Never construct a secondary client when the next task belongs
             # to the host or when no runnable review work exists.
             from .agent_dispatch import dispatch_secondary_reviews
@@ -424,8 +494,11 @@ def main(argv=None):
                 return _result_exit(dict(status="host_owned", packet=pending,
                                          reason="current work belongs to the host Agent"))
             try:
+                import os
                 from .cloud import AntigravityCloudClient
-                client = AntigravityCloudClient(args.agy_model)
+                client = AntigravityCloudClient(args.agy_model,
+                    session_root=workflow.directory / 'secondary-sessions')
+                client.legacy_session_root = Path(os.environ.get('V4_SESSION_DIR', Path.cwd() / '.v4-sessions'))
             except (RuntimeError, ValueError) as exc:
                 with workflow.queue.transaction() as state:
                     identity = 'antigravity/' + args.agy_model
@@ -441,7 +514,9 @@ def main(argv=None):
             return _result_exit(dispatch_secondary_reviews(
                 workflow, client, max_workers=args.max_workers,
                 max_items=args.max_items, batch_size=args.batch_size,
-                continuous=not args.single_packet, lease_seconds=args.lease_seconds))
+                continuous=not args.single_packet, lease_seconds=args.lease_seconds,
+                startup_lease_seconds=args.startup_lease_seconds,
+                progress_interval_seconds=args.progress_interval_seconds))
         if args.command == "retry-global":
             return _result_exit(NativeReviewWorkflow(args.work_dir).retry_global(args.reason))
         if args.command == "retry-patch":

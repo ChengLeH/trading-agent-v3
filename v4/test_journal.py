@@ -179,7 +179,7 @@ from unittest.mock import patch
 from v4.__main__ import main
 from v4.test_integration import CloudDouble
 with patch("v4.__main__.AntigravityCloudClient", side_effect=lambda model, **kwargs: CloudDouble(model, lambda _: os._exit(19))):
-    main(["--resume", sys.argv[1], "--out", sys.argv[2], "--author-model", "author", "--verifier-model", "first", "--deep-model", "deep", "--global-model", "global"])
+    main(["--resume", sys.argv[1], "--allow-ephemeral-out", "--out", sys.argv[2], "--author-model", "author", "--verifier-model", "first", "--deep-model", "deep", "--global-model", "global"])
 '''
             proc = subprocess.run([sys.executable, "-B", "-c", code, str(out / "checkpoint.json"), str(out)],
                                   cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True, timeout=15)

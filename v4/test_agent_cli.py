@@ -13,6 +13,10 @@ from .test_integration import seeded
 
 
 def run(args):
+    if args and args[0] == 'init' and '--allow-ephemeral-work-dir' not in args:
+        args = [*args, '--allow-ephemeral-work-dir']
+    if args and args[0] == 'dispatch-secondary' and '--direct' not in args:
+        args = [*args, '--direct']
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = main(args)
@@ -20,6 +24,36 @@ def run(args):
 
 
 class AgentCli(unittest.TestCase):
+    def test_dispatch_secondary_uses_supervision_by_default(self):
+        output = io.StringIO()
+        with patch('v4.dispatch_supervisor.supervise_secondary',
+                   return_value={'status': 'fallback_to_main'}) as launch:
+            with contextlib.redirect_stdout(output):
+                code = main(['dispatch-secondary', '--work-dir', '/durable/run', '--agy-model', 'fake'])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue())['status'], 'fallback_to_main')
+        self.assertEqual(launch.call_args.args, ('/durable/run', 'fake'))
+    def test_supervised_secondary_passes_explicit_configuration(self):
+        with patch('v4.dispatch_supervisor.supervise_secondary',
+                   return_value={'status': 'fallback_to_main'}) as launch:
+            code, output = run(['supervise-secondary', '--work-dir', '/durable/run',
+                                '--agy-model', 'fixture-model', '--max-workers', '2'])
+        self.assertEqual(code, 0)
+        self.assertEqual(output['status'], 'fallback_to_main')
+        self.assertEqual(launch.call_args.args, ('/durable/run', 'fixture-model'))
+        self.assertEqual(launch.call_args.kwargs['max_workers'], 2)
+
+    def test_init_rejects_temporary_work_dir_before_writing(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = self.source_checkpoint(root)
+            work = Path(root) / 'native'
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = main(['init', '--checkpoint', str(source), '--work-dir', str(work)])
+            self.assertEqual(code, 2)
+            self.assertIn('temporary storage', json.loads(output.getvalue())['error']['reason'])
+            self.assertFalse(work.exists())
+
     def test_prompt_files_deliver_full_role_context_without_large_inline_response(self):
         import hashlib
         from .test_agent_roles import NativeRoles

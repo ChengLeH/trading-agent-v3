@@ -41,6 +41,12 @@ V3 維持原入口與行為，作為 baseline（比較基準）。V4 保留 V3 �
 此入口將目前執行 V4 的 Agent 視為主 Agent，不綁定 Codex、Qwen 或特定供應商。
 主 Agent 自己讀取持久化工作包、用原生工具執行分析與驗證，再將結構化 JSON 結果送回單一正式狀態；
 init、next、submit、patch 本身不啟動模型。此路徑與下方全 AGY 雲端入口並存。
+正式 run 的 `--work-dir` 必須放在執行環境的持久掛載目錄，並確保重啟後仍可讀寫。
+Native `init` 會拒絕系統暫存目錄（含符號連結指向的路徑）；僅拋棄式測試可明確使用
+`--allow-ephemeral-work-dir`。此檢查無法判斷非暫存路徑是否為容器的暫存磁碟，
+也不保護外層腳本自行寫進暫存區的 log；操作者仍須確認掛載與保存位置。
+直接執行 `python -m v4` 的 `--out` 採同樣的暫存目錄保護；拋棄式測試須明確傳入
+`--allow-ephemeral-out`。不送提示詞的 transport 自檢可使用暫存目錄。
 
 ~~~sh
 python -m v4.agent_cli init --manifest /path/to/manifest.json --work-dir /path/to/native-work
@@ -59,7 +65,27 @@ AGY 是可選副 Agent，僅處理可並行的 atomic／deep Claim 審查：
 
 ~~~sh
 python -m v4.agent_cli dispatch-secondary --work-dir /path/to/native-work   --agy-model "$AGY_REVIEW_MODEL" --max-workers 4 --max-items 8
+python -m v4.agent_cli dispatch-status --work-dir /path/to/native-work
 ~~~
+
+派工紀錄只記本地呼叫開始、完成或失敗及時間，不含提示詞和模型回覆。`calling` 不能證明供應商已接收，
+也不能證明程序仍活著；工作被預約也不等於已執行。釋放租約前必須確認原執行者已停止，避免重複派工。
+派工器在 work-dir 內定期保存各次執行的心跳與已排程／已驗收計數；
+`dispatch-status --attention-after-seconds N` 可提示久未更新的程序或請求，但不會自動重派。
+外層必須實際監看這些紀錄，程式被啟動之前或整個環境離線時，V4 本身無法發通知。
+`dispatch-secondary` 預設啟動監督程序，不需要修改既有的外層派工命令；也可直接使用
+`supervise-secondary`，參數沿用 `--work-dir`、`--agy-model`、`--max-workers`、`--max-items`
+與 `--batch-size`。它把程序 ID、退出碼、狀態和原始輸出放在 work-dir 的
+`secondary-supervision/`，並在自己的 stderr 印出啟動與過期心跳提醒；可用
+`--progress-interval-seconds`（或 `supervise-secondary` 的 `--poll-seconds`）及
+`--attention-after-seconds` 調整。它不會因為暫時無進度而終止或重派工作。
+原本外層仍須啟動此命令並接收提示；若外層沒有啟動任何命令或整個執行環境停止，
+這個監督程序也無法獨立運作。監督程序異常中止時，先查持久狀態及子程序，再決定是否重派。
+AGY 派工的啟動前預約預設 60 秒，可用 `--startup-lease-seconds` 調整；工作者開始前會原子確認
+並延長為 `--lease-seconds`。預約若在啟動前到期，工作者不得呼叫模型。這不是模型執行逾時，
+已開始呼叫的工作不會因啟動時間過期而重派；啟動後程序失聯仍須由外層監控與確認。
+Native AGY 新 session 存在 work-dir 的 `secondary-sessions/`。若同一請求只在舊 session 目錄找到，
+程式會保留舊 session 並轉回主 Agent，不會默默從頭建立新對話；先核對舊 session 再安排恢復。
 
 AGY 額度耗盡、連線失敗或回覆不合法時，絕不產生假 PASS。已完成收據保留，
 剩餘工作包仍可由主 Agent 透過 next／submit 處理；角色決策、修補與 P6 全局不自動派給 AGY。
@@ -240,6 +266,8 @@ Mac 真實測試已在接收任務後刻意中斷，再用原對話 ID 續接；
 全局掃描回覆若只涵蓋部分 Claim，原生流程保留已完成列與全局 findings，列出 `missing_dependency_claim_ids`，再以 `dependency_completion` 只要求補審缺漏項。補審仍用完整 DAG 判斷前提；不將漏項視為沒有依賴，也不重做已完成的全文掃描。
 
 次數使用 `--max-contract-attempts`（包含初次掃描回覆）；耗盡時回 `blocked:global_dependency_coverage`，提高上限可續跑。`global_review_progress` 隨檢查點保存作診斷；重啟從完整 request archives（請求回覆檔）重播並重新驗收，不直接相信檢查點中的審查收據。請保留整個 responses／sessions 目錄。完整覆蓋、修補及必要重驗完成前，報告不能算通過。
+依賴補審封包另回傳 `completion_contract`，列出本包目標、目前缺漏與回覆欄位；
+並行補審也會標出 findings 和外部結案必須為空陣列。這是格式提示，不能把空依賴當預設通過。
 
 ## 驗證與限制
 
@@ -399,6 +427,21 @@ python -m v4.agent_cli next --work-dir RUN
 ```sh
 python -m v4.agent_cli repair-evidence --work-dir RUN --request-id REQUEST_ID --claim-id CLAIM_ID --source-ref CANONICAL_ID --reason '補入已核對的既有引用'
 ```
+
+多筆待處理證據請求也可明確合成一筆修補，避免共同下游在逐筆修補間反覆重驗：
+`python -m v4.agent_cli repair-evidence-batch --work-dir RUN --repairs repairs.json --reason '核對所選證據'`。
+`repairs.json` 是陣列，每項為 `{"request_id":"既有請求 ID", "source_refs":["既有來源 ID"]}`。
+管線核對每筆 ID，依請求既有的 Claim 目標組裝修補；由修補者判斷證據是否支持論述，
+正式收件後仍重驗所有有變動的 Claim 及其下游。未完成的初審／深審不能靠批次入口跳過。
+若多份新來源已準備好，先放入同一份 manifest，並在 `add-evidence` 使用
+`--request-bindings bindings.json`；JSON 物件以既有請求 ID 對應本次 manifest 的來源 ID 陣列。
+來源會一次匯入，關聯只表示已提交，不能證明來源支持論述或讓 finding 自動結案。
+
+舊 Claim 未宣告來源範圍時，預設維持對完整目錄敏感。若要減少未來新增無關來源的重驗，
+可在初審完成後用 `prepare-catalog-scopes --work-dir RUN --claim-id ID ... --reason 理由`
+建立一次性的語義判斷工作；模型必須逐條選擇引用範圍或完整目錄範圍。程式只接受修改
+`assertion.catalog_scope`，不接受趁此修改其他內容；完成後仍按依賴圖重驗並保留全局掃描。
+此遷移本身會產生一次重驗，舊資料不會因新增來源自動視為無關。
 
 `--source-ref` 可重複；Claim IDs 必須涵蓋 request 的全部 targets，所選 IDs 必須已在 canonical catalog。入口只建立 surgical patch，不改來源、不清除 finding、不自動貼引用。正式 patch 後仍重驗 Claim 與 descendants，再完成 Global。Global 可回 `resolution_mode=existing_evidence`、全部原 target IDs 與 `resolution_refs`；程式要求來源在原 finding baseline 已存在、每個 target 有可追溯的新引用且 fresh semantic reference check 為 SUPPORTS。Global 仍須確認這些來源真正解決原問題。未知 ID、未綁定來源、過期收據與只改標籤皆不能結案。這是增補修復路徑，沒有減少原有語義驗證義務。
 

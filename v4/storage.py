@@ -5,6 +5,13 @@ import os
 import tempfile
 
 
+def is_ephemeral_directory(path):
+    """Identify known OS temporary roots; other paths are not proof of durability."""
+    target = Path(path).expanduser().resolve()
+    roots = {Path(tempfile.gettempdir()).resolve(), Path('/tmp').resolve(), Path('/var/tmp').resolve()}
+    return any(target == root or root in target.parents for root in roots)
+
+
 def write_json(path, payload):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -47,6 +47,8 @@ def main(argv=None):
     for role in ("author", "verifier", "deep", "global"):
         parser.add_argument(f"--{role}-model", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument('--allow-ephemeral-out', action='store_true',
+                        help='explicitly allow disposable test runs in OS temporary storage')
     parser.add_argument("--request-timeout", type=float, default=1200,
                         help="Per-request seconds (all roles and reviews); default 1200")
     parser.add_argument("--session-max-continuations", type=int,
@@ -98,6 +100,12 @@ def main(argv=None):
     if args.review_batch_max_bytes is not None and args.review_batch_max_bytes < 1024:
         parser.error("--review-batch-max-bytes must be >=1024")
     out = Path(args.out)
+    from .storage import is_ephemeral_directory
+    if not args.check_transport and is_ephemeral_directory(out) and not args.allow_ephemeral_out:
+        print(json.dumps(dict(status='blocked:output', blocked=True, result_written=False,
+                              reason='output directory is in temporary storage; choose persistent storage'),
+                         ensure_ascii=False))
+        return 2
     try:
         write_json(out / "result.json", dict(status="running", blocked=True))
     except Exception as exc:

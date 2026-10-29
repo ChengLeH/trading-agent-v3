@@ -36,7 +36,7 @@ class NativeQueueLeases(unittest.TestCase):
             with reloaded.transaction() as state:
                 rows = state["packets"][packet["packet_id"]]["item_leases"]
                 self.assertEqual(rows["a"], dict(lease_id=first["lease_id"], owner="host/one",
-                                                  expires_at=130.0))
+                                                  claimed_at=100.0, expires_at=130.0))
                 self.assertEqual(rows["b"], rows["a"])
 
             before = state_bytes(directory)

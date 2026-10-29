@@ -108,7 +108,7 @@ class ExhaustionRecovery(unittest.TestCase):
         from .runner import PipelineRunnerV4
         with tempfile.TemporaryDirectory() as temp:
             checkpoint = Path(temp)/'checkpoint.json'; save_checkpoint(seeded(), checkpoint)
-            argv = ['--resume', str(checkpoint), '--out', str(Path(temp)/'out')]
+            argv = ['--resume', str(checkpoint), '--allow-ephemeral-out', '--out', str(Path(temp)/'out')]
             for role in ('author', 'verifier', 'deep', 'global'): argv += [f'--{role}-model', 'model']
             with patch('v4.__main__.AntigravityCloudClient', return_value=CloudDouble()), \
                  patch.object(RunJournal, 'authorize_session_replay', return_value=dict(task_id='atomic.target')) as authorize, \

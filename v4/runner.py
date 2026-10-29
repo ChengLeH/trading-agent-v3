@@ -65,20 +65,20 @@ refs 的來源 ID 與 Claim ID 是不同類型：來源以 facts/calcs/evidence/
 所有提供的 binding 欄位 ref_id/entity/concept/period/scope/unit/basis 均必填；
 來源不具備的維度明寫 unknown，不得猜。保留原始 Fact 的 share_basis/effective_date 與 provenance。
 assertion 是結構化斷言，至少有 kind；若 kind=value，填 ref_id/value；
-可選 assertion.catalog_scope=referenced_sources 僅限命題完全依所列引用與前提判斷，不宣稱整體目錄完整、某資料不存在或本次沒有其他證據；這類目錄相關命題用 full_catalog，未確定可省略（沿用保守完整目錄）。範圍宣告仍須語義驗證，不能刪來源或改標籤來規避重驗。
+每條 Claim 請依實際論述在 assertion.catalog_scope 宣告來源範圍：referenced_sources 僅限命題完全依所列引用與前提判斷，不宣稱整體目錄完整、某資料不存在或本次沒有其他證據；這類目錄相關命題用 full_catalog；無法判定時用 full_catalog。範圍宣告仍須語義驗證，不能刪來源或改標籤來規避重驗。為相容舊輸出，省略仍按保守完整目錄處理。
 若 kind=event，event_ref 只能選 events 目錄已註冊的 event_id，is_aggregate 必須與該事件相同；並在 refs 與 binding 中列出事件。
 一般新聞敘述不需要量化事件結構時可用 kind=text；evidence ID 不是 event_id，不得把所有新聞預設為 aggregate。
 需要新事件時由主 Agent 先 register-events 註冊結構化事件，不能自行假造目錄 ID。
 不允許 Markdown 成為正式狀態。text 僅作人類閱讀，所有後續角色依賴 Claim 物件。
-輸出 JSON object：{"claims":[{"claim_id":"角色.唯一ID","text":"完整論述",
+輸出 JSON object（下列 catalog_scope 僅示意；須依每條實際內容選擇）：{"claims":[{"claim_id":"角色.唯一ID","text":"完整論述",
 "claim_type":"source_fact|derived_fact|semantic_fact|interpretation|forecast|trade_assumption",
 "refs":[],"fact_refs":[],"dependencies":[],"author_role":"指定角色",
-"assertion":{"kind":"interpretation"},"bindings":[],"confidence":0.5,
+"assertion":{"kind":"interpretation","catalog_scope":"referenced_sources"},"bindings":[],"confidence":0.5,
 "subsection":"章節名稱","purpose":"論述用途"}]}。
 trader 的 trade.decision_comparison 必須包含 research_view={direction:BULLISH|BEARISH|NEUTRAL|UNKNOWN,reason, horizon_end:ISO日期或null,refs:[]} 與 alternatives（恰好 BUY、SHORT 各一項；每項含 direction,status:VIABLE|REJECTED|UNASSESSABLE|NOT_ALLOWED,reason,support_refs:[],opposition_refs:[],missing_information:[]）。WAIT 另填 wait={best_alternative:BUY|SHORT|UNKNOWN,reason,reassessment_trigger,refs:[]}；沒有資料或未獲授權時如實表示，不准虛構數字或使用者風險偏好。比較中的所有引用須列入 trade_plan Claim 的 refs 或 dependencies。研究判斷方向和可執行交易不同，不能只因多空都有反證就預設 WAIT。
 trader 另在 object 的 trade 欄位給結構化交易計畫：direction=WAIT 或 BUY/SHORT，
 交易時填 entry/stop/target/position_pct，價格必須是 JSON 數字。其他角色不可修改 trade。
-trader 恰一條 Claim 的 assertion 必須為 {"kind":"trade_plan","trade":與輸出的 trade 相同物件}；
+trader 恰一條 Claim 的 assertion 須包含 {"kind":"trade_plan","trade":與輸出的 trade 相同物件} 及依上文選擇的 catalog_scope；
 這是交易方案的正式狀態，修補此 Claim 後程式會重新產生對應交易 Fact/Calc。
 market_analyst 分析技術面；fundamentals_analyst 分析財報；news_analyst 分析事件；
 social_analyst 分析情緒；bull/bear 提出可反駁論證；research_manager 裁決；

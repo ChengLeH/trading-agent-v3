@@ -15,6 +15,22 @@ DEPENDENCY_ROLE = "global_dependency_completion"
 DEPENDENCY_PACKET_KIND = "global"
 
 
+def dependency_completion_contract(runner, target_ids, *, parallel=False):
+    """Expose exact pending coverage and a format guide, never a verdict."""
+    target_ids = _target_ids(runner, target_ids)
+    coverage = runner._global_coverage_status()
+    return dict(target_claim_ids=target_ids, parallel=parallel,
+        missing_claim_ids=deepcopy(coverage.get('missing_dependency_claim_ids', [])),
+        response_format=dict(type='object', required=['findings', 'dependency_reviews'],
+            optional=['resolved_external_findings'], row_fields=dict(
+                claim_id='one exact target Claim ID',
+                required_dependencies='array of exact Claim IDs determined by semantic review',
+                unresolved='boolean', reason='brief semantic reason')),
+        instruction=('Review every target; findings and resolved_external_findings must be empty arrays. '
+                     if parallel else 'Review every target; report only new findings and resolutions. ')
+                    + 'Do not treat missing results or an empty dependency list as a default PASS.')
+
+
 def _target_ids(runner, target_ids):
     if not isinstance(target_ids, (list, tuple)) or not target_ids:
         raise ValueError("target_claim_ids must be a nonempty list or tuple")
@@ -197,6 +213,7 @@ class NativeDependencyBatchMixin:
             return dict(status="dependency_reviews_claimed", kind=DEPENDENCY_PACKET_KIND,
                         packet_id=packet_id, input_hash=state["input_hash"],
                         target_claim_ids=deepcopy(target_ids), global_context=deepcopy(context),
+                        completion_contract=dependency_completion_contract(runner, target_ids, parallel=True),
                         lease=lease, items=deepcopy(packet["items"]))
 
 

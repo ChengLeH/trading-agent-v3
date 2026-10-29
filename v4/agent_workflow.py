@@ -190,7 +190,15 @@ class NativeWorkflow:
             return cls.from_checkpoint(checkpoint_path, directory)
 
     def _load(self, state):
-        write_json(self.checkpoint_path, state["checkpoint"])
+        # agent-state is authoritative; checkpoint.json is its derived view.
+        # Avoid an fsync and replacement on every replay when the view already
+        # matches, but repair a missing, corrupt or stale view before loading.
+        try:
+            checkpoint_matches = json_read(self.checkpoint_path) == state['checkpoint']
+        except (OSError, ValueError, TypeError):
+            checkpoint_matches = False
+        if not checkpoint_matches:
+            write_json(self.checkpoint_path, state["checkpoint"])
         runner = load_checkpoint(self.checkpoint_path)
         # Journal writes are suppressed inside a transaction; the caller
         # commits the runner snapshot into authoritative state atomically.
@@ -232,7 +240,7 @@ class NativeWorkflow:
                         'financial_review_contract_upgraded' if old_version != FINANCIAL_REVIEW_VERSION
                         else 'review_context_format_upgraded'))
             state['active_packet_id'] = None
-            for key in ('role_candidates', 'role_errors', 'group_error', 'patch_prompt', 'accepted_links',
+            for key in ('role_candidates', 'role_errors', 'group_error', 'patch_prompt', 'catalog_scope_migration', 'accepted_links',
                         'patch_blocked', 'link_blocked', 'review_blocked', 'global_blocked'):
                 state.pop(key, None)
             self._save(state, runner)

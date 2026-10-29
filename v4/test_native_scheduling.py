@@ -22,6 +22,33 @@ def batch_answer(request, omit=()):
 
 
 class Scheduling(unittest.TestCase):
+    def test_single_request_reserves_only_its_own_items(self):
+        with tempfile.TemporaryDirectory() as root:
+            workflow = NativeReviews().bootstrap(root)
+            first = workflow.claim_reviews('agy/first', max_items=4, batch_size=1, single_request=True)
+            self.assertEqual(len(first['requests']), 1)
+            self.assertEqual(first['lease']['item_ids'], first['requests'][0]['claim_ids'])
+            second = NativeReviewWorkflow(workflow.directory).claim_reviews(
+                'host/second', max_items=4, batch_size=1, single_request=True)
+            self.assertEqual(len(second['requests']), 1)
+            self.assertFalse(set(first['lease']['item_ids']) & set(second['lease']['item_ids']))
+
+    def test_unstarted_expired_request_is_reclaimed_without_old_owner_restart(self):
+        from .agent_queue import renew_items_in_state
+        with tempfile.TemporaryDirectory() as root:
+            workflow = NativeReviews().bootstrap(root)
+            with patch('v4.agent_queue.time.time', return_value=100.0):
+                first = workflow.claim_reviews('agy/first', max_items=1, batch_size=1,
+                                               single_request=True, lease_seconds=5)
+            with patch('v4.agent_queue.time.time', return_value=106.0):
+                second = NativeReviewWorkflow(workflow.directory).claim_reviews(
+                    'host/second', max_items=1, batch_size=1, single_request=True)
+                self.assertEqual(first['lease']['item_ids'], second['lease']['item_ids'])
+                with workflow.queue.transaction() as state:
+                    renewed = renew_items_in_state(state, first['packet_id'], 'agy/first',
+                        first['lease']['lease_id'], 3600)
+                self.assertEqual(renewed['item_ids'], [])
+
     def test_disjoint_owners_restart_and_batch_raw_provenance(self):
         with tempfile.TemporaryDirectory() as root:
             w = NativeReviews().bootstrap(root)
@@ -100,7 +127,7 @@ class Scheduling(unittest.TestCase):
                 self.assertEqual(set(result['accepted_claim_ids']), set(r.receipts))
                 self.assertTrue(all(not p.get('item_leases') for p in state['packets'].values()))
 
-    def test_byte_split_keeps_sibling_leases_until_all_requests_complete(self):
+    def test_byte_split_leases_only_started_worker_requests(self):
         import threading
         import time
         from concurrent.futures import ThreadPoolExecutor
@@ -135,9 +162,11 @@ class Scheduling(unittest.TestCase):
                             if time.monotonic() > deadline:
                                 self.fail('first split response was not collected')
                             time.sleep(.01)
-                        self.assertEqual(still_owned, {'b', 'c', 'independent'})
+                        self.assertIn('b', still_owned)
+                        self.assertLessEqual(len(still_owned), 2)
                         main = NativeReviewWorkflow(w.directory).claim_reviews('host/main', max_items=4)
                         self.assertFalse(set(main['lease']['item_ids']) & still_owned)
+                        w.queue.release_items(main['packet_id'], 'host/main', main['lease']['lease_id'])
                     finally:
                         release.set()
                     outcome = future.result(timeout=10)
@@ -340,15 +369,16 @@ class Scheduling(unittest.TestCase):
             result = w.submit(claim['packet_id'], {'a': answer}, 'host/new', claim['input_hash'])
             self.assertFalse(result.get('blocked'), result)
 
-    def test_fast_responses_do_not_write_lease_renewal_transactions(self):
+    def test_fast_responses_renew_once_at_worker_start(self):
         from .test_agent_dispatch import FakeSecondary
+        from .agent_queue import renew_items_in_state
         with tempfile.TemporaryDirectory() as root:
             w = NativeReviews().bootstrap(root)
-            with patch('v4.agent_dispatch.renew_items_in_state') as renew:
+            with patch('v4.agent_dispatch.renew_items_in_state', wraps=renew_items_in_state) as renew:
                 result = dispatch_secondary_reviews(w, FakeSecondary(), max_workers=3, lease_seconds=3600)
             self.assertFalse(result['failures'], result)
             self.assertEqual(len(result['accepted_claim_ids']), 8)
-            renew.assert_not_called()
+            self.assertEqual(renew.call_count, 8)
 
 
 class ParallelDependencyIntegration(unittest.TestCase):
@@ -379,7 +409,15 @@ class ParallelDependencyIntegration(unittest.TestCase):
             w = self.boot(root)
             a = w.claim_dependency_reviews('host/main', max_items=4)
             b = NativeReviewWorkflow(w.directory).claim_dependency_reviews('agy/reviewer', max_items=4)
+            from .agent_dispatch import dispatch_status
+            reservations = [row for row in dispatch_status(w.directory)['reservations']
+                            if row['layer'] == 'dependency']
+            self.assertEqual({tuple(row['claim_ids']) for row in reservations},
+                             {tuple(sorted(a['target_claim_ids'])), tuple(sorted(b['target_claim_ids']))})
             self.assertFalse(set(a['target_claim_ids']) & set(b['target_claim_ids']))
+            self.assertTrue(a['completion_contract']['parallel'])
+            self.assertEqual(a['completion_contract']['target_claim_ids'], a['target_claim_ids'])
+            self.assertIn('empty arrays', a['completion_contract']['instruction'])
             for claim, owner in [(b, 'agy/reviewer'), (a, 'host/main')]:
                 answer = self.answer(w, claim)
                 outcome = NativeReviewWorkflow(w.directory).submit(claim['packet_id'],

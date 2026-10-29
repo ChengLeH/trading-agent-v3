@@ -102,6 +102,85 @@ class PrecisionContracts(unittest.TestCase):
 
 
 class EvidenceRecoveryContracts(unittest.TestCase):
+    def test_batch_add_evidence_binds_multiple_requests_in_one_transaction(self):
+        import json, tempfile
+        from pathlib import Path
+        from .test_agent_reviews import NativeReviews
+        from .evidence_repair import append_sources
+        with tempfile.TemporaryDirectory() as root:
+            workflow = NativeReviews().bootstrap(root)
+            NativeReviews()._reach_global(workflow)
+            with workflow.queue.transaction() as state:
+                runner = workflow._load(state)
+                findings = [dict(finding_id='gap.' + cid, claim_ids=[cid],
+                    issue='Need source', resolution_route='evidence_needed',
+                    evidence_request=dict(proposition='Verify ' + cid)) for cid in ('a', 'b')]
+                runner.deferred_global_findings = deepcopy(findings)
+                requests = runner.prepare_evidence_work(findings)['evidence_requests']
+                workflow._save(state, runner)
+            manifest_path = self.manifest(root)
+            manifest = json.loads(manifest_path.read_text())
+            manifest['sources'].append(dict(id='filing.second', type='generic_text', path='second.txt'))
+            (Path(root) / 'second.txt').write_text('An additional distinct source.', encoding='utf-8')
+            manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+            bindings = {requests[0]['request_id']: ['filing.new'],
+                        requests[1]['request_id']: ['filing.second']}
+            with self.assertRaisesRegex(ValueError, 'source IDs in this manifest'):
+                append_sources(workflow, manifest_path, reason='invalid binding',
+                               request_bindings={requests[0]['request_id']: ['not-in-manifest']})
+            with workflow.queue.transaction() as state:
+                current = workflow._load(state)
+                self.assertFalse(any(row['submitted_source_ids'] for row in current.evidence_requests))
+            result = append_sources(workflow, manifest_path, reason='add both', request_bindings=bindings)
+            self.assertEqual(result['request_bindings'], bindings)
+            self.assertFalse(result['findings_resolved'])
+            with workflow.queue.transaction() as state:
+                runner = workflow._load(state)
+                by_id = {row['request_id']: row for row in runner.evidence_requests}
+                self.assertEqual(by_id[requests[0]['request_id']]['submitted_source_ids'], ['filing.new'])
+                self.assertEqual(by_id[requests[1]['request_id']]['submitted_source_ids'], ['filing.second'])
+                additions = [row for row in state['evidence_additions'] if 'request_id' in row]
+                self.assertEqual(len(additions), 2)
+                self.assertTrue(all(row['canonical_refs'] for row in additions))
+
+    def test_batch_evidence_requests_bind_sources_to_each_target(self):
+        import tempfile
+        from pathlib import Path
+        from .checkpoint import save_checkpoint
+        from .agent_reviews import NativeReviewWorkflow
+        from .test_agent_reviews import NativeReviews
+        from .evidence_repair import prepare_evidence_patch_batch
+        with tempfile.TemporaryDirectory() as root:
+            runner = seeded()
+            runner.run.fact_store.add(Fact('available.amount', 42, 'USD', 'FY2025',
+                entity='TEST', concept='Revenue', basis='gaap', scope='consolidated', source_id='fixture'))
+            source = Path(root) / 'source.json'
+            save_checkpoint(runner, source)
+            workflow = NativeReviewWorkflow.from_checkpoint(source, Path(root) / 'native')
+            NativeReviews()._reach_global(workflow)
+            with workflow.queue.transaction() as state:
+                runner = workflow._load(state)
+                findings = [dict(finding_id='gap.' + cid, claim_ids=[cid],
+                    issue='Source requires review', resolution_route='evidence_needed',
+                    evidence_request=dict(proposition='Verify ' + cid)) for cid in ('a', 'b')]
+                runner.deferred_global_findings = deepcopy(findings)
+                requests = runner.prepare_evidence_work(findings)['evidence_requests']
+                workflow._save(state, runner)
+            specs = [dict(request_id=row['request_id'], source_refs=['available.amount']) for row in requests]
+            with self.assertRaisesRegex(ValueError, 'canonical source'):
+                prepare_evidence_patch_batch(workflow, [dict(request_id=specs[0]['request_id'],
+                    source_refs=['not-present'])], reason='review')
+            outcome = prepare_evidence_patch_batch(workflow, specs, reason='review both sources')
+            self.assertEqual(set(outcome['allowed_claim_ids']), {'a', 'b'})
+            packet = workflow.next()
+            self.assertEqual(packet['kind'], 'patch')
+            self.assertEqual(set(packet['allowed_claim_ids']), {'a', 'b'})
+            with workflow.queue.transaction() as state:
+                current = workflow._load(state)
+                self.assertEqual(len(current.pending_patch['findings']), 2)
+                self.assertEqual({f['evidence']['request_id'] for f in current.pending_patch['findings']},
+                                 {row['request_id'] for row in requests})
+
     def _pending_existing_evidence_repair(self, root, *, at_limit=False):
         from pathlib import Path
         from .checkpoint import save_checkpoint

@@ -32,15 +32,21 @@ def review_reservations(state, layer):
         if (packet.get('kind') != layer or packet.get('retired')
                 or packet.get('input_hash') != state['input_hash']):
             continue
+        if layer == 'global' and not packet.get('parallel_dependency'):
+            continue
         for cid, lease in packet.get('item_leases', {}).items():
             if lease['expires_at'] <= now or cid in packet.get('received', {}):
                 continue
             key = (packet['packet_id'], lease['lease_id'], lease['owner'], lease['expires_at'])
-            groups.setdefault(key, []).append(cid)
+            row = groups.setdefault(key, dict(item_ids=[], claim_ids=[]))
+            row['item_ids'].append(cid)
+            row['claim_ids'].extend(packet.get('global_context', {}).get('target_claim_ids', [])
+                                    if layer == 'global' else [cid])
     return [dict(packet_id=packet_id, lease_id=lease_id, owner=owner,
-                 expires_at=expires_at, claim_ids=sorted(claim_ids),
-                 execution_state='unknown')
-            for (packet_id, lease_id, owner, expires_at), claim_ids in sorted(groups.items())]
+                 expires_at=expires_at, claim_ids=sorted(set(group['claim_ids'])),
+                 execution_state='unknown',
+                 claimed_at=state['packets'][packet_id]['item_leases'][group['item_ids'][0]].get('claimed_at'))
+            for (packet_id, lease_id, owner, expires_at), group in sorted(groups.items())]
 
 
 def retire_unowned_review_packets(state):
@@ -103,7 +109,7 @@ class NativeScheduling:
                 runner.status = "atomic" if len(runner.receipts) < len(runner.run.claims) else "deep"
                 self._save(state, runner)
 
-    def claim_reviews(self, executor, *, max_items=4, batch_size=4, lease_seconds=3600, exclude_claim_ids=(), takeover_incomplete=False):
+    def claim_reviews(self, executor, *, max_items=4, batch_size=4, lease_seconds=3600, exclude_claim_ids=(), takeover_incomplete=False, single_request=False):
         if not isinstance(executor, str) or not executor.strip():
             raise ValueError("executor identity required")
         if type(max_items) is not int or not 1 <= max_items <= 16:
@@ -112,6 +118,8 @@ class NativeScheduling:
             raise ValueError("batch_size must be 1..16")
         if type(takeover_incomplete) is not bool:
             raise ValueError("takeover_incomplete must be boolean")
+        if type(single_request) is not bool:
+            raise ValueError("single_request must be boolean")
         self._handoff_unavailable_supplements(executor, takeover_incomplete=takeover_incomplete)
         pending = self.next()
         if pending.get("kind") not in {"atomic", "deep"} or pending.get("blocked") or "packet_id" not in pending:
@@ -160,6 +168,13 @@ class NativeScheduling:
                             prompt=item["prompt"], response_schema=deepcopy(item["schema"])))
                 else:
                     requests.append(request)
+            if single_request:
+                # A worker owns exactly the items it will start. Renewing a
+                # running request must not extend an unrelated queued request.
+                if not requests:
+                    raise ValueError('no bounded review request could be prepared')
+                requests = requests[:1]
+                selected = list(requests[0]['claim_ids'])
             lease = claim_items_in_state(state, packet["packet_id"], executor, selected, lease_seconds)
             stored = packet.setdefault("wire_requests", {})
             for request in requests:

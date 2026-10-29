@@ -69,7 +69,7 @@ class ReviewBudgetReporting(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             manifest = Path(root) / 'manifest.json'
             manifest.write_text(json.dumps(dict(subject=dict(ticker='TEST'))))
-            base = ['--manifest', str(manifest), '--out', str(Path(root) / 'out')]
+            base = ['--manifest', str(manifest), '--allow-ephemeral-out', '--out', str(Path(root) / 'out')]
             for role in ('author', 'verifier', 'deep', 'global'):
                 base += [f'--{role}-model', 'test/cloud']
             clients = {role: SimpleNamespace(calls=[]) for role in ('author', 'verifier', 'deep', 'global')}

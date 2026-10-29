@@ -609,8 +609,7 @@ class NativeReviewWorkflow(NativeRedeliberation, NativeDependencyBatchMixin, Nat
                 if (self._matches_global(runner, active, prepared)
                         and active["items"][key]["prompt"] == prepared[1]):
                     self._save(state, runner)
-                    return dict(status="global", kind="global", packet_id=active["packet_id"],
-                                input_hash=state["input_hash"], items=deepcopy(active["items"]))
+                    return self._global_packet_view(state, runner, active)
             active["retired"] = True
             if state.get("active_packet_id") == active["packet_id"]:
                 state["active_packet_id"] = None
@@ -666,8 +665,18 @@ class NativeReviewWorkflow(NativeRedeliberation, NativeDependencyBatchMixin, Nat
                                            items={role: dict(prompt=prompt)}, received={})
         state["active_packet_id"] = packet_id
         self._save(state, runner)
-        return dict(status="global", kind="global", packet_id=packet_id,
-                    input_hash=state["input_hash"], items={role: dict(prompt=prompt)})
+        return self._global_packet_view(state, runner, state['packets'][packet_id])
+
+    @staticmethod
+    def _global_packet_view(state, runner, packet):
+        view = dict(status='global', kind='global', packet_id=packet['packet_id'],
+                    input_hash=state['input_hash'], items=deepcopy(packet['items']))
+        if ('global_dependency_completion' in packet['items'] and runner.pending_global
+                and not runner.pending_global.get('resolution_completion')):
+            from .native_dependency_batches import dependency_completion_contract
+            view['completion_contract'] = dependency_completion_contract(
+                runner, packet['global_context']['target_claim_ids'])
+        return view
 
     def _has_pending_patch(self):
         state = json_read(self.queue.state_path)
@@ -871,6 +880,10 @@ class NativeReviewWorkflow(NativeRedeliberation, NativeDependencyBatchMixin, Nat
                 raise ValueError("stale or unprepared claim patch")
             if not isinstance(row["response"], list) or not all(isinstance(p, dict) for p in row["response"]):
                 raise ValueError("patch response must be a JSON array of objects")
+            migration = state.get('catalog_scope_migration')
+            if migration is not None:
+                from .catalog_scope_migration import validate_scope_patches
+                validate_scope_patches(runner, row['response'], migration)
             RunJournal(self.directory).archive_external_submission(
                 runner, model=row["executor"], task_id=f"patch.{packet['packet_id']}",
                 prompt=packet["items"][PATCH_ROLE]["prompt"], response=deepcopy(row["response"]))
@@ -889,6 +902,7 @@ class NativeReviewWorkflow(NativeRedeliberation, NativeDependencyBatchMixin, Nat
             state["active_packet_id"] = None
         state.setdefault("patch_outcomes", {})[packet["packet_id"]] = deepcopy(result)
         if not result.get("blocked"):
+            state.pop('catalog_scope_migration', None)
             state.pop("patch_prompt", None)
             if "accepted_links" in state:
                 state.setdefault("historical_links", []).append(

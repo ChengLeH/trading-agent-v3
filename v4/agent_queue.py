@@ -77,6 +77,10 @@ def _lease_row(row, item_id):
         raise ValueError(f"item lease for {item_id} has an invalid expiry") from None
     if not math.isfinite(expires_at):
         raise ValueError(f"item lease for {item_id} has an invalid expiry")
+    claimed_at = row.get('claimed_at')
+    if claimed_at is not None and (isinstance(claimed_at, bool) or
+            not isinstance(claimed_at, (int, float)) or not math.isfinite(claimed_at)):
+        raise ValueError(f"item lease for {item_id} has an invalid claim time")
     return lease_id, owner, expires_at
 
 
@@ -147,7 +151,7 @@ def claim_items_in_state(state, packet_id, executor, item_ids=None, lease_second
         if item_id in leases:
             _, previous_owner, _ = _lease_row(leases[item_id], item_id)
             _remember_released_owner(packet, item_id, previous_owner)
-        leases[item_id] = dict(lease_id=lease_id, owner=executor, expires_at=expires_at)
+        leases[item_id] = dict(lease_id=lease_id, owner=executor, claimed_at=now, expires_at=expires_at)
     return _lease_result(packet_id, lease_id, executor, selected, expires_at)
 
 

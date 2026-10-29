@@ -128,7 +128,7 @@ class Integration(unittest.TestCase):
                     def failed_check():
                         raise AntigravityError("tool_policy_unverified")
                     client.check_capabilities = failed_check
-                args = ["--check-transport", "--out", temp, "--author-model", "shared",
+                args = ["--check-transport", "--allow-ephemeral-out", "--out", temp, "--author-model", "shared",
                         "--verifier-model", "shared", "--deep-model", "shared", "--global-model", "shared"]
                 with patch("v4.__main__.AntigravityCloudClient", return_value=client), \
                      patch("v4.__main__.PipelineRunnerV4", side_effect=AssertionError("pipeline must not start")), \
@@ -156,7 +156,7 @@ class Integration(unittest.TestCase):
                 result_path.write_text(json.dumps(dict(status="complete", blocked=False, report_markdown="OLD SUCCESS")))
                 invalid = Path(temp) / "invalid.json"
                 invalid.write_text("not JSON")
-                args = [source, str(invalid), "--out", str(out), "--author-model", "author",
+                args = [source, str(invalid), "--allow-ephemeral-out", "--out", str(out), "--author-model", "author",
                         "--verifier-model", "first", "--deep-model", "second", "--global-model", "global"]
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(main(args), 2)
@@ -177,7 +177,7 @@ class Integration(unittest.TestCase):
              patch("v4.cloud.shutil.which", return_value=None), \
              patch("v4.__main__.AntigravityCloudClient",
                    side_effect=lambda model, **kwargs: CloudDouble("test/" + model)):
-            args = ["--resume", "unused.json", "--out", temp, "--author-model", "author",
+            args = ["--resume", "unused.json", "--allow-ephemeral-out", "--out", temp, "--author-model", "author",
                     "--verifier-model", "first", "--deep-model", "second", "--global-model", "global"]
             with patch("v4.__main__.load_checkpoint", return_value=r), \
                  patch.object(r, "execute_phase6", return_value=completed), \
@@ -288,7 +288,7 @@ class Integration(unittest.TestCase):
             manifest_path.write_text(json.dumps(dict(subject={"ticker": "TEST"}, as_of="2026-10-16",
                                                      sources=[dict(id="news", type="news_json", path=str(path))])))
             out = Path(temp) / "out"
-            args = ["--manifest", str(manifest_path), "--out", str(out), "--author-model", "author",
+            args = ["--manifest", str(manifest_path), "--allow-ephemeral-out", "--out", str(out), "--author-model", "author",
                     "--verifier-model", "atomic", "--deep-model", "deep", "--global-model", "global"]
             with patch("v4.__main__.AntigravityCloudClient", side_effect=lambda model, **kwargs: clients[model]), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(main(args), 0)
@@ -411,7 +411,7 @@ class Integration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             checkpoint, out = Path(temp) / "checkpoint.json", Path(temp) / "out"
             save_checkpoint(r, checkpoint)
-            args = ["--resume", str(checkpoint), "--out", str(out), "--author-model", "author",
+            args = ["--resume", str(checkpoint), "--allow-ephemeral-out", "--out", str(out), "--author-model", "author",
                     "--verifier-model", "shared", "--deep-model", "shared", "--global-model", "global"]
             with patch("v4.__main__.AntigravityCloudClient", side_effect=lambda model, **kwargs: clients[model]), \
                  contextlib.redirect_stdout(io.StringIO()):
@@ -694,7 +694,7 @@ class AdjustableRuntimeLimits(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             runner = seeded(); runner.revision_round = 2
             checkpoint = Path(temp) / "checkpoint.json"; save_checkpoint(runner, checkpoint)
-            argv = ["--resume", str(checkpoint), "--out", str(Path(temp) / "out"),
+            argv = ["--resume", str(checkpoint), "--allow-ephemeral-out", "--out", str(Path(temp) / "out"),
                     "--session-max-continuations", "12", "--session-budget-seconds", "14400",
                     "--max-revisions", "40", "--max-contract-attempts", "8"]
             for role in ("author", "verifier", "deep", "global"):

@@ -585,7 +585,7 @@ class ReviewBatches(unittest.TestCase):
                 seen.append((runner.review_batch_size, runner.review_batch_max_bytes,
                              runner.review_deep_batch_max_bytes, runner.max_workers))
                 return dict(blocked=True, status="test-stop")
-            args = ["--resume", str(path), "--out", str(Path(temp)/"out"), "--author-model", "m",
+            args = ["--resume", str(path), "--allow-ephemeral-out", "--out", str(Path(temp)/"out"), "--author-model", "m",
                     "--verifier-model", "m", "--deep-model", "m", "--global-model", "m",
                     "--request-timeout", "1500", "--review-batch-size", "3", "--review-batch-max-bytes", "32000",
                     "--max-workers", "2"]
