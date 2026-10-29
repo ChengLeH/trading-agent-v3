@@ -178,6 +178,14 @@ def dispatch_secondary_reviews(workflow, client, *, max_workers=4, max_items=16,
             lease_id = owned["lease_id"]
             if outstanding_requests[lease_id] > 0:
                 workflow.queue.release_items(owned["packet_id"], identity, lease_id)
+    if not dispatched and not failures:
+        outstanding = workflow.next()
+        return dict(status="reviews_in_flight" if outstanding.get("status") == "reviews_in_flight"
+                    else "secondary_no_work", packet_id=initial_packet_id,
+                    input_hash=packet.get("input_hash"), kind=kind,
+                    accepted_claim_ids=[], failures={}, dispatched_claim_count=0,
+                    outstanding=outstanding, warnings=[],
+                    reason="No review request was dispatched; inspect outstanding work before waiting.")
     warning = workflow.record_secondary_event(packet,
         code='secondary_failed' if failures else 'secondary_completed', requested_identity=identity,
         accepted_claim_ids=accepted, failed_claim_ids=failures)

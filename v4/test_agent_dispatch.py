@@ -32,6 +32,23 @@ class SecondaryDispatch(unittest.TestCase):
     def bootstrap(self, root):
         return NativeReviews().bootstrap(root)
 
+    def test_reserved_reviews_are_not_reported_as_dispatched(self):
+        with tempfile.TemporaryDirectory() as root:
+            workflow = self.bootstrap(root)
+            while True:
+                reserved = workflow.claim_reviews('another/executor', max_items=16, lease_seconds=3600)
+                if reserved['status'] != 'reviews_claimed':
+                    self.assertEqual(reserved['status'], 'reviews_in_flight')
+                    break
+            client = FakeSecondary()
+            result = dispatch_secondary_reviews(workflow, client, continuous=True, max_items=16)
+            self.assertEqual(result['status'], 'reviews_in_flight')
+            self.assertEqual(result['dispatched_claim_count'], 0)
+            self.assertEqual(client.calls, [])
+            self.assertTrue(result['outstanding']['reservations'])
+            self.assertTrue(all(row['execution_state'] == 'unknown'
+                                for row in result['outstanding']['reservations']))
+
     def test_agy_parallel_atomic_accepts_individual_receipts(self):
         with tempfile.TemporaryDirectory() as root:
             workflow = self.bootstrap(root)

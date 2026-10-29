@@ -24,6 +24,25 @@ def leased_review_ids(state, layer):
             if lease["expires_at"] > now and cid not in packet["received"]}
 
 
+def review_reservations(state, layer):
+    """Describe reservations without claiming that an executor has started."""
+    now = time.time()
+    groups = {}
+    for packet in state['packets'].values():
+        if (packet.get('kind') != layer or packet.get('retired')
+                or packet.get('input_hash') != state['input_hash']):
+            continue
+        for cid, lease in packet.get('item_leases', {}).items():
+            if lease['expires_at'] <= now or cid in packet.get('received', {}):
+                continue
+            key = (packet['packet_id'], lease['lease_id'], lease['owner'], lease['expires_at'])
+            groups.setdefault(key, []).append(cid)
+    return [dict(packet_id=packet_id, lease_id=lease_id, owner=owner,
+                 expires_at=expires_at, claim_ids=sorted(claim_ids),
+                 execution_state='unknown')
+            for (packet_id, lease_id, owner, expires_at), claim_ids in sorted(groups.items())]
+
+
 def retire_unowned_review_packets(state):
     """Cold-store superseded packets without dropping live work/candidates."""
     now = time.time()

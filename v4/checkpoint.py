@@ -342,7 +342,6 @@ def load_checkpoint(path, *, continue_verification=True):
                          review_deep_batch_max_bytes=data.get("review_deep_batch_max_bytes", 128 * 1024),
                          global_dependency_batch_size=data.get("global_dependency_batch_size", 12))
     if continue_verification:
-        from uuid import UUID
         epoch = data.get("verification_epoch")
         if not isinstance(epoch, str) or UUID(epoch).hex != epoch:
             raise ValueError("checkpoint lacks a durable verification epoch; explicit fresh verification required")

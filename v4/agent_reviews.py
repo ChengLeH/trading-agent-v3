@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 from .agent_workflow import NativeWorkflow, json_read, _require_identity
 from .agent_queue import submit_items_in_state
-from .native_scheduling import NativeScheduling, leased_review_ids, retire_unowned_review_packets
+from .native_scheduling import NativeScheduling, leased_review_ids, retire_unowned_review_packets, review_reservations
 from .native_dependency_batches import NativeDependencyBatchMixin, dependency_identity, collect_dependency_packet
 from .journal import RunJournal
 from .native_redeliberation import NativeRedeliberation, NativeResolutionJournal
@@ -227,7 +227,9 @@ class NativeReviewWorkflow(NativeRedeliberation, NativeDependencyBatchMixin, Nat
                     layer, prompts, schemas = "deep", dict(prepared["deep_prompts"]), prepared["response_schemas"]
             if not prompts:
                 return dict(status="reviews_in_flight", kind=layer, items={},
-                            reason="ready work is reserved; renew or await its owner, or reclaim after lease expiry")
+                            reservations=review_reservations(state, layer),
+                            reason="work is reserved; reservation alone does not confirm execution. "
+                                   "Verify the owner before waiting or releasing its lease.")
             return self._issue_review_packet(state, runner, layer, prompts, schemas, size, cap, tasks)
 
     @staticmethod
