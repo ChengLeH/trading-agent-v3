@@ -47,6 +47,40 @@ class EmptyRevision(unittest.TestCase):
         runner.prepare_phase6_revision_v4(findings)
         return runner, findings
 
+    def test_repair_candidates_cover_transitive_descendants_and_survive_reload(self):
+        runner, findings = self.prepared()
+        self.assertEqual(runner.pending_patch["ids"], ["a", "b", "c"])
+        self.assertEqual(runner.pending_patch["findings"], findings)
+        self.assertEqual(runner.pending_patch["dependent_candidate_ids"], ["b", "c"])
+        before = deepcopy(runner.receipts)
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'checkpoint.json'
+            save_checkpoint(runner, path)
+            restored = load_checkpoint(path, continue_verification=True)
+            self.assertEqual(restored.pending_patch, runner.pending_patch)
+            review_all(restored)
+            before = deepcopy(restored.receipts)
+            result = restored.collect_phase6_revision([
+                dict(claim_id='a', text='correct premise'),
+                dict(claim_id='c', text='correct downstream interpretation')])
+            self.assertEqual(set(result['revalidate_claim_ids']), {'a', 'b', 'c'})
+            self.assertTrue(set(before) - {'a', 'b', 'c'} <= set(restored.receipts))
+            self.assertIsNone(restored.global_receipt)
+
+    def test_candidate_scope_cannot_authorize_unrelated_claim_on_reload_or_patch(self):
+        runner, _ = self.prepared()
+        with self.assertRaises(ValueError):
+            runner.collect_phase6_revision([dict(claim_id='independent', text='unauthorized')])
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'checkpoint.json'
+            save_checkpoint(runner, path)
+            data = json.loads(path.read_text())
+            data['pending_patch']['ids'].append('independent')
+            data['pending_patch']['dependent_candidate_ids'].append('independent')
+            path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(ValueError, 'dependency closure'):
+                load_checkpoint(path)
+
     def test_empty_response_preserves_pending_findings_and_all_review_state(self):
         runner, findings = self.prepared()
         before = deepcopy(dict(claims=runner.run.claims, receipts=runner.receipts,
@@ -230,7 +264,7 @@ class EmptyRevision(unittest.TestCase):
             self.assertEqual(result["status"], "blocked:revision_limit")
             restored = load_checkpoint(path)
             self.assertEqual(restored.pending_patch["findings"], findings)
-            self.assertEqual(restored.pending_patch["ids"], ["a"])
+            self.assertEqual(restored.pending_patch["ids"], ["a", "b", "c"])
             self.assertEqual((restored.revision_round, restored.max_revisions), (5, 5))
             clients = [CloudDouble() for _ in range(4)]
             paused = restored.execute_phase6(*clients)
@@ -252,7 +286,7 @@ class EmptyRevision(unittest.TestCase):
                 global_findings=[dict(claim_id="b", issue="Still uses an unsupported premise")])
         self.assertEqual(rc, 2)
         self.assertEqual(result["status"], "blocked:revision_limit")
-        self.assertEqual(restored.pending_patch["ids"], ["b"])
+        self.assertEqual(restored.pending_patch["ids"], ["b", "c"])
         self.assertEqual(restored.revision_round, runner.max_revisions + 1)
         self.assertEqual(restored.max_revisions, runner.max_revisions)
         self.assertEqual(len(clients["global_reviewer"].calls), 1)
@@ -337,7 +371,7 @@ class EmptyRevision(unittest.TestCase):
     def test_cli_invalid_patch_file_preserves_pending_state_without_cloud_calls(self):
         invalid = ["not JSON", "{}", '[{"claim_id":"a","claim_id":"b","text":"ambiguous"}]',
                    '[{"claim_id":"a","confidence":NaN}]',
-                   '[{"claim_id":"b","text":"unauthorized"}]',
+                   '[{"claim_id":"unknown","text":"unauthorized"}]',
                    '[{"claim_id":"a","text":"first"},{"claim_id":"a","text":"second"}]']
         for patch_text in invalid:
             with self.subTest(patch_text=patch_text), tempfile.TemporaryDirectory() as temp:
@@ -384,6 +418,7 @@ class EmptyRevision(unittest.TestCase):
         review_all(runner)
         runner.prepare_phase6_revision_v4([dict(claim_id=plan_id, issue="Trader must follow RM WAIT")])
         # Recreate the narrow pending scope stored by older versions.
+        runner.pending_patch.pop("dependent_candidate_ids", None)
         runner.pending_patch["ids"] = [plan_id]
         runner.pending_patch["findings"] = [dict(claim_id=plan_id, issue="Trader must follow RM WAIT")]
         patches = [dict(claim_id=plan_id, text="WAIT; no new position", assertion=dict(kind="trade_plan", trade=dict(direction="WAIT"))),

@@ -87,6 +87,7 @@ def main(argv=None):
                       help='explicitly allow disposable test runs in OS temporary storage')
     init.add_argument('--role-prompt-budget-bytes', type=int, default=None,
                       help='advisory UTF-8 budget per role; never truncates source evidence')
+    init.add_argument('--global-dependency-batch-size', type=int, choices=range(1,65))
     init.add_argument('--review-batch-max-bytes', type=int, default=None)
     init.add_argument('--review-packet-max-bytes', type=int, default=None)
 
@@ -95,6 +96,11 @@ def main(argv=None):
     budgets.add_argument('--review-batch-max-bytes', type=int, default=None)
     budgets.add_argument('--review-packet-max-bytes', type=int, default=None)
     budgets.add_argument('--reason', required=True)
+
+    dependency_budget = sub.add_parser('configure-dependencies', help='set global dependency chunk size before global review')
+    dependency_budget.add_argument('--work-dir', required=True)
+    dependency_budget.add_argument('--batch-size', type=int, choices=range(1,65), required=True)
+    dependency_budget.add_argument('--reason', required=True)
 
     nxt = sub.add_parser("next", help="show the current outstanding packet")
     nxt.add_argument("--work-dir", required=True)
@@ -346,6 +352,9 @@ def main(argv=None):
                 if not source.is_file():
                     raise ValueError(f"checkpoint not found: {source}")
                 instance = NativeReviewWorkflow.from_checkpoint(source, args.work_dir)
+                if args.global_dependency_batch_size is not None:
+                    from .agent_reviews import configure_dependency_batch
+                    configure_dependency_batch(instance, batch_size=args.global_dependency_batch_size, reason='declared at native init')
                 if args.review_batch_max_bytes is not None or args.review_packet_max_bytes is not None:
                     from .agent_reviews import configure_review_budget
                     configure_review_budget(instance, max_item_bytes=args.review_batch_max_bytes,
@@ -360,6 +369,9 @@ def main(argv=None):
             if not source.is_file():
                 raise ValueError(f"manifest not found: {source}")
             instance = NativeReviewWorkflow.from_manifest(source, args.work_dir, ticker=args.ticker)
+            if args.global_dependency_batch_size is not None:
+                from .agent_reviews import configure_dependency_batch
+                configure_dependency_batch(instance, batch_size=args.global_dependency_batch_size, reason='declared at native init')
             if args.review_batch_max_bytes is not None or args.review_packet_max_bytes is not None:
                 from .agent_reviews import configure_review_budget
                 configure_review_budget(instance, max_item_bytes=args.review_batch_max_bytes,
@@ -370,6 +382,10 @@ def main(argv=None):
             _emit(dict(ok=True, status="initialized", work_dir=str(args.work_dir),
                        source_manifest=str(source)))
             return 0
+        if args.command == 'configure-dependencies':
+            from .agent_reviews import configure_dependency_batch
+            return _result_exit(configure_dependency_batch(NativeReviewWorkflow(args.work_dir),
+                batch_size=args.batch_size, reason=args.reason))
         if args.command == 'configure-reviews':
             from .agent_reviews import configure_review_budget
             return _result_exit(configure_review_budget(NativeReviewWorkflow(args.work_dir),

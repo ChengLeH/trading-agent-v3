@@ -1247,7 +1247,7 @@ class SemanticAcceptance(unittest.TestCase):
             self.assertEqual(resumed.deferred_global_findings, r.deferred_global_findings)
             review_all(resumed)
             revision = resumed.prepare_phase6_revision_v4(resumed._review_findings())
-            self.assertEqual(revision["allowed_claim_ids"], ["b"])
+            self.assertEqual(revision["allowed_claim_ids"], ["b", "c"])
             self.assertIn(row["reason"], revision["revision_prompts"][0][1])
 
     def test_unresolved_dependency_survives_another_claim_graph_repair(self):

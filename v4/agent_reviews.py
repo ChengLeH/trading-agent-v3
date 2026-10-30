@@ -67,6 +67,27 @@ def configure_review_budget(workflow, *, max_item_bytes=None, max_packet_bytes=N
         return dict(status='review_budget_updated', **event)
 
 
+def configure_dependency_batch(workflow, *, batch_size, reason):
+    """Persist the completion chunk size before issuing a global review."""
+    if type(batch_size) is not int or not 1 <= batch_size <= 64:
+        raise ValueError("global_dependency_batch_size must be 1..64")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("operator reason required")
+    with workflow.queue.transaction() as state:
+        runner = workflow._load(state)
+        # Existing prompts and chunk identities must remain stable in flight.
+        if runner.pending_global or any(
+                p.get("kind") in {"global", "global_dependency"} and not p.get("retired")
+                for p in state.get("packets", {}).values()):
+            raise ValueError("global review is in progress; keep its saved batch size until completion")
+        before = runner.global_dependency_batch_size
+        runner.global_dependency_batch_size = batch_size
+        event = dict(before=before, after=batch_size, reason=reason.strip())
+        state.setdefault("dependency_batch_changes", []).append(event)
+        workflow._save(state, runner)
+        return dict(status="dependency_batch_updated", **event)
+
+
 class NativeReviewWorkflow(NativeRedeliberation, NativeDependencyBatchMixin, NativeScheduling, NativeWorkflow):
     def _options(self, state):
         options = state.get("options", {})

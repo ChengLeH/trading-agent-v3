@@ -660,3 +660,23 @@ Fact entity 缺失時，僅可根據相符且唯一的 SourceRecord.subject_tick
 ### Token 與交付成本優化
 
 本機主 Agent 可採用 `next --delivery-files`、`claim-reviews --delivery-files` 與精確來源查詢，讓共享規則及目錄只保存一份；既有 AGY 自足輸入維持完整。`completion-summary` 提供短報、`audit-cost` 分列 prepared prompt bytes、wire request bytes 與實體儲存；未記錄的模型 token 用量維持 unknown。操作、恢復與 catalog_scope 的限制見 [TOKEN_OPTIMIZATION.md](TOKEN_OPTIMIZATION.md)。
+
+### 角色包與修補範圍（2026-10-30）
+
+新產生的角色 prompt 使用 compact JSON，完整保留所有來源和 Claim；既有封存 prompt 保持原樣。
+一般修補包將 DAG 的傳遞下游列為 `dependent_candidate_ids`，不是新增已確認錯誤。
+主 Agent 只提交必要變更；未修改的候選不消耗額外修補輪次。修補後仍重驗受影響後代並做全局掃描。
+舊 checkpoint 的既有窄範圍仍可讀；舊的待修範圍若需擴大，使用既有 `--patch-dependents` 明確授權。
+來源範圍分類遷移仍只允許所選 Claim，不能藉此修改其他內容。
+
+Native 新 run 可在 `init` 指定 `--global-dependency-batch-size 32`（1–64，預設 12）。
+既有 run 可在全局審查開始前執行：
+
+```sh
+python -m v4.agent_cli configure-dependencies --work-dir /persistent/run --batch-size 32 --reason "measured output capacity"
+```
+
+設定會保存並沿用；進行中的全局審查拒絕改動批次，以保留已發出提示詞的一致性。
+`claim-dependencies --max-items` 是單次領取上限，仍受已保存的批次大小限制。
+更大批次可能增加輸出截斷風險，不保證更快。失敗角色的相同回覆重送會保留原始錯誤並提示 `retry-role`；
+修正版不能覆寫原封包，須先用 `retry-role` 建立新的角色請求。

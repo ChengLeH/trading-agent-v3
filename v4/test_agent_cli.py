@@ -24,6 +24,32 @@ def run(args):
 
 
 class AgentCli(unittest.TestCase):
+    def test_native_dependency_batch_configuration_persists_without_invalidating_receipts(self):
+        from .agent_reviews import NativeReviewWorkflow
+        from .checkpoint import load_checkpoint
+        with tempfile.TemporaryDirectory() as root:
+            source = self.source_checkpoint(root); work = Path(root) / 'native'
+            code, _ = run(['init', '--checkpoint', str(source), '--work-dir', str(work),
+                           '--global-dependency-batch-size', '32'])
+            self.assertEqual(code, 0)
+            workflow = NativeReviewWorkflow(work)
+            with workflow.queue.transaction() as state:
+                runner = workflow._load(state)
+                self.assertEqual(runner.global_dependency_batch_size, 32)
+                receipts = dict(runner.receipts)
+            code, outcome = run(['configure-dependencies', '--work-dir', str(work), '--batch-size', '64', '--reason', 'measured run'])
+            self.assertEqual(code, 0)
+            self.assertEqual((outcome['before'], outcome['after']), (32, 64))
+            with workflow.queue.transaction() as state:
+                runner = workflow._load(state)
+                self.assertEqual(runner.global_dependency_batch_size, 64)
+                self.assertEqual(runner.receipts, receipts)
+            from types import SimpleNamespace
+            with patch.object(NativeReviewWorkflow, '_load', return_value=SimpleNamespace(pending_global={'active': True})):
+                code, outcome = run(['configure-dependencies', '--work-dir', str(work), '--batch-size', '12', '--reason', 'unsafe change'])
+            self.assertEqual(code, 2)
+            self.assertIn('in progress', outcome['error']['reason'])
+
     def test_dispatch_secondary_uses_supervision_by_default(self):
         output = io.StringIO()
         with patch('v4.dispatch_supervisor.supervise_secondary',

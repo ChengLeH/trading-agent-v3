@@ -56,7 +56,7 @@ class EvidenceFidelityContract(unittest.TestCase):
         self.assertIn("不得只刪除引用", prompt)
         self.assertIn("bindings.period", prompt)
         self.assertIn("Source contradicts conclusion", prompt)
-        self.assertEqual(result["allowed_claim_ids"], ["a"])
+        self.assertEqual(result["allowed_claim_ids"], ["a", "b", "c"])
 
 
 if __name__ == "__main__":

@@ -613,7 +613,9 @@ def load_checkpoint(path, *, continue_verification=True):
     if pending is not None:
         from .schema import id_list
         try:
-            if not isinstance(pending, dict) or set(pending) != {"input_hash", "ids", "findings"}:
+            if (not isinstance(pending, dict) or set(pending) not in (
+                    {"input_hash", "ids", "findings"},
+                    {"input_hash", "ids", "findings", "dependent_candidate_ids"})):
                 raise ValueError("invalid fields")
             ids = id_list(pending["ids"], "pending repair IDs")
             findings = pending["findings"]
@@ -634,7 +636,12 @@ def load_checkpoint(path, *, continue_verification=True):
                 if not targets:
                     raise ValueError("unmapped finding")
                 mapped.update(targets)
-            if mapped != set(ids):
+            candidates = set(id_list(pending.get("dependent_candidate_ids", []), "dependent candidate IDs"))
+            if "dependent_candidate_ids" in pending:
+                from .schema import descendants
+                if candidates != set(descendants(r.run.claims, mapped)) - mapped:
+                    raise ValueError("dependent candidates differ from the current dependency closure")
+            if mapped | candidates != set(ids):
                 raise ValueError("finding targets differ from allowed IDs")
         except (ValueError, TypeError, KeyError) as exc:
             raise ValueError(f"invalid pending claim repair: {exc}") from exc

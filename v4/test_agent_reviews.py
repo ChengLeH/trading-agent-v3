@@ -143,7 +143,7 @@ print(json.dumps(dict(result=result, serialized_definitions=json.dumps(definitio
                 w.submit(packet['packet_id'],{cid:response(cid,item) for cid,item in packet['items'].items()},
                          'host/test',packet['input_hash'])
             self.assertEqual(packet.get('kind'),'patch',packet)
-            self.assertEqual(packet['allowed_claim_ids'],['a'])
+            self.assertEqual(packet['allowed_claim_ids'], ['a', 'b', 'c'])
             outcome = w.submit_patch(packet['packet_id'],[dict(claim_id='a',assertion=dict(kind='text'))],
                                      'host/repair',packet['input_hash'])
             self.assertFalse(outcome.get('blocked'),outcome)
@@ -291,7 +291,7 @@ print(json.dumps(dict(result=result, serialized_definitions=json.dumps(definitio
                 workflow.submit(packet['packet_id'], {cid: response(cid, item, 'FAIL' if cid == 'b' else 'PASS')
                     for cid, item in packet['items'].items()}, 'host/test', packet['input_hash'])
             self.assertEqual(packet.get('kind'), 'patch', packet)
-            self.assertEqual(packet['allowed_claim_ids'], ['b'])
+            self.assertEqual(packet['allowed_claim_ids'], ['b', 'c'])
             resumed = NativeReviewWorkflow(workflow.directory).next()
             self.assertEqual(resumed['packet_id'], packet['packet_id'])
             outcome = workflow.submit_patch(packet['packet_id'], [{'claim_id': 'b', 'text': 'Corrected premise'}],
@@ -311,7 +311,7 @@ print(json.dumps(dict(result=result, serialized_definitions=json.dumps(definitio
             imported = NativeReviewWorkflow.from_checkpoint(workflow.checkpoint_path, Path(root) / 'imported')
             packet = imported.next()
             self.assertEqual(packet.get('kind'), 'patch', packet)
-            self.assertEqual(packet['allowed_claim_ids'], ['a'])
+            self.assertEqual(packet['allowed_claim_ids'], ['a', 'b', 'c'])
             self.assertTrue(packet['manual_patch_only'])
             self.assertTrue(packet['blocked'])
             self.assertEqual(packet['status'], 'blocked:revision_limit')
@@ -826,7 +826,7 @@ class NativeGlobalFindingsPatch(NativeReviews):
             resumed = NativeReviewWorkflow(workflow.directory)
             patch = resumed.next()
             self.assertEqual(patch.get('kind'), 'patch', patch)
-            self.assertEqual(patch['allowed_claim_ids'], ['a'])
+            self.assertEqual(patch['allowed_claim_ids'], ['a', 'b', 'c'])
 
     def test_legacy_reissued_completion_packet_is_retired_after_verified_revision_close(self):
         from copy import deepcopy

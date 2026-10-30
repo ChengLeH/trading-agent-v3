@@ -69,7 +69,7 @@ class CheckpointRecoveryRegression(unittest.TestCase):
                 dict(claim_id='b', dependencies=['missing-claim'])])
         self.assertEqual(runner.run.claims, before)
         self.assertEqual(runner.receipts, receipts)
-        self.assertEqual(set(runner.pending_patch['ids']), {'a', 'b'})
+        self.assertEqual(set(runner.pending_patch['ids']), {'a', 'b', 'c'})
         outcome = runner.collect_phase6_revision([
             dict(claim_id='a', text='corrected first claim'),
             dict(claim_id='b', text='corrected second claim')])

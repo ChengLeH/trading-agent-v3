@@ -171,10 +171,10 @@ class EvidenceRecoveryContracts(unittest.TestCase):
                 prepare_evidence_patch_batch(workflow, [dict(request_id=specs[0]['request_id'],
                     source_refs=['not-present'])], reason='review')
             outcome = prepare_evidence_patch_batch(workflow, specs, reason='review both sources')
-            self.assertEqual(set(outcome['allowed_claim_ids']), {'a', 'b'})
+            self.assertEqual(set(outcome['allowed_claim_ids']), {'a', 'b', 'c'})
             packet = workflow.next()
             self.assertEqual(packet['kind'], 'patch')
-            self.assertEqual(set(packet['allowed_claim_ids']), {'a', 'b'})
+            self.assertEqual(set(packet['allowed_claim_ids']), {'a', 'b', 'c'})
             with workflow.queue.transaction() as state:
                 current = workflow._load(state)
                 self.assertEqual(len(current.pending_patch['findings']), 2)
@@ -237,7 +237,7 @@ class EvidenceRecoveryContracts(unittest.TestCase):
                     status='evidence_recovery', evidence_requests=['outstanding'], blocked=False)):
                 packet = restored.next()
                 self.assertEqual(packet.get('kind'), 'patch', packet)
-                self.assertEqual(packet['allowed_claim_ids'], ['a'])
+                self.assertEqual(packet['allowed_claim_ids'], ['a', 'b', 'c'])
                 again = NativeReviewWorkflow(workflow.directory).next()
                 self.assertEqual(again['packet_id'], packet['packet_id'])
             result = restored.submit_patch(packet['packet_id'],

@@ -9,6 +9,33 @@ from .test_journal import author_response
 
 
 class NativeRoles(unittest.TestCase):
+    def test_role_prompt_is_compact_without_losing_context(self):
+        import json
+        from .runner import ROLE_CONTRACT, json_prompt
+        runner = seeded()
+        role, prompt = runner._role_prompts(['market_analyst'])[0]
+        packet = runner.orch.get_packet(runner.run_id, role)
+        payload = prompt.split('<context-data>\n', 1)[1].split('\n</context-data>', 1)[0]
+        self.assertEqual(json.loads(payload), packet)
+        self.assertLess(len(prompt.encode()), len(json_prompt(ROLE_CONTRACT, packet).encode()))
+
+    def test_failed_role_redelivery_gives_retry_action_and_does_not_replace_response(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, workflow = self.bootstrap(root)
+            packet = workflow.next(); role = 'market_analyst'
+            bad = {'claims': [{}]}
+            result = workflow.submit(packet['packet_id'], {role: bad}, 'host/main', packet['input_hash'])
+            self.assertEqual(result['next_action'], 'retry-role')
+            result = NativeWorkflow(workflow.directory).submit(packet['packet_id'], {role: bad}, 'host/main', packet['input_hash'])
+            self.assertTrue(result['role_retry_required'])
+            self.assertIn(role, result['retry_roles'])
+            with self.assertRaisesRegex(ValueError, 'retry-role'):
+                workflow.submit(packet['packet_id'], {role: {'claims': []}}, 'host/main', packet['input_hash'])
+            with workflow.queue.transaction() as state:
+                self.assertEqual(state['packets'][packet['packet_id']]['received'][role]['response'], bad)
+            workflow.retry_role(role)
+            self.assertIn(role, workflow.next()['items'])
+
     def test_large_role_prompt_has_exact_durable_artifact_and_budget_notice(self):
         import hashlib
         import json

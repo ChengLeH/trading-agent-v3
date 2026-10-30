@@ -26,7 +26,7 @@ def prepare_catalog_scope_migration(workflow, claim_ids, *, reason):
             evidence=dict(selection_reason=reason.strip()),
             suggested_fix='只在 assertion 增加 catalog_scope；完全依引用與前提才選 referenced_sources，'
                           '否則選 full_catalog。保留其他欄位與所有依賴，不得刪除內容。') for cid in ids]
-        outcome = runner.prepare_phase6_revision_v4(findings)
+        outcome = runner.prepare_phase6_revision_v4(findings, include_dependents=False)
         if 'revision_prompts' in outcome:
             role, prompt = outcome['revision_prompts'][0]
             prompt += ('\n\n這次只允許修訂以下選定 Claim 的 assertion.catalog_scope：'

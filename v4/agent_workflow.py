@@ -426,6 +426,9 @@ class NativeWorkflow:
         return dict(status="blocked:roles" if role_errors else "roles_staged", packet_id=packet_id,
                     received_item_ids=sorted(packet["received"]), staged_roles=sorted(candidates),
                     missing_item_ids=missing, role_errors=deepcopy(role_errors),
+                    next_action="retry-role" if role_errors else "submit_missing_roles",
+                    retry_roles=sorted(role_errors),
+                    role_retry_required=bool(role_errors),
                     input_hash=state["input_hash"])
 
 

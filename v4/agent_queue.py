@@ -261,6 +261,9 @@ def submit_items_in_state(state, packet_id, responses, executor, input_hash):
             continue
         if existing["response"] == response and existing["executor"] == executor:
             continue  # idempotent redelivery keeps the original candidate row
+        if packet.get("kind") == "roles":
+            raise ValueError(f"conflicting duplicate response for role {item_id}; "
+                             "response was not replaced; use retry-role before submitting a corrected candidate")
         raise ValueError(f"conflicting duplicate response for item {item_id}")
     for item_id, response in responses.items():
         if item_id not in received:

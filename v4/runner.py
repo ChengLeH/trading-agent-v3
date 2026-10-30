@@ -510,7 +510,7 @@ class PipelineRunnerV4:
         return context
 
     def _role_prompts(self, roles):
-        return [(role, json_prompt(ROLE_CONTRACT, self.orch.get_packet(self.run_id, role))) for role in roles]
+        return [(role, json_prompt(ROLE_CONTRACT, self.orch.get_packet(self.run_id, role), compact=True)) for role in roles]
 
     def prepare(self, ticker, manifest):
         if self.run_id:
@@ -1217,8 +1217,10 @@ class PipelineRunnerV4:
         self._persist()
         return linked
 
-    def prepare_phase6_revision_v4(self, findings):
+    def prepare_phase6_revision_v4(self, findings, *, include_dependents=True):
         self._require_atomic()
+        if type(include_dependents) is not bool:
+            raise ValueError("include_dependents must be boolean")
         if not isinstance(findings, list) or not findings:
             raise ValueError("revision requires findings")
         non_patchable = [f for f in findings
@@ -1259,19 +1261,28 @@ class PipelineRunnerV4:
                     evidence=dict(trade_plan_claim_ids=sorted(trade_plans), direct_dependencies=sorted(parents),
                                   generated_source_refs=sorted(refs)),
                     suggested_fix="只在新交易狀態使原內容或引用失效時修改；保留仍成立的內容與真正依賴"))
+        # Permit semantic propagation in one transaction. Graph reachability
+        # identifies candidates, not errors; unchanged descendants need no patch.
+        requested = list(wanted)
+        dependent_candidates = (sorted(set(descendants(self.run.claims, requested)) - set(wanted))
+                                if include_dependents else [])
+        wanted.extend(dependent_candidates)
         self.pending_patch = dict(input_hash=self._hash(), ids=wanted, findings=deepcopy(findings))
+        if include_dependents:
+            self.pending_patch["dependent_candidate_ids"] = dependent_candidates
         tasks = self._tasks()
         prompt = json_prompt(
             '只修改所列 Claim 物件，不得重寫 Markdown、擴大範圍或更改作者與 ID。'
             '回傳 JSON array，每項至少 claim_id 加必要更改的欄位。所有未改欄位保留。'
-            '相依檢查任務不是已確認錯誤；不需修改的物件不要回傳。不得藉刪除真正的因果依賴掩蓋決策衝突。'
+            'dependent_candidate_ids 是可能受影響的下游，不是已確認錯誤；不需修改的物件不要回傳。不得藉刪除真正的因果依賴掩蓋決策衝突。'
             '逐條依 findings 與 tasks 所附的完整來源內容修正論述及歸因：不得選擇性引用有利資訊，'
             '來源若含相反證據、分歧或限制，應如實揭露並調整結論，不能只拿偏向自己的來源數字。'
             '不得只刪除引用來躲避矛盾；若要撤回某個引用，必須同步縮小或撤回不再受支持的主張。'
             '區分統計截止日與事件或極值實際發生日；沒有獨立日期證據就刪除推測日期，'
             '並同步校正 bindings.period 等相關欄位及受影響的依賴論述，不能僅改 text 留下自相矛盾的欄位。'
             '修正內容必須符合 V4 Claim schema，並更新 assertion/bindings/dependencies。' + FINANCIAL_REVIEW_CONTRACT,
-            dict(findings=findings, tasks=[tasks[cid].review_dict() for cid in wanted]))
+            dict(findings=findings, dependent_candidate_ids=dependent_candidates,
+                 tasks=[tasks[cid].review_dict() for cid in wanted]))
         if self.revision_round >= self.max_revisions:
             # Stop automatic model spending, but retain a state-bound repair
             # request for explicit operator patches. Never reset used rounds.
